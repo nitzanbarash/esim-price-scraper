@@ -1,0 +1,16 @@
+# NEVER commit credentials — they go into a GitHub secret instead
+credentials.json
+
+# Logs
+*.log
+launchd.log
+full_run.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
