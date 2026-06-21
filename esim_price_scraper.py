@@ -577,12 +577,27 @@ class ESIMScraper:
             # (prev and last_change are never touched when the price is unchanged)
 
         if updates:
-            CHUNK = 100
+            # The scrape can take 10+ minutes — long enough for the idle Google
+            # connection to be dropped by the server, causing a BrokenPipeError on
+            # the first write. So rebuild a fresh connection right before writing,
+            # send in small chunks, and retry each chunk (rebuilding) on failure.
+            self.setup_google_sheets()
+            CHUNK = 50
             for i in range(0, len(updates), CHUNK):
                 batch = updates[i:i + CHUNK]
-                self.sheet_service.spreadsheets().values().batchUpdate(
-                    spreadsheetId=SHEET_ID,
-                    body={'data': batch, 'value_input_option': 'USER_ENTERED'}).execute()
+                for attempt in range(4):
+                    try:
+                        self.sheet_service.spreadsheets().values().batchUpdate(
+                            spreadsheetId=SHEET_ID,
+                            body={'data': batch, 'value_input_option': 'USER_ENTERED'}
+                        ).execute(num_retries=3)
+                        break
+                    except Exception as e:
+                        print(f"  ⚠️ write chunk {i // CHUNK + 1} attempt {attempt + 1} "
+                              f"failed: {e}")
+                        if attempt == 3:
+                            raise
+                        self.setup_google_sheets()  # fresh connection, then retry
             print(f"\n📊 Sheet updated for {len(items)} packages at {ts}")
         print("\n✅ Done!")
 
