@@ -577,9 +577,12 @@ class ESIMScraper:
             # (prev and last_change are never touched when the price is unchanged)
 
         if updates:
-            self.sheet_service.spreadsheets().values().batchUpdate(
-                spreadsheetId=SHEET_ID,
-                body={'data': updates, 'value_input_option': 'USER_ENTERED'}).execute()
+            CHUNK = 100
+            for i in range(0, len(updates), CHUNK):
+                batch = updates[i:i + CHUNK]
+                self.sheet_service.spreadsheets().values().batchUpdate(
+                    spreadsheetId=SHEET_ID,
+                    body={'data': batch, 'value_input_option': 'USER_ENTERED'}).execute()
             print(f"\n📊 Sheet updated for {len(items)} packages at {ts}")
         print("\n✅ Done!")
 
