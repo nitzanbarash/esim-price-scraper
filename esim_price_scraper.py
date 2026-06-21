@@ -41,16 +41,35 @@ from esim_country_data import (
 SHEET_ID = "108D3BUV-MNcIuRZuKUgb-E-b1Ra8moxWZZyI5JxnyRo"
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
-# Column indices (0-based) in the A:N range
-COL_CODE, COL_COUNTRIES, COL_GB, COL_SOURCE, COL_LINK = 0, 1, 2, 3, 4
-COL_VALIDITY, COL_PRICE, COL_PREV, COL_UPDATED, COL_CHANGED = 5, 6, 7, 8, 9
-COL_LAST_CHANGE, COL_NETWORK, COL_BREAKOUT_IP, COL_VARIANT = 10, 11, 12, 13
+# Columns are located by their HEADER TEXT (row 1), not by fixed positions, so the
+# sheet keeps working even if you insert/move/reorder columns. Each logical field
+# maps to the exact header string it lives under.
+HEADER_KEYS = {
+    'code':        "חבילה (קוד)",
+    'countries':   "מדינות",
+    'gb':          "GB",
+    'source':      "מקור",
+    'link':        "קישור",
+    'validity':    "זמן חבילה",
+    'price':       "מחיר קנייה",
+    'prev':        "מחיר קודם",
+    'updated':     "עודכן לאחרונה",
+    'changed':     "השתנה?",
+    'last_change': "שינוי אחרון",
+    'network':     "Networks",
+    'breakout_ip': "Breakout IP",
+    'variant':     "וריאנט (אזורי)",
+}
 
-HEADERS = [
-    "חבילה (קוד)", "מדינות", "GB", "מקור", "קישור",
-    "זמן חבילה", "מחיר קנייה", "מחיר קודם", "עודכן לאחרונה",
-    "השתנה?", "שינוי אחרון", "Networks", "Breakout IP", "וריאנט (אזורי)",
-]
+
+def col_letter(idx: int) -> str:
+    """0-based column index -> spreadsheet letter (0->A, 25->Z, 26->AA)."""
+    result = ""
+    idx += 1
+    while idx:
+        idx, rem = divmod(idx - 1, 26)
+        result = chr(ord('A') + rem) + result
+    return result
 
 
 def strip_vpn_from_url(url: str) -> str:
@@ -309,9 +328,12 @@ class ESIMScraper:
                     'note': 'No plans found on region page'}
 
         # Choose plan by variant (country count). If none, list options for the user.
+        # The variant cell may be currency-formatted (e.g. "$18.00") or have stray
+        # text, so pull the first integer out rather than requiring a clean digit.
         chosen = None
-        if variant and variant.strip().isdigit():
-            want = int(variant.strip())
+        m = re.search(r'\d+', variant or '')
+        if m:
+            want = int(m.group())
             matches = [p for p in plans if p['countries'] == want]
             if matches:
                 chosen = min(matches, key=lambda p: p['price'])
@@ -319,7 +341,8 @@ class ESIMScraper:
             options = ", ".join(f"{p['countries']} מדינות ${p['price']:.2f}" for p in plans)
             return {'price': None, 'countries': '', 'gb': '', 'validity': '',
                     'code': '', 'network': '', 'breakout_ip': '',
-                    'note': f"בחר וריאנט בעמודה N — {len(plans)} חבילות: {options}"}
+                    'note': f"בחר וריאנט (מספר מדינות) בעמודת 'וריאנט (אזורי)' — "
+                            f"{len(plans)} חבילות: {options}"}
 
         # Click into the chosen plan to reveal its Payment Summary, then read One-time payment
         price = f"${chosen['price']:.2f}"
@@ -432,24 +455,46 @@ class ESIMScraper:
         return r
 
     # ── sheet I/O ────────────────────────────────────────────────
-    def read_rows(self) -> List[Dict]:
+    def read_rows(self):
+        """
+        Returns (items, col_index). Columns are located by matching the header row
+        (row 1) against HEADER_KEYS, so the sheet keeps working even after columns
+        are inserted, moved, or reordered.
+        """
         result = self.sheet_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID, range='A:N').execute()
+            spreadsheetId=SHEET_ID, range='A1:Z').execute()
         rows = result.get('values', [])
+        if not rows:
+            return [], {}
+
+        header = rows[0]
+        col_index = {}
+        for key, header_text in HEADER_KEYS.items():
+            try:
+                col_index[key] = header.index(header_text)
+            except ValueError:
+                pass  # header missing — that field is simply skipped
+
+        width = max(col_index.values(), default=0) + 1
         items = []
         for idx, row in enumerate(rows[1:], start=2):
-            row = row + [""] * (14 - len(row))  # pad
-            link = row[COL_LINK]
+            row = row + [""] * (width - len(row))  # pad to cover all mapped columns
+            link = row[col_index['link']] if 'link' in col_index else ""
             if link and link.startswith("http"):
-                items.append({'row': idx, 'link': link,
-                              'old_price': row[COL_PRICE], 'variant': row[COL_VARIANT]})
-        return items
+                items.append({
+                    'row': idx,
+                    'link': link,
+                    'old_price': row[col_index['price']] if 'price' in col_index else "",
+                    'variant': row[col_index['variant']] if 'variant' in col_index else "",
+                    'old_changed': row[col_index['changed']] if 'changed' in col_index else "",
+                })
+        return items, col_index
 
     async def run(self):
         if not self.sheet_service:
             print("⚠️  Google Sheets not configured. Cannot run.")
             return
-        items = self.read_rows()
+        items, col = self.read_rows()
         if not items:
             print("ℹ️  No links found in column E.")
             return
@@ -458,8 +503,12 @@ class ESIMScraper:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         updates = []
 
-        def put(row, col_letter, value):
-            updates.append({'range': f'{col_letter}{row}', 'values': [[value]]})
+        def put(row, key, value):
+            """Queue a cell write, locating the column by its header key."""
+            if key not in col:
+                return  # header not present in this sheet — skip silently
+            updates.append({'range': f'{col_letter(col[key])}{row}',
+                            'values': [[value]]})
 
         def to_val(p):
             try:
@@ -474,8 +523,8 @@ class ESIMScraper:
 
             if new_price is None:
                 # Only update timestamp and note on error, don't touch price fields
-                put(r, 'I', f'{ts}')
-                put(r, 'J', res['note'] or 'Check failed')
+                put(r, 'updated', ts)
+                put(r, 'changed', res['note'] or 'Check failed')
                 continue
 
             new_val = to_val(new_price)
@@ -488,23 +537,23 @@ class ESIMScraper:
 
             # Always update metadata + current price + timestamp
             if res['code']:
-                put(r, 'A', res['code'])
+                put(r, 'code', res['code'])
             if res['countries']:
-                put(r, 'B', res['countries'])
+                put(r, 'countries', res['countries'])
             if res['gb']:
-                put(r, 'C', res['gb'])
-            put(r, 'D', 'esim.dog')
+                put(r, 'gb', res['gb'])
+            put(r, 'source', 'esim.dog')
             if res['validity']:
-                put(r, 'F', res['validity'])
-            put(r, 'G', new_price)       # current buy price (always)
-            put(r, 'I', ts)              # updated timestamp (always)
+                put(r, 'validity', res['validity'])
+            put(r, 'price', new_price)       # current buy price (always)
+            put(r, 'updated', ts)            # updated timestamp (always)
 
             # Networks / Breakout IP reflect the currently-selected (cheapest) route,
             # always refreshed regardless of whether the price changed.
             if res['network']:
-                put(r, 'L', res['network'])
+                put(r, 'network', res['network'])
             if res['breakout_ip']:
-                put(r, 'M', res['breakout_ip'])
+                put(r, 'breakout_ip', res['breakout_ip'])
 
             if price_changed:
                 diff = new_val - old_val
@@ -513,13 +562,19 @@ class ESIMScraper:
                 sign = '+' if diff > 0 else '-'
                 # Leading arrow keeps Google Sheets from reading it as a formula
                 changed = f"{arrow} {sign}${abs(diff):.2f} ({sign}{abs(pct):.1f}%)"
-                put(r, 'H', old)         # store previous price (persists until next change)
-                put(r, 'J', changed)     # show the change (persists until next change)
-                put(r, 'K', datetime.now().strftime("%Y-%m-%d"))  # date of this change
+                put(r, 'prev', old)          # previous price (persists until next change)
+                put(r, 'changed', changed)   # the change (persists until next change)
+                put(r, 'last_change', datetime.now().strftime("%Y-%m-%d"))  # change date
             elif first_time:
-                put(r, 'J', "First check")
-            # else: price unchanged → leave H (previous), J (change) and K (last
-            # change date) exactly as they were
+                put(r, 'changed', "First check")
+            else:
+                # Price unchanged → keep a real change description (↑/↓/First check),
+                # but clear any stale error left in J by an earlier failed run.
+                oc = (it.get('old_changed') or "").strip()
+                is_real = oc.startswith('↑') or oc.startswith('↓') or oc == "First check"
+                if oc and not is_real:
+                    put(r, 'changed', "")
+            # (prev and last_change are never touched when the price is unchanged)
 
         if updates:
             self.sheet_service.spreadsheets().values().batchUpdate(
