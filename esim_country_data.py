@@ -167,8 +167,13 @@ def make_country_code(slug: str, gb) -> str:
     return f"{continent}.{dialing}.{gb_str}"
 
 
-def make_region_code(region_slug: str, gb) -> str:
-    """Generate package code for a regional package: continent.0.GB"""
+def make_region_code(region_slug: str, gb, variant_countries: int = 0) -> str:
+    """Generate package code for a regional package.
+    Uses A=mini (<=12 countries) / B=grande (>12 countries).
+    Format: continent.0[A|B].GB"""
     continent = REGION_TO_CONTINENT.get(region_slug.lower(), 7)
     gb_str = str(gb).replace("gb", "").replace("GB", "").strip()
+    if variant_countries:
+        tier = "A" if variant_countries <= 12 else "B"
+        return f"{continent}.0{tier}.{gb_str}"
     return f"{continent}.0.{gb_str}"

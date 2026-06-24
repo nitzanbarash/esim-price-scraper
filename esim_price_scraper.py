@@ -2,24 +2,15 @@
 """
 eSIM.dog Price Scraper — Nitzan's auto-updating price table.
 
-Reads links from the Google Sheet (column E), scrapes esim.dog, and auto-fills:
-  A=code, B=countries, C=GB, D=source, F=validity, G=buy price
-plus tracking: H=previous price, I=last updated, J=changed?,
-K=last change date, L=Networks, M=Breakout IP.
-Column E (link) and N (variant, for regional plans) are filled by the user.
+Reads links from the Google Sheet, scrapes esim.dog, and auto-fills:
+  code, countries, GB, source, validity, buy price, route, profit, stock status
+plus tracking: previous price, last updated, changed?, last change date,
+Networks, Breakout IP.
 
-Handles URL types:
-  1. Country fixed-GB   e.g. /th?tab=fixedgb&data=10&validity=14
-  2. VPN in URL         -> vpn param stripped automatically
-  3. Route selection    -> picks the cheapest route (Blue/Pink/Black), expanding
-                            "Show more routes" if present
-  4. Regional plans      e.g. /regions?region=asia&data=3&validity=7
-
-Column order rules per package:
-  1. Verify GB / validity match the package definition.
-  2. Find the cheapest Route (expanding "Show more routes" if needed).
-  3. Re-select that route, then read Networks / Breakout IP and fill all
-     remaining columns + price-history bookkeeping.
+Route selection: cheapest first, ties broken by quality (Blue>Pink>Black>Yellow>Green).
+Stock detection: if the page shows different GB/validity than the URL requested.
+Profitability: 1GB packages allow up to -20% loss; all others require >=20% profit.
+Regional codes: A=mini, B=grande (e.g. 1.0A.10, 1.0B.5).
 """
 
 import asyncio
@@ -59,7 +50,21 @@ HEADER_KEYS = {
     'network':     "Networks",
     'breakout_ip': "Breakout IP",
     'variant':     "וריאנט (אזורי)",
+    'route':       "Route",
+    'profit':      "רווח (כדאיות)",
+    'stock':       "במלאי/רווחי",
+    'my_price':    "מחיר שלי",
 }
+
+ROUTE_QUALITY = ['Blue', 'Pink', 'Black', 'Yellow', 'Green']
+
+def route_quality_rank(name: str) -> int:
+    """Lower = better. Strips emoji prefixes like '🎁'."""
+    clean = re.sub(r'[^\w]', '', name).capitalize()
+    for i, r in enumerate(ROUTE_QUALITY):
+        if clean == r:
+            return i
+    return len(ROUTE_QUALITY)
 
 
 def col_letter(idx: int) -> str:
@@ -223,9 +228,8 @@ class ESIMScraper:
                     return False
         return False
 
-    async def get_all_routes(self, page: Page) -> Dict[str, str]:
-        """Click every route option (including ones behind "Show more routes")
-        and record its price."""
+    async def get_all_routes(self, page: Page) -> Dict[str, Dict]:
+        """Click every route option and record price + network info."""
         routes = {}
         container = await self.find_route_container(page)
         if not container:
@@ -233,9 +237,14 @@ class ESIMScraper:
         for name in await self.list_route_names(page, container):
             if await self.select_route(page, container, name):
                 price = await self.extract_price(page)
+                net_info = await self.extract_network_info(page)
                 if price:
-                    routes[name] = price
-                    print(f"    {name}: {price}")
+                    routes[name] = {
+                        'price': price,
+                        'network': net_info['network'],
+                        'breakout_ip': net_info['breakout_ip'],
+                    }
+                    print(f"    {name}: {price}  |  {net_info['network'][:50]}")
         return routes
 
     async def extract_network_info(self, page: Page) -> Dict[str, str]:
@@ -264,58 +273,103 @@ class ESIMScraper:
 
         return {'network': network, 'breakout_ip': breakout_ip}
 
+    async def read_page_package_info(self, page: Page) -> Dict[str, str]:
+        """Read the actual GB and validity shown on the page (for stock detection)."""
+        try:
+            text = await page.inner_text("body")
+        except Exception:
+            return {}
+        result = {}
+        m = re.search(r'(\d+(?:\.\d+)?)\s*GB', text)
+        if m:
+            result['page_gb'] = m.group(1)
+        m2 = re.search(r'(\d+)\s*(?:Days?|days?)', text)
+        if m2:
+            result['page_validity'] = m2.group(1)
+        return result
+
     # ── per-type scraping ────────────────────────────────────────
     async def scrape_country(self, page: Page, info: Dict) -> Dict:
         slug = info['slug']
         country_name = hebrew_name(slug)
 
-        # candidates: (price_float, route_name_or_None)
+        page_info = await self.read_page_package_info(page)
+
+        # candidates: (price_float, route_quality_rank, route_name, net_info)
         candidates = []
         default_price = await self.extract_price(page)
 
-        # Check every route option (works for any color names), expanding
-        # "Show more routes" so hidden (often cheaper) routes are included too.
         routes = await self.get_all_routes(page)
         if routes:
             print(f"  📌 Routes found (default {default_price}): {len(routes)}")
-            for name, v in routes.items():
+            for name, rdata in routes.items():
                 try:
-                    candidates.append((float(v.replace('$', '')), name))
-                except:
+                    candidates.append((
+                        float(rdata['price'].replace('$', '')),
+                        route_quality_rank(name),
+                        name,
+                        rdata,
+                    ))
+                except Exception:
                     pass
         elif default_price:
-            # No Route selector on this page — default price is the only option,
-            # and the page is already in the correct state for Networks/Breakout IP.
-            candidates.append((float(default_price.replace('$', '')), None))
+            net_info = await self.extract_network_info(page)
+            candidates.append((
+                float(default_price.replace('$', '')),
+                999,
+                None,
+                {'price': default_price, 'network': net_info['network'],
+                 'breakout_ip': net_info['breakout_ip']},
+            ))
 
         network = ""
         breakout_ip = ""
+        route_name = ""
         if candidates:
-            cheapest_val, cheapest_route = min(candidates, key=lambda c: c[0])
-            price = f"${cheapest_val:.2f}"
-            print(f"  ✓ Cheapest = {price}" + (f" [{cheapest_route}]" if cheapest_route else ""))
+            # Sort by price first, then by route quality rank for ties
+            best = min(candidates, key=lambda c: (c[0], c[1]))
+            price_val, _, route_name, rdata = best
+            price = f"${price_val:.2f}"
+            route_display = route_name or ""
+            print(f"  ✓ Best = {price}" + (f" [{route_display}]" if route_display else ""))
 
-            # Re-select the cheapest route so the info box reflects it before reading
-            if cheapest_route:
+            # Re-select the best route to ensure page state is correct
+            if route_name:
                 container = await self.find_route_container(page)
                 if container:
-                    await self.select_route(page, container, cheapest_route)
+                    await self.select_route(page, container, route_name)
+                    rdata_fresh = await self.extract_network_info(page)
+                    rdata['network'] = rdata_fresh['network']
+                    rdata['breakout_ip'] = rdata_fresh['breakout_ip']
 
-            net_info = await self.extract_network_info(page)
-            network = net_info['network']
-            breakout_ip = net_info['breakout_ip']
+            network = rdata['network']
+            breakout_ip = rdata['breakout_ip']
         else:
             price = None
 
         gb = (info['gb'] or "").lower()
+        actual_gb = page_info.get('page_gb', gb)
+        actual_validity = page_info.get('page_validity', info['validity'])
+
+        # Stock detection: page shows different package than requested
+        out_of_stock = False
+        if info['gb'] and actual_gb and str(info['gb']) != str(actual_gb):
+            print(f"  ⚠️ Stock mismatch: requested {info['gb']}GB but page shows {actual_gb}GB")
+            out_of_stock = True
+        if info['validity'] and actual_validity and str(info['validity']) != str(actual_validity):
+            print(f"  ⚠️ Stock mismatch: requested {info['validity']}d but page shows {actual_validity}d")
+            out_of_stock = True
+
         return {
             'price': price,
             'countries': country_name,
-            'gb': f"{gb}gb" if gb else "",
-            'validity': f"{info['validity']}d" if info['validity'] else "",
-            'code': make_country_code(slug, gb) if gb else "",
+            'gb': f"{actual_gb}gb" if actual_gb else "",
+            'validity': f"{actual_validity}d" if actual_validity else "",
+            'code': make_country_code(slug, actual_gb) if actual_gb else "",
             'network': network,
             'breakout_ip': breakout_ip,
+            'route': route_display if route_name else "",
+            'out_of_stock': out_of_stock,
             'note': "" if price else "Could not read price",
         }
 
@@ -324,12 +378,10 @@ class ESIMScraper:
         plans = parse_region_plans(text)
         if not plans:
             return {'price': None, 'countries': '', 'gb': '', 'validity': '',
-                    'code': '', 'network': '', 'breakout_ip': '',
+                    'code': '', 'network': '', 'breakout_ip': '', 'route': '',
+                    'out_of_stock': False,
                     'note': 'No plans found on region page'}
 
-        # Choose plan by variant (country count). If none, list options for the user.
-        # The variant cell may be currency-formatted (e.g. "$18.00") or have stray
-        # text, so pull the first integer out rather than requiring a clean digit.
         chosen = None
         m = re.search(r'\d+', variant or '')
         if m:
@@ -340,11 +392,11 @@ class ESIMScraper:
         if chosen is None:
             options = ", ".join(f"{p['countries']} מדינות ${p['price']:.2f}" for p in plans)
             return {'price': None, 'countries': '', 'gb': '', 'validity': '',
-                    'code': '', 'network': '', 'breakout_ip': '',
+                    'code': '', 'network': '', 'breakout_ip': '', 'route': '',
+                    'out_of_stock': False,
                     'note': f"בחר וריאנט (מספר מדינות) בעמודת 'וריאנט (אזורי)' — "
                             f"{len(plans)} חבילות: {options}"}
 
-        # Click into the chosen plan to reveal its Payment Summary, then read One-time payment
         price = f"${chosen['price']:.2f}"
         try:
             await page.locator(f"text={chosen['countries']} countries").first.click()
@@ -364,9 +416,11 @@ class ESIMScraper:
             'countries': f"{chosen['countries']} מדינות",
             'gb': f"{gb}gb" if gb else "",
             'validity': f"{info['validity']}d" if info['validity'] else chosen['validity'],
-            'code': make_region_code(info['region'], gb) if gb else "",
+            'code': make_region_code(info['region'], gb, chosen['countries']) if gb else "",
             'network': net_info['network'],
             'breakout_ip': net_info['breakout_ip'],
+            'route': '',
+            'out_of_stock': False,
             'note': "",
         }
 
@@ -393,15 +447,16 @@ class ESIMScraper:
                     await page.wait_for_timeout(2000)
                     if info['type'] == 'country':
                         return await self.scrape_country(page, info)
-                    # unknown / partial link — still try to read a price
                     price = await self.extract_price(page)
                     return {'price': price, 'countries': '', 'gb': '', 'validity': '',
-                            'code': '', 'network': '', 'breakout_ip': '',
+                            'code': '', 'network': '', 'breakout_ip': '', 'route': '',
+                            'out_of_stock': False,
                             'note': 'Partial link — add data/validity params'}
             except Exception as e:
                 print(f"  ❌ {e}")
                 return {'price': None, 'countries': '', 'gb': '', 'validity': '',
-                        'code': '', 'network': '', 'breakout_ip': '', 'note': f'Error: {e}'}
+                        'code': '', 'network': '', 'breakout_ip': '', 'route': '',
+                        'out_of_stock': False, 'note': f'Error: {e}'}
             finally:
                 await browser.close()
 
@@ -478,15 +533,20 @@ class ESIMScraper:
         width = max(col_index.values(), default=0) + 1
         items = []
         for idx, row in enumerate(rows[1:], start=2):
-            row = row + [""] * (width - len(row))  # pad to cover all mapped columns
+            row = row + [""] * (width - len(row))
             link = row[col_index['link']] if 'link' in col_index else ""
             if link and link.startswith("http"):
+                def _get(key):
+                    return row[col_index[key]] if key in col_index else ""
                 items.append({
                     'row': idx,
                     'link': link,
-                    'old_price': row[col_index['price']] if 'price' in col_index else "",
-                    'variant': row[col_index['variant']] if 'variant' in col_index else "",
-                    'old_changed': row[col_index['changed']] if 'changed' in col_index else "",
+                    'old_price': _get('price'),
+                    'variant': _get('variant'),
+                    'old_changed': _get('changed'),
+                    'my_price': _get('my_price'),
+                    'old_gb': _get('gb'),
+                    'old_validity': _get('validity'),
                 })
         return items, col_index
 
@@ -504,16 +564,15 @@ class ESIMScraper:
         updates = []
 
         def put(row, key, value):
-            """Queue a cell write, locating the column by its header key."""
             if key not in col:
-                return  # header not present in this sheet — skip silently
+                return
             updates.append({'range': f'{col_letter(col[key])}{row}',
                             'values': [[value]]})
 
         def to_val(p):
             try:
-                return float(p.replace('$', ''))
-            except:
+                return float(str(p).replace('$', '').replace(',', ''))
+            except Exception:
                 return None
 
         for it in items:
@@ -522,7 +581,6 @@ class ESIMScraper:
             new_price = res['price']
 
             if new_price is None:
-                # Only update timestamp and note on error, don't touch price fields
                 put(r, 'updated', ts)
                 put(r, 'changed', res['note'] or 'Check failed')
                 continue
@@ -535,7 +593,15 @@ class ESIMScraper:
                              and abs(new_val - old_val) > 0.001)
             first_time = (old_val is None and new_val is not None)
 
-            # Always update metadata + current price + timestamp
+            # ── Stock detection ──
+            if res.get('out_of_stock'):
+                put(r, 'updated', ts)
+                put(r, 'stock', 'לא במלאי')
+                put(r, 'changed', f"לא במלאי — הדף הציג {res['gb']}/{res['validity']}")
+                print(f"  ❌ Row {r}: out of stock")
+                continue
+
+            # ── Update all fields ──
             if res['code']:
                 put(r, 'code', res['code'])
             if res['countries']:
@@ -545,42 +611,64 @@ class ESIMScraper:
             put(r, 'source', 'esim.dog')
             if res['validity']:
                 put(r, 'validity', res['validity'])
-            put(r, 'price', new_price)       # current buy price (always)
-            put(r, 'updated', ts)            # updated timestamp (always)
+            put(r, 'price', new_price)
+            put(r, 'updated', ts)
 
-            # Networks / Breakout IP reflect the currently-selected (cheapest) route,
-            # always refreshed regardless of whether the price changed.
-            if res['network']:
+            if res.get('network'):
                 put(r, 'network', res['network'])
-            if res['breakout_ip']:
+            if res.get('breakout_ip'):
                 put(r, 'breakout_ip', res['breakout_ip'])
+            if res.get('route'):
+                put(r, 'route', res['route'])
 
+            # ── Price change tracking ──
             if price_changed:
                 diff = new_val - old_val
                 pct = (diff / old_val) * 100
                 arrow = '↑' if diff > 0 else '↓'
                 sign = '+' if diff > 0 else '-'
-                # Leading arrow keeps Google Sheets from reading it as a formula
                 changed = f"{arrow} {sign}${abs(diff):.2f} ({sign}{abs(pct):.1f}%)"
-                put(r, 'prev', old)          # previous price (persists until next change)
-                put(r, 'changed', changed)   # the change (persists until next change)
-                put(r, 'last_change', datetime.now().strftime("%Y-%m-%d"))  # change date
+                put(r, 'prev', old)
+                put(r, 'changed', changed)
+                put(r, 'last_change', datetime.now().strftime("%Y-%m-%d"))
             elif first_time:
                 put(r, 'changed', "First check")
             else:
-                # Price unchanged → keep a real change description (↑/↓/First check),
-                # but clear any stale error left in J by an earlier failed run.
                 oc = (it.get('old_changed') or "").strip()
                 is_real = oc.startswith('↑') or oc.startswith('↓') or oc == "First check"
                 if oc and not is_real:
                     put(r, 'changed', "")
-            # (prev and last_change are never touched when the price is unchanged)
+
+            # ── Profitability check ──
+            my_price_val = to_val(it['my_price'])
+            if my_price_val and new_val:
+                profit_abs = my_price_val - new_val
+                profit_pct = (profit_abs / new_val) * 100
+                sign = '+' if profit_abs >= 0 else '-'
+                put(r, 'profit',
+                    f"{sign}${abs(profit_abs):.2f} ({sign}{abs(profit_pct):.1f}%)")
+
+                gb_num = to_val(res['gb'].replace('gb', '')) if res['gb'] else None
+                is_1gb = gb_num is not None and gb_num <= 1
+
+                if is_1gb:
+                    # 1GB: flag if loss exceeds 20%
+                    if profit_pct < -20:
+                        put(r, 'stock', 'לא רווחי')
+                        print(f"  💸 Row {r}: 1GB unprofitable ({profit_pct:+.1f}%)")
+                    else:
+                        put(r, 'stock', '')
+                else:
+                    # All others: flag if profit below 20%
+                    if profit_pct < 20:
+                        put(r, 'stock', 'לא רווחי')
+                        print(f"  💸 Row {r}: unprofitable ({profit_pct:+.1f}%)")
+                    else:
+                        put(r, 'stock', '')
+            else:
+                put(r, 'stock', '')
 
         if updates:
-            # The scrape can take 10+ minutes — long enough for the idle Google
-            # connection to be dropped by the server, causing a BrokenPipeError on
-            # the first write. So rebuild a fresh connection right before writing,
-            # send in small chunks, and retry each chunk (rebuilding) on failure.
             self.setup_google_sheets()
             CHUNK = 50
             for i in range(0, len(updates), CHUNK):
@@ -597,7 +685,7 @@ class ESIMScraper:
                               f"failed: {e}")
                         if attempt == 3:
                             raise
-                        self.setup_google_sheets()  # fresh connection, then retry
+                        self.setup_google_sheets()
             print(f"\n📊 Sheet updated for {len(items)} packages at {ts}")
         print("\n✅ Done!")
 
