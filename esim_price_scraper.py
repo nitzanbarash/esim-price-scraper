@@ -620,6 +620,8 @@ class ESIMScraper:
                 put(r, 'breakout_ip', res['breakout_ip'])
             if res.get('route'):
                 put(r, 'route', res['route'])
+            elif '/regions' in it['link']:
+                put(r, 'route', '')  # regional plans have no route colour — keep O clean
 
             # ── Price change tracking ──
             if price_changed:
