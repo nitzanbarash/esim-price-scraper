@@ -645,8 +645,11 @@ class ESIMScraper:
                 profit_abs = my_price_val - new_val
                 profit_pct = (profit_abs / new_val) * 100
                 sign = '+' if profit_abs >= 0 else '-'
+                # Leading emoji keeps Sheets from parsing "+..."/"-..." as a formula,
+                # and doubles as a green/red profit indicator.
+                emoji = '🟢' if profit_abs >= 0 else '🔴'
                 put(r, 'profit',
-                    f"{sign}${abs(profit_abs):.2f} ({sign}{abs(profit_pct):.1f}%)")
+                    f"{emoji} {sign}${abs(profit_abs):.2f} ({sign}{abs(profit_pct):.1f}%)")
 
                 gb_num = to_val(res['gb'].replace('gb', '')) if res['gb'] else None
                 is_1gb = gb_num is not None and gb_num <= 1

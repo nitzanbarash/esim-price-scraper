@@ -2,8 +2,13 @@ name: eSIM price scrape
 
 # Runs daily in GitHub's cloud — your Mac does NOT need to be on.
 on:
-  # Triggered externally by cron-job.org for precise 10:00 Israel time.
-  # Manual trigger from GitHub Actions tab also works.
+  # Automatic daily run — no external service or Mac required.
+  # GitHub's free scheduler can drift by up to a few hours, but it always runs
+  # at least once a day. For exact 10:00 timing, an external trigger
+  # (cron-job.org) can POST to workflow_dispatch instead.
+  schedule:
+    - cron: "0 7 * * *"   # 07:00 UTC = 10:00 Israel (summer) / 09:00 (winter)
+  # Manual trigger (Actions tab) + external triggers (cron-job.org).
   workflow_dispatch:
 
 jobs:
