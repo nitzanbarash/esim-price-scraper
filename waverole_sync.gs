@@ -8,12 +8,13 @@
  *  3. Menu "🌊 Waverole": preview (dry run), full sync, sync selected rows,
  *     run scrape now.
  *
- * One-time setup:
- *  A. Apps Script → Project Settings → Time zone: Asia/Jerusalem.
- *  B. Project Settings → Script Properties, add two rows:
+ * One-time setup (all from the sheet, no settings pages):
+ *  1. Extensions → Apps Script → paste this file → Save (Cmd+S).
+ *  2. Reload the sheet → menu 🌊 Waverole → "🛠 התקנה ראשונית" → authorize,
+ *     then paste the two tokens when prompted:
  *       SITE_TOKEN = the UPDATE_PACKAGES_TOKEN value (site's .env.local)
  *       GH_TOKEN   = GitHub PAT (repo+workflow) for esim-price-scraper
- *  C. In the editor run setupTriggers() once and authorize.
+ *     (Trigger timezone is set in code — no timezone setting needed.)
  */
 
 const ENDPOINT = 'https://www.waverole.com/api/update-packages';
@@ -39,14 +40,36 @@ function onOpen() {
     .addItem('עדכן שורות מסומנות', 'syncSelected')
     .addSeparator()
     .addItem('הרץ סריקה עכשיו (GitHub)', 'runScrapeNow')
+    .addSeparator()
+    .addItem('🛠 התקנה ראשונית', 'firstTimeSetup')
     .addToUi();
+}
+
+function firstTimeSetup() {
+  const ui = SpreadsheetApp.getUi();
+  const props = PropertiesService.getScriptProperties();
+
+  const site = ui.prompt('התקנה 1/2 — טוקן האתר',
+    'הדבק את הערך של UPDATE_PACKAGES_TOKEN (מהאתר):', ui.ButtonSet.OK_CANCEL);
+  if (site.getSelectedButton() !== ui.Button.OK) return;
+  if (site.getResponseText().trim()) props.setProperty('SITE_TOKEN', site.getResponseText().trim());
+
+  const gh = ui.prompt('התקנה 2/2 — טוקן GitHub',
+    'הדבק את ה-Personal Access Token של GitHub (repo+workflow):', ui.ButtonSet.OK_CANCEL);
+  if (gh.getSelectedButton() !== ui.Button.OK) return;
+  if (gh.getResponseText().trim()) props.setProperty('GH_TOKEN', gh.getResponseText().trim());
+
+  setupTriggers();
+  ui.alert('ההתקנה הושלמה ✓',
+    'עדכון מיידי בכל עריכה + סריקה יומית ב-10:00 + סנכרון אתר אחריה.', ui.ButtonSet.OK);
 }
 
 function setupTriggers() {
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('onEditPush')
     .forSpreadsheet(SpreadsheetApp.getActive()).onEdit().create();
-  ScriptApp.newTrigger('dailyScrape').timeBased().atHour(10).everyDays(1).create();
+  ScriptApp.newTrigger('dailyScrape').timeBased()
+    .atHour(10).everyDays(1).inTimezone('Asia/Jerusalem').create();
   SpreadsheetApp.getActive().toast('Triggers מותקנים ✓', 'Waverole', 5);
 }
 
