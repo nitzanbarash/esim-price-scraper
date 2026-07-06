@@ -1,24 +1,36 @@
 /**
- * Waverole ↔ Google Sheet sync  (paste into the sheet: Extensions → Apps Script)
+ * Waverole ↔ Google Sheet sync — STANDALONE Apps Script project.
+ *
+ * Why standalone: the spreadsheet sits in shared storage whose security
+ * restrictions block creating a container-bound script ("מגבלות אבטחה").
+ * A standalone project + installable triggers works around that: it opens
+ * the sheet by ID, so no binding is needed. Limitation: standalone scripts
+ * cannot add a custom menu inside the sheet — manual actions run from the
+ * Apps Script editor (Run ▶) instead.
  *
  * What it does:
- *  1. INSTANT site update whenever a relevant cell is edited in the sheet.
- *  2. Daily ~10:00 Israel: starts the GitHub scraper, then a full site sync
+ *  1. INSTANT site update whenever a relevant cell is edited in the sheet
+ *     (installable onEdit trigger).
+ *  2. Daily 10:00 Israel: starts the GitHub scraper, then a full site sync
  *     45 minutes later (after the scrape finished writing fresh data).
- *  3. Menu "🌊 Waverole": preview (dry run), full sync, sync selected rows,
- *     run scrape now.
  *
- * One-time setup (all from the sheet, no settings pages):
- *  1. Extensions → Apps Script → paste this file → Save (Cmd+S).
- *  2. Reload the sheet → menu 🌊 Waverole → "🛠 התקנה ראשונית" → authorize,
- *     then paste the two tokens when prompted:
+ * One-time setup (in the Apps Script editor, script.google.com):
+ *  1. Paste this file over Code.gs → Save (Cmd+S).
+ *  2. Project Settings (⚙) → Script properties → add:
  *       SITE_TOKEN = the UPDATE_PACKAGES_TOKEN value (site's .env.local)
  *       GH_TOKEN   = GitHub PAT (repo+workflow) for esim-price-scraper
- *     (Trigger timezone is set in code — no timezone setting needed.)
+ *  3. In the editor pick `setupTriggers` in the function dropdown → Run ▶
+ *     → authorize when prompted. Done.
+ *
+ * Manual actions (function dropdown → Run ▶):
+ *   previewLog   — log the exact JSON that would be sent (dry run)
+ *   fullSync     — push all packages to the site now
+ *   runScrapeNow — trigger the GitHub scraper now
  */
 
 const ENDPOINT = 'https://www.waverole.com/api/update-packages';
 const GH_DISPATCH = 'https://api.github.com/repos/nitzanbarash/esim-price-scraper/actions/workflows/scrape.yml/dispatches';
+const SHEET_ID = '108D3BUV-MNcIuRZuKUgb-E-b1Ra8moxWZZyI5JxnyRo';
 
 // Row-1 header text (trimmed) → API field
 const HEADERS = {
@@ -33,47 +45,20 @@ const HEADERS = {
   sale:        'מבעצעים (אחוזים)',  // empty/0 cancels the sale
 };
 
-function onOpen() {
-  SpreadsheetApp.getUi().createMenu('🌊 Waverole')
-    .addItem('תצוגה מקדימה (בלי לשלוח)', 'previewSync')
-    .addItem('עדכן אתר עכשיו — הכל', 'fullSync')
-    .addItem('עדכן שורות מסומנות', 'syncSelected')
-    .addSeparator()
-    .addItem('הרץ סריקה עכשיו (GitHub)', 'runScrapeNow')
-    .addSeparator()
-    .addItem('🛠 התקנה ראשונית', 'firstTimeSetup')
-    .addToUi();
-}
-
-function firstTimeSetup() {
-  const ui = SpreadsheetApp.getUi();
-  const props = PropertiesService.getScriptProperties();
-
-  const site = ui.prompt('התקנה 1/2 — טוקן האתר',
-    'הדבק את הערך של UPDATE_PACKAGES_TOKEN (מהאתר):', ui.ButtonSet.OK_CANCEL);
-  if (site.getSelectedButton() !== ui.Button.OK) return;
-  if (site.getResponseText().trim()) props.setProperty('SITE_TOKEN', site.getResponseText().trim());
-
-  const gh = ui.prompt('התקנה 2/2 — טוקן GitHub',
-    'הדבק את ה-Personal Access Token של GitHub (repo+workflow):', ui.ButtonSet.OK_CANCEL);
-  if (gh.getSelectedButton() !== ui.Button.OK) return;
-  if (gh.getResponseText().trim()) props.setProperty('GH_TOKEN', gh.getResponseText().trim());
-
-  setupTriggers();
-  ui.alert('ההתקנה הושלמה ✓',
-    'עדכון מיידי בכל עריכה + סריקה יומית ב-10:00 + סנכרון אתר אחריה.', ui.ButtonSet.OK);
-}
-
 function setupTriggers() {
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('onEditPush')
-    .forSpreadsheet(SpreadsheetApp.getActive()).onEdit().create();
+    .forSpreadsheet(SHEET_ID).onEdit().create();
   ScriptApp.newTrigger('dailyScrape').timeBased()
     .atHour(10).everyDays(1).inTimezone('Asia/Jerusalem').create();
-  SpreadsheetApp.getActive().toast('Triggers מותקנים ✓', 'Waverole', 5);
+  Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape');
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
+function sheet_() {
+  return SpreadsheetApp.openById(SHEET_ID).getSheets()[0];
+}
+
 function colMap_(sheet) {
   const head = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
   const map = {};
@@ -108,7 +93,7 @@ function rowToPackage_(row, map) {
 }
 
 function buildPackages_(rowsWanted) {   // rowsWanted: null = all, or Set of sheet row numbers
-  const sheet = SpreadsheetApp.getActive().getSheets()[0];
+  const sheet = sheet_();
   const map = colMap_(sheet);
   const data = sheet.getDataRange().getValues();
   const out = [];
@@ -122,7 +107,7 @@ function buildPackages_(rowsWanted) {   // rowsWanted: null = all, or Set of she
 
 function post_(packages) {
   const token = PropertiesService.getScriptProperties().getProperty('SITE_TOKEN');
-  if (!token) throw new Error('חסר SITE_TOKEN ב-Script Properties');
+  if (!token) throw new Error('חסר SITE_TOKEN ב-Script Properties (הגדרות הפרויקט)');
   const res = UrlFetchApp.fetch(ENDPOINT, {
     method: 'post',
     contentType: 'application/json',
@@ -140,7 +125,8 @@ function post_(packages) {
       ((j.not_found || []).length ? ' | לא נמצאו: ' + j.not_found.join(', ') : '') +
       ((j.warnings || []).length ? ' | ⚠️ ' + j.warnings.length + ' אזהרות' : '');
   } catch (err) {}
-  SpreadsheetApp.getActive().toast(msg, 'Waverole', 8);
+  Logger.log(msg);
+  try { SpreadsheetApp.openById(SHEET_ID).toast(msg, 'Waverole', 8); } catch (e) {}
   return body;
 }
 
@@ -148,7 +134,7 @@ function post_(packages) {
 function onEditPush(e) {
   if (!e || !e.range) return;
   const sheet = e.range.getSheet();
-  const main = SpreadsheetApp.getActive().getSheets()[0];
+  const main = e.source.getSheets()[0];
   if (sheet.getSheetId() !== main.getSheetId()) return;
   const map = colMap_(sheet);
   const watched = Object.values(map).map(i => i + 1);
@@ -163,27 +149,15 @@ function onEditPush(e) {
 
 function fullSync() { post_(buildPackages_(null)); }
 
-function syncSelected() {
-  const sel = SpreadsheetApp.getActiveRange();
-  const rows = new Set();
-  for (let r = Math.max(2, sel.getRow()); r <= sel.getLastRow(); r++) rows.add(r);
-  const pkgs = buildPackages_(rows);
-  if (pkgs.length) post_(pkgs);
-  else SpreadsheetApp.getActive().toast('אין חבילות בשורות שנבחרו', 'Waverole', 5);
-}
-
-function previewSync() {
+function previewLog() {
   const pkgs = buildPackages_(null);
-  const html = HtmlService.createHtmlOutput(
-    '<pre style="direction:ltr;text-align:left;font-size:11px">' +
-    JSON.stringify({ packages: pkgs }, null, 2).replace(/</g, '&lt;') + '</pre>')
-    .setWidth(560).setHeight(480);
-  SpreadsheetApp.getUi().showModalDialog(html, 'מה יישלח לאתר (' + pkgs.length + ' חבילות)');
+  Logger.log('packages: ' + pkgs.length);
+  Logger.log(JSON.stringify({ packages: pkgs }, null, 2));
 }
 
 function runScrapeNow() {
   const token = PropertiesService.getScriptProperties().getProperty('GH_TOKEN');
-  if (!token) throw new Error('חסר GH_TOKEN ב-Script Properties');
+  if (!token) throw new Error('חסר GH_TOKEN ב-Script Properties (הגדרות הפרויקט)');
   const res = UrlFetchApp.fetch(GH_DISPATCH, {
     method: 'post',
     contentType: 'application/json',
@@ -192,9 +166,7 @@ function runScrapeNow() {
     muteHttpExceptions: true,
   });
   const ok = res.getResponseCode() === 204;
-  SpreadsheetApp.getActive().toast(
-    ok ? 'הסריקה הופעלה ב-GitHub ✓' : 'שגיאה: ' + res.getContentText(),
-    'Waverole', 8);
+  Logger.log(ok ? 'הסריקה הופעלה ב-GitHub ✓' : 'שגיאה: ' + res.getContentText());
 }
 
 function dailyScrape() {
