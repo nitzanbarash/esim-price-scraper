@@ -238,6 +238,13 @@ function fullSyncOnce() {
   }
 }
 
+// Manual test: verifies the alert-email path works (run from the editor).
+function testAlert() {
+  alert_('בדיקת מערכת ההתראות',
+    'אם קיבלת את המייל הזה — מערכת ההתראות של סנכרון המחירים עובדת ✓');
+  Logger.log('test alert sent to ' + ALERT_EMAIL);
+}
+
 // ── watchdog: is the live site actually fresh? ──────────────────────
 function checkSiteFresh() {
   try {
