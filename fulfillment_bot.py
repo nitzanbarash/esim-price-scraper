@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""
+Order-fulfillment bot (bot #4) — runs in GitHub Actions ("on the internet").
+
+What it does, every run (stateless — safe to run as often as you like):
+  1. Reads the waverolesupply@gmail.com inbox over IMAP and picks up every
+     UNFLAGGED "Your eSIM is ready!" email from orders@updates.esim.dog.
+  2. Opens the email's success page (esim.dog/success?session_id=...) in a
+     headless browser, expands "eSIM Details", and extracts the activation
+     code / SM-DP+ / ICCID / APN. If the text is not exposed, it decodes the
+     QR image itself (the QR *is* the LPA activation string).
+  3. Matches the email to the oldest compatible PENDING row in the receipts
+     Google Sheet (has order number, no activation yet, same GB, compatible
+     location, purchased before the email within MATCH_WINDOW_HOURS).
+     Two look-alike candidates within 3 minutes -> alert, never guess.
+  4. Completes the sheet row, then POSTs fulfillment to waverole.com so the
+     customer's order page shows the QR and the site emails them.
+  5. Flags the email (IMAP \\Flagged) so it is never processed twice.
+     A run that could not extract details leaves the email unflagged and
+     the next run retries automatically.
+
+Required environment (GitHub Secrets):
+  GOOGLE_CREDENTIALS_JSON  service-account JSON (same one the scraper uses;
+                           share the receipts sheet with it as Editor!)
+  GMAIL_APP_PASSWORD       app password for waverolesupply@gmail.com
+  ORDERS_TOKEN             bearer token of waverole.com/api/orders
+"""
+
+import base64
+import email
+import email.header
+import email.utils
+import imaplib
+import json
+import logging
+import os
+import re
+import smtplib
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
+from zoneinfo import ZoneInfo
+
+import gspread
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("fulfillment")
+
+# ── constants ────────────────────────────────────────────────────────────────
+GMAIL_USER = os.getenv("GMAIL_USER", "waverolesupply@gmail.com")
+ALERTS_EMAIL = os.getenv("ALERTS_EMAIL", "uper.request@gmail.com")
+DELIVERY_FROM = "orders@updates.esim.dog"
+DELIVERY_SUBJECT = "Your eSIM is ready"
+RECEIPTS_SHEET_ID = "1bWH_Zef0aNwZjLOR07hjJRZRXkrY73mX0aMLGPH6uao"
+ORDERS_URL = "https://www.waverole.com/api/orders"
+MATCH_WINDOW_HOURS = int(os.getenv("MATCH_WINDOW_HOURS", "12"))
+LOOKBACK_DAYS = 7          # only consider emails from the last week
+TZ = ZoneInfo("Asia/Jerusalem")
+
+SUCCESS_URL_RE = re.compile(r"https://esim\.dog/success\?session_id=[A-Za-z0-9_\-]+")
+PLAN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*GB\s*[-–]\s*(\d+)\s*days?", re.I)
+LPA_RE = re.compile(r"LPA:1\$[^\s\"'<>]+\$[A-Za-z0-9\-_]+")
+ICCID_RE = re.compile(r"\b(89\d{17,18})\b")
+APN_RE = re.compile(r"APN[^A-Za-z0-9]{0,20}([a-z0-9.\-]+\.[a-z]{2,})", re.I)
+
+
+def env(name: str) -> str:
+    v = os.getenv(name, "").strip()
+    if not v:
+        sys.exit(f"Missing env/secret: {name}")
+    return v
+
+
+# ── alerts ───────────────────────────────────────────────────────────────────
+
+def alert(subject: str, body: str):
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["From"] = GMAIL_USER
+        msg["To"] = ALERTS_EMAIL
+        msg["Subject"] = f"[fulfillment bot] {subject}"
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+            s.starttls()
+            s.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
+            s.send_message(msg)
+    except Exception:
+        log.exception("alert email failed")
+
+
+# ── inbox ────────────────────────────────────────────────────────────────────
+
+def _decode(s) -> str:
+    if not s:
+        return ""
+    return "".join(
+        p.decode(enc or "utf-8", "replace") if isinstance(p, bytes) else p
+        for p, enc in email.header.decode_header(s)
+    )
+
+
+def _body_text(msg) -> str:
+    chunks = []
+    for part in msg.walk():
+        if part.get_content_type() in ("text/plain", "text/html"):
+            payload = part.get_payload(decode=True)
+            if payload:
+                chunks.append(payload.decode(part.get_content_charset() or "utf-8", "replace"))
+    return "\n".join(chunks)
+
+
+def parse_delivery(uid: str, msg) -> dict | None:
+    text = _body_text(msg)
+    m_url = SUCCESS_URL_RE.search(text)
+    if not m_url:
+        return None
+    out = {"uid": uid, "success_url": m_url.group(0), "gb": None, "days": None,
+           "location": "", "network": "", "received_at": None}
+    if m := PLAN_RE.search(text):
+        out["gb"], out["days"] = float(m.group(1)), int(m.group(2))
+    if m := re.search(r"📍\s*([A-Za-z ,()&\-]+)", text):
+        out["location"] = m.group(1).strip()
+    if m := re.search(r"📶\s*([^\n<]+)", text):
+        out["network"] = m.group(1).strip()
+    try:
+        out["received_at"] = email.utils.parsedate_to_datetime(msg.get("Date")).astimezone(timezone.utc)
+    except Exception:
+        out["received_at"] = datetime.now(timezone.utc)
+    return out
+
+
+class Inbox:
+    def __init__(self):
+        self.box = imaplib.IMAP4_SSL("imap.gmail.com")
+        self.box.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
+        self.box.select("INBOX")
+
+    def unprocessed(self) -> list[dict]:
+        since = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%d-%b-%Y")
+        typ, data = self.box.uid(
+            "search", None, f'(UNFLAGGED FROM "{DELIVERY_FROM}" SINCE {since})'
+        )
+        out = []
+        for uid_b in (data[0] or b"").split():
+            uid = uid_b.decode()
+            typ, msgdata = self.box.uid("fetch", uid, "(RFC822)")
+            if typ != "OK" or not msgdata or msgdata[0] is None:
+                continue
+            msg = email.message_from_bytes(msgdata[0][1])
+            if DELIVERY_SUBJECT.lower() not in _decode(msg.get("Subject")).lower():
+                continue
+            if d := parse_delivery(uid, msg):
+                out.append(d)
+        return out
+
+    def flag(self, uid: str):
+        self.box.uid("store", uid, "+FLAGS", "(\\Flagged)")
+
+    def close(self):
+        try:
+            self.box.logout()
+        except Exception:
+            pass
+
+
+# ── success page scraping ────────────────────────────────────────────────────
+
+def decode_qr_data_uri(data_uri: str) -> str:
+    """The QR image encodes the LPA activation string — decode it."""
+    try:
+        import cv2
+        import numpy as np
+        raw = base64.b64decode(data_uri.split(",", 1)[1])
+        img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
+        text, *_ = cv2.QRCodeDetector().detectAndDecode(img)
+        return text or ""
+    except Exception as e:
+        log.warning(f"QR decode failed: {e}")
+        return ""
+
+
+def scrape_success_page(url: str) -> dict:
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(6000)
+
+            # Expand "eSIM Details" with a REAL click (JS clicks are ignored).
+            try:
+                page.get_by_text(re.compile("eSIM Details", re.I)).first.click(timeout=5000)
+                page.wait_for_timeout(2500)
+            except Exception:
+                log.info("eSIM Details expander not clicked (may already be open)")
+
+            html = page.content()
+            out = {}
+            if m := LPA_RE.search(html):
+                out["activation_code"] = m.group(0)
+            if m := ICCID_RE.search(html):
+                out["iccid"] = m.group(1)
+            if m := APN_RE.search(html):
+                out["apn"] = m.group(1)
+            if m := re.search(r'src="(data:image/png;base64,[^"]+)"', html):
+                out["qr_code"] = m.group(1)[:100000]
+                if not out.get("activation_code"):
+                    if lpa := decode_qr_data_uri(m.group(1)):
+                        if LPA_RE.match(lpa):
+                            out["activation_code"] = lpa
+                            log.info("activation code recovered from the QR image")
+            if ac := out.get("activation_code"):
+                parts = ac.split("$")
+                if len(parts) >= 2:
+                    out["smdp"] = parts[1]
+            return out
+        finally:
+            browser.close()
+
+
+# ── receipts sheet ───────────────────────────────────────────────────────────
+
+class AmbiguousMatch(Exception):
+    pass
+
+
+def sheet_client():
+    creds = env("GOOGLE_CREDENTIALS_JSON")
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        f.write(creds)
+        path = f.name
+    return gspread.service_account(filename=path)
+
+
+def _row_time(s: str):
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
+        try:
+            return datetime.strptime(s.strip(), fmt).replace(tzinfo=TZ)
+        except ValueError:
+            continue
+    return None
+
+
+def _link_ok(link: str, location: str) -> bool:
+    if not location or not link:
+        return True
+    l, slug = link.lower(), location.lower().replace(" ", "-")
+    if slug in l:
+        return True
+    m = re.search(r"[?&]region=([a-z\-]+)", l)
+    if m and m.group(1) in location.lower():
+        return True
+    return "region=" in l
+
+
+def find_pending_row(ws, delivery: dict) -> dict | None:
+    rows = ws.get_all_values()
+    hdr = [h.strip() for h in rows[0]]
+    idx = lambda name: hdr.index(name) if name in hdr else None
+    i_date, i_gb = idx("תאריך - Date"), idx("איחסון - GB")
+    i_order, i_act = idx("מס׳ הזמנה"), idx("Activation Code")
+    i_iccid, i_link = idx("מס סידורי -ICCID"), idx("Link - esim.dog")
+
+    email_time = delivery["received_at"].astimezone(TZ)
+    window = timedelta(hours=MATCH_WINDOW_HOURS)
+    cands = []
+    for n, r in enumerate(rows[1:], start=2):
+        get = lambda i: r[i].strip() if i is not None and len(r) > i else ""
+        if not get(i_order) or get(i_act) or get(i_iccid):
+            continue                                    # not pending
+        gb = re.sub(r"[^\d.]", "", get(i_gb))
+        if delivery["gb"] is not None and gb and float(gb) != delivery["gb"]:
+            continue
+        if not _link_ok(get(i_link), delivery["location"]):
+            continue
+        t = _row_time(get(i_date))
+        if t and (t > email_time or email_time - t > window):
+            continue
+        cands.append({"row": n, "time": t, "order_id": get(i_order)})
+
+    if not cands:
+        return None
+    cands.sort(key=lambda c: c["time"] or datetime.min.replace(tzinfo=TZ))
+    if len(cands) > 1 and cands[0]["time"] and cands[1]["time"] and \
+            abs((cands[1]["time"] - cands[0]["time"]).total_seconds()) < 180:
+        raise AmbiguousMatch(
+            f"rows {cands[0]['row']} and {cands[1]['row']} are both pending "
+            f"{delivery['gb']}GB within 3 minutes"
+        )
+    return cands[0]
+
+
+def complete_row(ws, row_number: int, delivery: dict, details: dict):
+    hdr = [h.strip() for h in ws.row_values(1)]
+    gb = delivery.get("gb")
+    updates = {
+        "GB (0/X) - ניצול": f"{gb:g} / {gb:g}" if gb else "",
+        "QR": delivery["success_url"],
+        "Activation Code": details.get("activation_code", ""),
+        "SM-DP+ Address": details.get("smdp", ""),
+        "מס סידורי -ICCID": details.get("iccid", ""),
+        "גישה - APN": details.get("apn", ""),
+        "אזור - Region": delivery.get("location", ""),
+        "חבילה - Plan": (
+            f'{gb:g}GB - {delivery["days"]} days — {delivery.get("network", "")}'
+            if gb and delivery.get("days") else delivery.get("network", "")
+        ),
+    }
+    cells = [gspread.Cell(row_number, hdr.index(k) + 1, str(v))
+             for k, v in updates.items() if k in hdr and v]
+    if cells:
+        ws.update_cells(cells, value_input_option="USER_ENTERED")
+    log.info(f"row {row_number}: {len(cells)} cells written")
+
+
+# ── site fulfillment ─────────────────────────────────────────────────────────
+
+def report_fulfilled(order_id: str, delivery: dict, details: dict):
+    payload = {
+        "order_id": order_id,
+        "status": "fulfilled",
+        "esim": {
+            "activation_code": details.get("activation_code", ""),
+            "qr_code": details.get("qr_code", ""),
+            "smdp": details.get("smdp", ""),
+            "iccid": details.get("iccid", ""),
+            "apn": details.get("apn", ""),
+            "region": delivery.get("location", ""),
+            "plan": (f'{delivery["gb"]:g}GB - {delivery["days"]}d'
+                     if delivery.get("gb") and delivery.get("days") else ""),
+            "networks": delivery.get("network", ""),
+        },
+    }
+    r = requests.post(ORDERS_URL, json=payload, timeout=20,
+                      headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+    r.raise_for_status()
+    log.info(f"order {order_id}: site fulfilled")
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def process(inbox: Inbox, ws, d: dict):
+    uid = d["uid"]
+    log.info(f"email uid={uid}: {d['gb']}GB/{d['days']}d {d['location']}")
+
+    try:
+        match = find_pending_row(ws, d)
+    except AmbiguousMatch as e:
+        alert("Ambiguous match — manual action needed",
+              f"{e}\nEmail: {d['gb']}GB {d['location']} {d['success_url']}\n"
+              "No row was touched.")
+        inbox.flag(uid)
+        return
+
+    if match is None:
+        alert("Delivery email without a matching order",
+              f"{d['gb']}GB / {d['days']}d / {d['location']}\n{d['success_url']}\n"
+              "No pending receipts row matched — if this was a manual "
+              "purchase, ignore this message.")
+        inbox.flag(uid)
+        return
+
+    order_id = match["order_id"]
+    details = scrape_success_page(d["success_url"])
+    if not (details.get("activation_code") or details.get("iccid")):
+        log.warning(f"order {order_id}: no details on success page yet — will retry")
+        return                                          # NOT flagged → retried
+
+    complete_row(ws, match["row"], d, details)
+    try:
+        report_fulfilled(order_id, d, details)
+    except Exception as e:
+        alert(f"Order {order_id}: sheet done, site report FAILED",
+              f"{e}\nUpdate the site manually or re-run the workflow.")
+    inbox.flag(uid)
+    log.info(f"order {order_id} COMPLETED (row {match['row']})")
+
+
+def main():
+    inbox = Inbox()
+    try:
+        deliveries = inbox.unprocessed()
+        log.info(f"{len(deliveries)} unprocessed delivery email(s)")
+        if not deliveries:
+            return
+        ws = sheet_client().open_by_key(RECEIPTS_SHEET_ID).sheet1
+        for d in deliveries:
+            try:
+                process(inbox, ws, d)
+            except Exception:
+                log.exception(f"email uid={d['uid']} failed — left for retry")
+    finally:
+        inbox.close()
+
+
+if __name__ == "__main__":
+    main()

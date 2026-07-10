@@ -1,0 +1,43 @@
+name: Order fulfillment (delivery emails)
+
+# Bot #4: completes orders from esim.dog delivery emails — receipts sheet +
+# waverole.com order page. Stateless: processed emails are IMAP-flagged.
+on:
+  schedule:
+    - cron: "*/5 * * * *"    # every 5 minutes (public repo — free)
+  workflow_dispatch: {}       # manual run from the Actions tab
+  repository_dispatch:        # instant trigger the site can call on purchase
+    types: [order-paid]
+
+concurrency:
+  group: fulfillment
+  cancel-in-progress: false
+
+jobs:
+  fulfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
+      - name: Install dependencies
+        run: |
+          pip install -q gspread requests playwright opencv-python-headless numpy
+          python -m playwright install --with-deps chromium
+
+      - name: Run fulfillment bot
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+        run: python fulfillment_bot.py
