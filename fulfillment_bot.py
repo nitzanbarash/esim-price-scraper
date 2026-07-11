@@ -130,11 +130,34 @@ def parse_delivery(uid: str, msg) -> dict | None:
     return out
 
 
+def _all_mail_folder(box) -> str:
+    """Gmail's "All Mail" folder — sees every message regardless of which
+    label/filter it landed under (a filter that skips the inbox would hide
+    the email from an INBOX-only search). Found via the \\All special-use
+    attribute so it works in any UI language; INBOX is the last resort."""
+    try:
+        typ, folders = box.list()
+        if typ == "OK":
+            for raw in folders:
+                line = raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)
+                if "\\All" in line:
+                    # ...(\HasNoChildren \All) "/" "[Gmail]/All Mail"
+                    name = line.split(' "/" ')[-1].strip().strip('"')
+                    if name:
+                        return name
+    except Exception as e:
+        log.warning(f"folder list failed ({e}) — using INBOX")
+    return "INBOX"
+
+
 class Inbox:
     def __init__(self):
         self.box = imaplib.IMAP4_SSL("imap.gmail.com")
         self.box.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
-        self.box.select("INBOX")
+        folder = _all_mail_folder(self.box)
+        log.info(f"searching folder: {folder}")
+        # imaplib needs the mailbox name quoted when it contains spaces.
+        self.box.select(f'"{folder}"' if " " in folder else folder)
 
     def unprocessed(self) -> list[dict]:
         since = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%d-%b-%Y")
