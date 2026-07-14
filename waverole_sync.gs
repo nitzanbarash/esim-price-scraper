@@ -216,10 +216,18 @@ function runScrapeNow() {
 }
 
 function dailyScrape() {
-  try {
-    runScrapeNow();
-  } catch (err) {
-    alert_('dailyScrape נכשל', String(err));
+  // Dispatching the GitHub scraper needs a GH_TOKEN. Without one this step
+  // is SKIPPED SILENTLY — the scraper has its own daily schedule on GitHub,
+  // so no alert is needed (it used to email an error every morning).
+  const gh = PropertiesService.getScriptProperties().getProperty('GH_TOKEN');
+  if (gh) {
+    try {
+      runScrapeNow();
+    } catch (err) {
+      alert_('dailyScrape נכשל', String(err));
+    }
+  } else {
+    Logger.log('GH_TOKEN not set — skipping dispatch (GitHub cron handles the scrape).');
   }
   // Full site sync 45 min later — after the scraper wrote fresh data to the
   // sheet. Programmatic writes don't fire onEdit, so this sync is the ONLY
