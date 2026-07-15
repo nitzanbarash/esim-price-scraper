@@ -78,6 +78,15 @@ function alert_(subject, body) {
   } catch (e) { Logger.log('alert email failed: ' + e); }
 }
 
+// Positive daily confirmation — sent when the morning check passed, so a
+// silent inbox never leaves you guessing whether the check ran at all.
+function report_(subject, body) {
+  try {
+    MailApp.sendEmail(ALERT_EMAIL, '✅ Waverole sync: ' + subject,
+      body + '\n\n(הודעה אוטומטית מסקריפט הסנכרון של טבלת המחירים)');
+  } catch (e) { Logger.log('report email failed: ' + e); }
+}
+
 function sheet_() {
   return SpreadsheetApp.openById(SHEET_ID).getSheets()[0];
 }
@@ -265,12 +274,18 @@ function checkSiteFresh() {
     }
     const updated = new Date(JSON.parse(res.getContentText()).updated);
     const hours = (Date.now() - updated.getTime()) / 36e5;
+    const ageStr = hours.toFixed(1) + ' שעות';
     Logger.log('site data age: ' + hours.toFixed(1) + 'h');
     if (!(hours < MAX_STALE_HOURS)) {
       alert_('הנתונים באתר לא התעדכנו ' + Math.round(hours) + ' שעות',
         'העדכון האחרון באתר: ' + updated.toISOString() +
         '\nכנראה שהסנכרון היומי לא רץ או נכשל.' +
         '\nלתיקון מיידי: להריץ fullSync מעורך ה-Apps Script.');
+    } else {
+      // Daily all-clear so a quiet inbox is proof it ran, not that it broke.
+      report_('הבדיקה היומית עברה — האתר מעודכן ✓',
+        'הנתונים באתר עודכנו לפני ' + ageStr + ' (הכל תקין).' +
+        '\nעדכון אחרון באתר: ' + updated.toISOString());
     }
   } catch (err) {
     alert_('watchdog נכשל', String(err));
