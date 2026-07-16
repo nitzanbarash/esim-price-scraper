@@ -160,19 +160,26 @@ class Inbox:
         self.box.select(f'"{folder}"' if " " in folder else folder)
 
     def unprocessed(self) -> list[dict]:
+        # No FROM filter in the IMAP query: forwarded copies (Fwd:) come from
+        # the owner's address, not esim.dog. Validation happens in Python —
+        # the subject must match AND the body must carry an esim.dog success
+        # link (parse_delivery returns None without one), which is a stronger
+        # signal than the envelope sender anyway.
         since = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%d-%b-%Y")
-        typ, data = self.box.uid(
-            "search", None, f'(UNFLAGGED FROM "{DELIVERY_FROM}" SINCE {since})'
-        )
+        typ, data = self.box.uid("search", None, f"(UNFLAGGED SINCE {since})")
         out = []
         for uid_b in (data[0] or b"").split():
             uid = uid_b.decode()
+            typ, sub = self.box.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+            if typ != "OK" or not sub or sub[0] is None:
+                continue
+            subject = _decode(email.message_from_bytes(sub[0][1]).get("Subject"))
+            if DELIVERY_SUBJECT.lower() not in subject.lower():
+                continue                        # cheap header-only skip
             typ, msgdata = self.box.uid("fetch", uid, "(RFC822)")
             if typ != "OK" or not msgdata or msgdata[0] is None:
                 continue
             msg = email.message_from_bytes(msgdata[0][1])
-            if DELIVERY_SUBJECT.lower() not in _decode(msg.get("Subject")).lower():
-                continue
             if d := parse_delivery(uid, msg):
                 out.append(d)
         return out
@@ -286,6 +293,7 @@ def find_pending_row(ws, delivery: dict) -> dict | None:
     i_date, i_gb = idx("תאריך - Date"), idx("איחסון - GB")
     i_order, i_act = idx("מס׳ הזמנה"), idx("Activation Code")
     i_iccid, i_link = idx("מס סידורי -ICCID"), idx("Link - esim.dog")
+    i_mail, i_wave = idx("מייל - Mail"), idx("Link - waverole")
 
     email_time = delivery["received_at"].astimezone(TZ)
     window = timedelta(hours=MATCH_WINDOW_HOURS)
@@ -302,7 +310,8 @@ def find_pending_row(ws, delivery: dict) -> dict | None:
         t = _row_time(get(i_date))
         if t and (t > email_time or email_time - t > window):
             continue
-        cands.append({"row": n, "time": t, "order_id": get(i_order)})
+        cands.append({"row": n, "time": t, "order_id": get(i_order),
+                      "customer_email": get(i_mail), "order_url": get(i_wave)})
 
     if not cands:
         return None
@@ -363,6 +372,57 @@ def report_fulfilled(order_id: str, delivery: dict, details: dict):
     log.info(f"order {order_id}: site fulfilled")
 
 
+# ── customer "ready" email (from waverolesupply@gmail.com) ───────────────────
+SUPPORT_EMAIL = "waverolesupport@gmail.com"
+NAVY, BEIGE, BROWN, ACCENT = "#1B365D", "#f7ede2", "#7a5c40", "#C27A4E"
+
+
+def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict):
+    """The buyer's 'your eSIM is ready' email. Sent from the real Waverole
+    Gmail (waverolesupply) — the site's Resend sender (onboarding@resend.dev)
+    looked untrustworthy, so this bot owns the customer email now."""
+    if not (to and order_url):
+        raise ValueError(f"missing customer email/order url (to={to!r})")
+
+    gb, days = delivery.get("gb"), delivery.get("days")
+    rows = [("Order number", order_id),
+            ("Destination", delivery.get("location", "")),
+            ("Data", f"{gb:g} GB" if gb else ""),
+            ("Validity", f"{days} days" if days else ""),
+            ("Network", delivery.get("network", ""))]
+    detail_rows = "".join(
+        f'<tr><td style="padding:7px 14px;color:{BROWN};font-size:13px">{k}</td>'
+        f'<td style="padding:7px 14px;color:{NAVY};font-size:13px;font-weight:700;'
+        f'text-align:right">{v}</td></tr>'
+        for k, v in rows if v)
+
+    html = f"""<div style="font-family:'Nunito',Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px;background:{BEIGE};border-radius:16px">
+  <h1 style="font-size:22px;color:{NAVY};text-align:center;margin:0 0 6px">Thank you for your purchase! &#127881;</h1>
+  <p style="text-align:center;color:{NAVY};font-size:16px;font-weight:700;margin:0 0 4px">Your eSIM is ready to use!</p>
+  <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 20px">Order <strong style="color:{NAVY}">{order_id}</strong></p>
+  <table style="width:100%;background:#fff;border-radius:12px;border-collapse:collapse;margin:0 0 20px">{detail_rows}</table>
+  <p style="text-align:center;color:{BROWN};font-size:14px;margin:0 0 12px">To activate your eSIM, open your order page:</p>
+  <div style="text-align:center;margin:0 0 22px">
+    <a href="{order_url}" style="display:inline-block;background:{NAVY};color:#fff;font-weight:800;font-size:15px;text-decoration:none;padding:14px 34px;border-radius:12px">Activate my eSIM &#8594;</a>
+  </div>
+  <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 6px">Need help installing? A step-by-step guide is on your order page.</p>
+  <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 18px">Any problem with your package? We're happy to help:
+    <a href="mailto:{SUPPORT_EMAIL}" style="color:{ACCENT};font-weight:700;text-decoration:none">{SUPPORT_EMAIL}</a></p>
+  <hr style="border:none;border-top:1px solid #e5d5c0;margin:0 0 12px">
+  <p style="font-size:11px;color:#9a7a60;text-align:center;word-break:break-all;margin:0">Button not working? Copy this link into your browser:<br>{order_url}</p>
+</div>"""
+
+    msg = MIMEText(html, "html", "utf-8")
+    msg["From"] = f"Waverole <{GMAIL_USER}>"
+    msg["To"] = to
+    msg["Subject"] = f"Your eSIM is ready to use! \N{AIRPLANE} Order {order_id}"
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+        s.starttls()
+        s.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
+        s.send_message(msg)
+    log.info(f"order {order_id}: customer email sent to {to}")
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def process(inbox: Inbox, ws, d: dict):
@@ -398,6 +458,14 @@ def process(inbox: Inbox, ws, d: dict):
     except Exception as e:
         alert(f"Order {order_id}: sheet done, site report FAILED",
               f"{e}\nUpdate the site manually or re-run the workflow.")
+    try:
+        send_customer_email(match.get("customer_email", ""), order_id,
+                            match.get("order_url", ""), d)
+    except Exception as e:
+        alert(f"Order {order_id}: customer email FAILED",
+              f"{e}\nSend the ready-email manually to "
+              f"{match.get('customer_email') or '<missing address>'}:\n"
+              f"{match.get('order_url', '')}")
     inbox.flag(uid)
     log.info(f"order {order_id} COMPLETED (row {match['row']})")
 
