@@ -40,6 +40,7 @@ import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
+from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -62,6 +63,10 @@ TZ = ZoneInfo("Asia/Jerusalem")
 SUCCESS_URL_RE = re.compile(r"https://esim\.dog/success\?session_id=[A-Za-z0-9_\-]+")
 PLAN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*GB\s*[-–]\s*(\d+)\s*days?", re.I)
 LPA_RE = re.compile(r"LPA:1\$[^\s\"'<>]+\$[A-Za-z0-9\-_]+")
+# The iPhone/Android install links carry the LPA in ?carddata= (URL-encoded:
+# LPA%3A1%24smdp%24code). This is the MOST reliable source — present without
+# expanding "eSIM Details" or decoding the QR.
+CARDDATA_RE = re.compile(r"carddata=(LPA(?:%3A|:)1(?:%24|\$)[^\"'&\s<>]+)", re.I)
 ICCID_RE = re.compile(r"\b(89\d{17,18})\b")
 APN_RE = re.compile(r"APN[^A-Za-z0-9]{0,20}([a-z0-9.\-]+\.[a-z]{2,})", re.I)
 
@@ -229,7 +234,13 @@ def scrape_success_page(url: str) -> dict:
 
             html = page.content()
             out = {}
-            if m := LPA_RE.search(html):
+            # 1) Most reliable: LPA from the install-link carddata= param.
+            if m := CARDDATA_RE.search(html):
+                lpa = unquote(m.group(1))
+                if LPA_RE.match(lpa):
+                    out["activation_code"] = lpa
+            # 2) Plain-text LPA from the expanded "eSIM Details" section.
+            if not out.get("activation_code") and (m := LPA_RE.search(html)):
                 out["activation_code"] = m.group(0)
             if m := ICCID_RE.search(html):
                 out["iccid"] = m.group(1)
