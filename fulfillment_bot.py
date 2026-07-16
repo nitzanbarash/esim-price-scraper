@@ -225,11 +225,23 @@ def scrape_success_page(url: str) -> dict:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(6000)
 
-            # Expand "eSIM Details" with a REAL click (JS clicks are ignored).
-            try:
-                page.get_by_text(re.compile("eSIM Details", re.I)).first.click(timeout=5000)
-                page.wait_for_timeout(2500)
-            except Exception:
+            # Expand "eSIM Details" with a REAL click (JS clicks are ignored by
+            # React) to reveal ICCID / SM-DP+ / plan info in plain text. The
+            # toggle is a <button> wrapping a heading + subtext; the outer text
+            # nodes don't fire the handler, so target the button role first.
+            expanded = False
+            for target in (
+                page.get_by_role("button", name=re.compile("eSIM Details", re.I)),
+                page.get_by_text(re.compile("eSIM Details", re.I)),
+            ):
+                try:
+                    target.first.click(timeout=5000)
+                    page.wait_for_timeout(2500)
+                    expanded = True
+                    break
+                except Exception:
+                    continue
+            if not expanded:
                 log.info("eSIM Details expander not clicked (may already be open)")
 
             html = page.content()
