@@ -36,7 +36,6 @@ import logging
 import os
 import re
 import smtplib
-import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
@@ -72,9 +71,14 @@ APN_RE = re.compile(r"APN[^A-Za-z0-9]{0,20}([a-z0-9.\-]+\.[a-z]{2,})", re.I)
 
 
 def env(name: str) -> str:
+    # RuntimeError, never sys.exit: SystemExit does not inherit from Exception,
+    # so an `except Exception` around a step (site report, customer email) would
+    # NOT catch it and one missing secret would kill the whole run mid-order —
+    # skipping every step after it. Raising normally lets each step fail, alert
+    # and carry on; a secret missing at startup still aborts the run loudly.
     v = os.getenv(name, "").strip()
     if not v:
-        sys.exit(f"Missing env/secret: {name}")
+        raise RuntimeError(f"Missing env/secret: {name}")
     return v
 
 
@@ -479,8 +483,16 @@ def process(inbox: Inbox, ws, d: dict):
     try:
         report_fulfilled(order_id, d, details)
     except Exception as e:
-        alert(f"Order {order_id}: sheet done, site report FAILED",
-              f"{e}\nUpdate the site manually or re-run the workflow.")
+        # No customer email: it sends the buyer to their order page, which has
+        # no eSIM on it until the site accepts this POST. Flagged anyway — the
+        # row is no longer "pending" now that it is filled in, so a retry could
+        # not re-match it and would just alert about an orphan email forever.
+        alert(f"Order {order_id}: sheet done, site report FAILED — ACTION NEEDED",
+              f"{e}\n\nThe customer email was NOT sent (their order page has no "
+              f"eSIM yet). Fix the cause, then re-post the fulfillment; row "
+              f"{match['row']} of the receipts sheet has every detail.")
+        inbox.flag(uid)
+        return
     try:
         send_customer_email(match.get("customer_email", ""), order_id,
                             match.get("order_url", ""), d)
