@@ -42,6 +42,9 @@ from email.mime.text import MIMEText
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+
 import gspread
 import requests
 
@@ -455,12 +458,18 @@ SUPPORT_EMAIL = "waverolesupport@gmail.com"
 NAVY, BEIGE, BROWN, ACCENT = "#1B365D", "#f7ede2", "#7a5c40", "#C27A4E"
 
 
-def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict):
+def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
+                        esim: dict | None = None):
     """The buyer's 'your eSIM is ready' email. Sent from the real Waverole
     Gmail (waverolesupply) — the site's Resend sender (onboarding@resend.dev)
-    looked untrustworthy, so this bot owns the customer email now."""
+    looked untrustworthy, so this bot owns the customer email now.
+
+    The email carries the FULL activation details (QR inline + manual codes),
+    not just a link: the site's order records expire after 90 days, and this
+    email must stay a working copy of the eSIM forever (new phone, late trip)."""
     if not (to and order_url):
         raise ValueError(f"missing customer email/order url (to={to!r})")
+    esim = esim or {}
 
     gb, days = delivery.get("gb"), delivery.get("days")
     total = order_payload(order_url).get("t")    # what the customer actually paid
@@ -485,6 +494,7 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict):
   <div style="text-align:center;margin:0 0 22px">
     <a href="{order_url}" style="display:inline-block;background:{NAVY};color:#fff;font-weight:800;font-size:15px;text-decoration:none;padding:14px 34px;border-radius:12px">Activate my eSIM &#8594;</a>
   </div>
+  {_esim_copy_html(esim)}
   <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 6px">Need help installing? A step-by-step guide is on your order page.</p>
   <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 18px">Any problem with your package? We're happy to help:
     <a href="mailto:{SUPPORT_EMAIL}" style="color:{ACCENT};font-weight:700;text-decoration:none">{SUPPORT_EMAIL}</a></p>
@@ -492,7 +502,15 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict):
   <p style="font-size:11px;color:#9a7a60;text-align:center;word-break:break-all;margin:0">Button not working? Copy this link into your browser:<br>{order_url}</p>
 </div>"""
 
-    msg = MIMEText(html, "html", "utf-8")
+    # multipart/related so the QR renders inline (data: URIs are stripped by
+    # Gmail — a real attachment referenced by cid: is the only reliable way).
+    msg = MIMEMultipart("related")
+    msg.attach(MIMEText(html, "html", "utf-8"))
+    if qr := _qr_bytes(esim):
+        img = MIMEImage(qr, _subtype="png")
+        img.add_header("Content-ID", "<qr>")
+        img.add_header("Content-Disposition", "inline", filename=f"esim-qr-{order_id}.png")
+        msg.attach(img)
     msg["From"] = f"Waverole <{GMAIL_USER}>"
     msg["To"] = to
     msg["Subject"] = f"Your eSIM is ready to use! \N{AIRPLANE} Order {order_id}"
@@ -501,6 +519,44 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict):
         s.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
         s.send_message(msg)
     log.info(f"order {order_id}: customer email sent to {to}")
+
+
+def _qr_bytes(esim: dict) -> bytes | None:
+    qc = (esim or {}).get("qr_code", "")
+    if qc.startswith("data:image/png;base64,"):
+        try:
+            return base64.b64decode(qc.split(",", 1)[1])
+        except Exception:
+            pass
+    return None
+
+
+def _esim_copy_html(esim: dict) -> str:
+    """Permanent in-email copy of the eSIM: inline QR + the manual codes.
+    Shown under the CTA; empty string when there is nothing to show."""
+    if not esim:
+        return ""
+    rows = [("Activation Code", esim.get("activation_code", "")),
+            ("SM-DP+ Address", esim.get("smdp", "")),
+            ("ICCID", esim.get("iccid", "")),
+            ("APN", esim.get("apn", ""))]
+    code_rows = "".join(
+        f'<tr><td style="padding:6px 12px;color:{BROWN};font-size:12px;white-space:nowrap">{k}</td>'
+        f'<td style="padding:6px 12px;color:{NAVY};font-size:12px;font-family:ui-monospace,Menlo,monospace;'
+        f'word-break:break-all;text-align:right">{v}</td></tr>'
+        for k, v in rows if v)
+    if not code_rows and not _qr_bytes(esim):
+        return ""
+    qr_img = ('<div style="text-align:center;margin:0 0 10px">'
+              '<img src="cid:qr" alt="eSIM QR code" width="180" height="180" '
+              'style="border-radius:12px;background:#fff;padding:8px"></div>'
+              if _qr_bytes(esim) else "")
+    return f"""<div style="background:#fff;border-radius:12px;padding:16px 10px;margin:0 0 22px">
+  <p style="text-align:center;color:{NAVY};font-size:13px;font-weight:800;margin:0 0 10px">Your eSIM — keep this email as your permanent copy</p>
+  {qr_img}
+  <table style="width:100%;border-collapse:collapse">{code_rows}</table>
+  <p style="text-align:center;color:#9a7a60;font-size:11px;margin:8px 0 0">Scan the QR from another device, or add the eSIM manually with the codes above.</p>
+</div>"""
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -565,7 +621,7 @@ def process(inbox: Inbox, ws, d: dict):
         return
     try:
         send_customer_email(match.get("customer_email", ""), order_id,
-                            match.get("order_url", ""), d)
+                            match.get("order_url", ""), d, esim=details)
     except Exception as e:
         alert(f"Order {order_id}: customer email FAILED",
               f"{e}\nSend the ready-email manually to "

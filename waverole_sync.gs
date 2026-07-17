@@ -39,8 +39,11 @@ const OVERLAY_URL = 'https://www.waverole.com/data/plans-overlay.json';
 const GH_DISPATCH = 'https://api.github.com/repos/nitzanbarash/esim-price-scraper/actions/workflows/scrape.yml/dispatches';
 const FULFILL_DISPATCH = 'https://api.github.com/repos/nitzanbarash/esim-price-scraper/actions/workflows/fulfillment.yml/dispatches';
 const SHEET_ID = '108D3BUV-MNcIuRZuKUgb-E-b1Ra8moxWZZyI5JxnyRo';
+const RECEIPTS_ID = '1bWH_Zef0aNwZjLOR07hjJRZRXkrY73mX0aMLGPH6uao';
 const ALERT_EMAIL = 'uper.request@gmail.com';
 const MAX_STALE_HOURS = 26;   // watchdog: alert if site data older than this
+const BACKUP_FOLDER = 'Waverole Backups';   // Drive folder for weekly copies
+const BACKUP_KEEP = 8;                      // copies kept per spreadsheet
 
 // Row-1 header text (trimmed) → API field.
 // Each field lists EVERY name the column has ever had, so renaming a header
@@ -72,7 +75,12 @@ function setupTriggers() {
   // fulfillment bot is dispatched from here instead — Apps Script's 5-minute
   // trigger actually fires every 5 minutes. Needs GH_TOKEN (skips without it).
   ScriptApp.newTrigger('fulfillmentTick').timeBased().everyMinutes(5).create();
-  Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape + 12:00 watchdog + 5-min fulfillment tick');
+  // Weekly Drive copies of both spreadsheets — the sheets ARE the business
+  // (prices, receipts, eSIM codes); an accidental mass-delete or a broken
+  // formula paste would otherwise be unrecoverable beyond version history.
+  ScriptApp.newTrigger('weeklyBackup').timeBased()
+    .onWeekDay(ScriptApp.WeekDay.SUNDAY).atHour(3).inTimezone('Asia/Jerusalem').create();
+  Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape + 12:00 watchdog + 5-min fulfillment tick + weekly backup');
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
@@ -298,6 +306,32 @@ function fullSyncOnce() {
   }
 }
 
+// ── weekly Drive backup of both spreadsheets ────────────────────────
+function weeklyBackup() {
+  try {
+    const it = DriveApp.getFoldersByName(BACKUP_FOLDER);
+    const folder = it.hasNext() ? it.next() : DriveApp.createFolder(BACKUP_FOLDER);
+    const stamp = Utilities.formatDate(new Date(), 'Asia/Jerusalem', 'yyyy-MM-dd');
+    [SHEET_ID, RECEIPTS_ID].forEach(function (id) {
+      const src = DriveApp.getFileById(id);
+      const base = src.getName().replace(/ \(backup .*\)$/, '');
+      src.makeCopy(base + ' (backup ' + stamp + ')', folder);
+      // Prune: keep only the newest BACKUP_KEEP copies of this spreadsheet.
+      const copies = [];
+      const files = folder.getFiles();
+      while (files.hasNext()) {
+        const f = files.next();
+        if (f.getName().indexOf(base + ' (backup ') === 0) copies.push(f);
+      }
+      copies.sort(function (a, b) { return b.getDateCreated() - a.getDateCreated(); });
+      copies.slice(BACKUP_KEEP).forEach(function (f) { f.setTrashed(true); });
+    });
+    Logger.log('weekly backup done → Drive folder "' + BACKUP_FOLDER + '"');
+  } catch (err) {
+    alert_('הגיבוי השבועי של הטבלאות נכשל', String(err));
+  }
+}
+
 // Manual test: verifies the alert-email path works (run from the editor).
 function testAlert() {
   alert_('בדיקת מערכת ההתראות',
@@ -307,6 +341,23 @@ function testAlert() {
 
 // ── watchdog: is the live site actually fresh? ──────────────────────
 function checkSiteFresh() {
+  // Upstream first: if the SCRAPER stopped writing, the sheet quietly ages,
+  // every sync "succeeds" with stale numbers, and the purchase bot compares
+  // esim.dog against yesterday's prices. Last-modified of the price sheet is
+  // a good liveness proxy (the daily scrape rewrites it every morning).
+  try {
+    const modified = DriveApp.getFileById(SHEET_ID).getLastUpdated();
+    const sheetAgeH = (Date.now() - modified.getTime()) / 36e5;
+    if (sheetAgeH > MAX_STALE_HOURS) {
+      alert_('טבלת המחירים עצמה לא התעדכנה ' + Math.round(sheetAgeH) + ' שעות',
+        'העדכון האחרון של הקובץ: ' + modified.toISOString() +
+        '\nכנראה שהסקרייפר היומי (GitHub Actions) לא רץ או נכשל — ' +
+        'בדוק את esim-price-scraper → Actions → price scrape.' +
+        '\nעד שיתוקן, הבוטים עובדים לפי מחירים ישנים.');
+    }
+  } catch (err) {
+    Logger.log('sheet-freshness check failed: ' + err);
+  }
   try {
     const res = UrlFetchApp.fetch(OVERLAY_URL + '?cb=' + Date.now(),
       { muteHttpExceptions: true });
