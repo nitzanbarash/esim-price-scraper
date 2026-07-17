@@ -37,6 +37,7 @@
 const ENDPOINT = 'https://www.waverole.com/api/update-packages';
 const OVERLAY_URL = 'https://www.waverole.com/data/plans-overlay.json';
 const GH_DISPATCH = 'https://api.github.com/repos/nitzanbarash/esim-price-scraper/actions/workflows/scrape.yml/dispatches';
+const FULFILL_DISPATCH = 'https://api.github.com/repos/nitzanbarash/esim-price-scraper/actions/workflows/fulfillment.yml/dispatches';
 const SHEET_ID = '108D3BUV-MNcIuRZuKUgb-E-b1Ra8moxWZZyI5JxnyRo';
 const ALERT_EMAIL = 'uper.request@gmail.com';
 const MAX_STALE_HOURS = 26;   // watchdog: alert if site data older than this
@@ -67,7 +68,11 @@ function setupTriggers() {
     .atHour(10).everyDays(1).inTimezone('Asia/Jerusalem').create();
   ScriptApp.newTrigger('checkSiteFresh').timeBased()
     .atHour(12).everyDays(1).inTimezone('Asia/Jerusalem').create();
-  Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape + 12:00 watchdog');
+  // GitHub throttles */5 cron on public repos to ~1/hour in practice, so the
+  // fulfillment bot is dispatched from here instead — Apps Script's 5-minute
+  // trigger actually fires every 5 minutes. Needs GH_TOKEN (skips without it).
+  ScriptApp.newTrigger('fulfillmentTick').timeBased().everyMinutes(5).create();
+  Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape + 12:00 watchdog + 5-min fulfillment tick');
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
@@ -175,6 +180,12 @@ function post_(packages) {
       ((j.warnings || []).length ? ' | ⚠️ ' + j.warnings.length + ' אזהרות' : '');
   } catch (err) {}
   Logger.log(msg);
+  // Freshness signal for the watchdog: a successful POST means the site HAS
+  // today's prices even when nothing changed (the endpoint then skips the
+  // commit, so the overlay's `updated` timestamp does NOT move — that false
+  // alarm is exactly what fired on 2026-07-16).
+  PropertiesService.getScriptProperties()
+    .setProperty('LAST_SYNC_OK', new Date().toISOString());
   try { SpreadsheetApp.openById(SHEET_ID).toast(msg, 'Waverole', 8); } catch (e) {}
   return body;
 }
@@ -222,6 +233,38 @@ function runScrapeNow() {
   const ok = res.getResponseCode() === 204;
   if (!ok) alert_('הפעלת הסקרייפר נכשלה', res.getContentText().slice(0, 500));
   Logger.log(ok ? 'הסריקה הופעלה ב-GitHub ✓' : 'שגיאה: ' + res.getContentText());
+}
+
+// ── fulfillment bot dispatcher — every 5 minutes ────────────────────
+// GitHub throttles scheduled workflows on public repos (observed: */5 cron
+// firing ~once an hour). Apps Script triggers are punctual, so this tick
+// dispatches the fulfillment workflow instead. Costs ~1s per run — far
+// inside the daily trigger quota. Failures alert at most once per 6h.
+function fulfillmentTick() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty('GH_TOKEN');
+  if (!token) return;                        // not configured — GitHub cron still runs
+  try {
+    const res = UrlFetchApp.fetch(FULFILL_DISPATCH, {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json' },
+      payload: JSON.stringify({ ref: 'main' }),
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() === 204) return;         // dispatched ✓
+    throw new Error('HTTP ' + res.getResponseCode() + ': ' +
+      res.getContentText().slice(0, 300));
+  } catch (err) {
+    const last = +(props.getProperty('FT_LAST_ALERT') || 0);
+    if (Date.now() - last > 6 * 36e5) {
+      props.setProperty('FT_LAST_ALERT', String(Date.now()));
+      alert_('הפעלת בוט המימוש מה-Apps Script נכשלת',
+        String(err) + '\n(הבוט עדיין רץ מה-cron של GitHub, רק לאט יותר. ' +
+        'התראה זו נשלחת לכל היותר פעם ב-6 שעות.)');
+    }
+    Logger.log('fulfillmentTick failed: ' + err);
+  }
 }
 
 function dailyScrape() {
@@ -276,11 +319,22 @@ function checkSiteFresh() {
     const hours = (Date.now() - updated.getTime()) / 36e5;
     const ageStr = hours.toFixed(1) + ' שעות';
     Logger.log('site data age: ' + hours.toFixed(1) + 'h');
-    if (!(hours < MAX_STALE_HOURS)) {
+    // The overlay `updated` only moves when a price actually CHANGED (the
+    // endpoint skips no-op commits). A successful recent sync is just as
+    // fresh — the site provably has today's numbers, they're identical.
+    const lastOk = PropertiesService.getScriptProperties().getProperty('LAST_SYNC_OK');
+    const okHours = lastOk ? (Date.now() - new Date(lastOk).getTime()) / 36e5 : Infinity;
+    if (!(hours < MAX_STALE_HOURS) && !(okHours < MAX_STALE_HOURS)) {
       alert_('הנתונים באתר לא התעדכנו ' + Math.round(hours) + ' שעות',
         'העדכון האחרון באתר: ' + updated.toISOString() +
+        '\nוגם לא היה סנכרון מוצלח ב-' + MAX_STALE_HOURS + ' השעות האחרונות.' +
         '\nכנראה שהסנכרון היומי לא רץ או נכשל.' +
         '\nלתיקון מיידי: להריץ fullSync מעורך ה-Apps Script.');
+    } else if (!(hours < MAX_STALE_HOURS)) {
+      report_('הבדיקה היומית עברה — האתר מעודכן ✓',
+        'הסנכרון האחרון רץ בהצלחה לפני ' + okHours.toFixed(1) + ' שעות ולא מצא ' +
+        'שינויי מחירים (ולכן חותמת האתר לא זזה — זה תקין).' +
+        '\nחותמת נתוני האתר: ' + updated.toISOString());
     } else {
       // Daily all-clear so a quiet inbox is proof it ran, not that it broke.
       report_('הבדיקה היומית עברה — האתר מעודכן ✓',
