@@ -56,10 +56,13 @@ DELIVERY_SUBJECT = "Your eSIM is ready"
 RECEIPTS_SHEET_ID = "1bWH_Zef0aNwZjLOR07hjJRZRXkrY73mX0aMLGPH6uao"
 ORDERS_URL = "https://www.waverole.com/api/orders"
 MATCH_WINDOW_HOURS = int(os.getenv("MATCH_WINDOW_HOURS", "12"))
+UNMATCHED_GRACE_HOURS = 2  # how long an unmatched delivery email keeps retrying
 LOOKBACK_DAYS = 7          # only consider emails from the last week
 TZ = ZoneInfo("Asia/Jerusalem")
 
-SUCCESS_URL_RE = re.compile(r"https://esim\.dog/success\?session_id=[A-Za-z0-9_\-]+")
+# Both live formats seen in real delivery emails: ?session_id=cs_live_... and
+# ?payment_intent=pi_... (older orders).
+SUCCESS_URL_RE = re.compile(r"https://esim\.dog/success\?(?:session_id|payment_intent)=[A-Za-z0-9_\-]+")
 PLAN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*GB\s*[-–]\s*(\d+)\s*days?", re.I)
 LPA_RE = re.compile(r"LPA:1\$[^\s\"'<>]+\$[A-Za-z0-9\-_]+")
 # The iPhone/Android install links carry the LPA in ?carddata= (URL-encoded:
@@ -67,7 +70,12 @@ LPA_RE = re.compile(r"LPA:1\$[^\s\"'<>]+\$[A-Za-z0-9\-_]+")
 # expanding "eSIM Details" or decoding the QR.
 CARDDATA_RE = re.compile(r"carddata=(LPA(?:%3A|:)1(?:%24|\$)[^\"'&\s<>]+)", re.I)
 ICCID_RE = re.compile(r"\b(89\d{17,18})\b")
+# APN in raw HTML only works for dotted values ("internet.provider.com"); real
+# pages also use bare words (seen live: "wbdata"), which only appear cleanly in
+# the page TEXT as a label/value pair after expanding "eSIM Details".
 APN_RE = re.compile(r"APN[^A-Za-z0-9]{0,20}([a-z0-9.\-]+\.[a-z]{2,})", re.I)
+APN_TEXT_RE = re.compile(r"\bAPN\b\s*\n+\s*(?!Copy\b)([A-Za-z][A-Za-z0-9._\-]{1,40})\s*\n")
+REGION_TEXT_RE = re.compile(r"\bRegion\b\s*\n+\s*([A-Za-z][A-Za-z ,()&\-]{1,40})\s*\n")
 
 
 def env(name: str) -> str:
@@ -80,6 +88,24 @@ def env(name: str) -> str:
     if not v:
         raise RuntimeError(f"Missing env/secret: {name}")
     return v
+
+
+def _redact(s: str) -> str:
+    """This repo is PUBLIC, so Actions logs are public. A success-page URL in a
+    log line (e.g. inside a Playwright error message) would hand anyone the
+    eSIM activation page AND reveal the supplier. Strip the tokens."""
+    return re.sub(r"(session_id|payment_intent)=[A-Za-z0-9_\-]+", r"\1=REDACTED", s)
+
+
+def order_payload(order_url: str) -> dict:
+    """Decode the ?order= base64 JSON of a waverole.com order link
+    ({id, sku, ts, t}) — `t` is the total the customer actually paid."""
+    try:
+        b64 = order_url.split("order=", 1)[1].split("&", 1)[0]
+        b64 += "=" * (-len(b64) % 4)
+        return json.loads(base64.urlsafe_b64decode(b64))
+    except Exception:
+        return {}
 
 
 # ── alerts ───────────────────────────────────────────────────────────────────
@@ -179,12 +205,18 @@ class Inbox:
         out = []
         for uid_b in (data[0] or b"").split():
             uid = uid_b.decode()
-            typ, sub = self.box.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+            typ, sub = self.box.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])")
             if typ != "OK" or not sub or sub[0] is None:
                 continue
-            subject = _decode(email.message_from_bytes(sub[0][1]).get("Subject"))
+            head = email.message_from_bytes(sub[0][1])
+            subject = _decode(head.get("Subject"))
             if DELIVERY_SUBJECT.lower() not in subject.lower():
                 continue                        # cheap header-only skip
+            # Our own outgoing customer email ("Your eSIM is ready to use!")
+            # sits in All Mail (Sent) and matches the subject — skip self-sent
+            # so we never full-fetch our own mail every run.
+            if GMAIL_USER.lower() in _decode(head.get("From")).lower():
+                continue
             typ, msgdata = self.box.uid("fetch", uid, "(RFC822)")
             if typ != "OK" or not msgdata or msgdata[0] is None:
                 continue
@@ -249,6 +281,10 @@ def scrape_success_page(url: str) -> dict:
                 log.info("eSIM Details expander not clicked (may already be open)")
 
             html = page.content()
+            try:
+                text = page.inner_text("body")
+            except Exception:
+                text = ""
             out = {}
             # 1) Most reliable: LPA from the install-link carddata= param.
             if m := CARDDATA_RE.search(html):
@@ -262,6 +298,14 @@ def scrape_success_page(url: str) -> dict:
                 out["iccid"] = m.group(1)
             if m := APN_RE.search(html):
                 out["apn"] = m.group(1)
+            elif m := APN_TEXT_RE.search(text):
+                out["apn"] = m.group(1)          # bare APNs like "wbdata"
+            # Plan/Region from the expanded panel — backfill for emails the
+            # PLAN_RE couldn't parse (delivery said "NoneGB" once already).
+            if m := PLAN_RE.search(text):
+                out["plan_gb"], out["plan_days"] = float(m.group(1)), int(m.group(2))
+            if m := REGION_TEXT_RE.search(text):
+                out["page_region"] = m.group(1).strip()
             if m := re.search(r'src="(data:image/png;base64,[^"]+)"', html):
                 out["qr_code"] = m.group(1)[:100000]
                 if not out.get("activation_code"):
@@ -316,6 +360,11 @@ def _link_ok(link: str, location: str) -> bool:
 def find_pending_row(ws, delivery: dict) -> dict | None:
     rows = ws.get_all_values()
     hdr = [h.strip() for h in rows[0]]
+    required = ["תאריך - Date", "איחסון - GB", "מס׳ הזמנה", "Activation Code",
+                "מס סידורי -ICCID", "מייל - Mail", "Link - waverole"]
+    if missing := [h for h in required if h not in hdr]:
+        # A renamed header would otherwise silently match nothing, forever.
+        raise RuntimeError(f"receipts sheet is missing expected headers: {missing}")
     idx = lambda name: hdr.index(name) if name in hdr else None
     i_date, i_gb = idx("תאריך - Date"), idx("איחסון - GB")
     i_order, i_act = idx("מס׳ הזמנה"), idx("Activation Code")
@@ -360,7 +409,9 @@ def complete_row(ws, row_number: int, delivery: dict, details: dict):
         "QR": delivery["success_url"],
         "Activation Code": details.get("activation_code", ""),
         "SM-DP+ Address": details.get("smdp", ""),
-        "מס סידורי -ICCID": details.get("iccid", ""),
+        # Leading apostrophe: USER_ENTERED turns a 19-digit ICCID into a float
+        # (doubles hold ~15 digits) unless the column happens to be text-formatted.
+        "מס סידורי -ICCID": f"'{details['iccid']}" if details.get("iccid") else "",
         "גישה - APN": details.get("apn", ""),
         "אזור - Region": delivery.get("location", ""),
         "חבילה - Plan": (
@@ -412,11 +463,13 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict):
         raise ValueError(f"missing customer email/order url (to={to!r})")
 
     gb, days = delivery.get("gb"), delivery.get("days")
+    total = order_payload(order_url).get("t")    # what the customer actually paid
     rows = [("Order number", order_id),
             ("Destination", delivery.get("location", "")),
             ("Data", f"{gb:g} GB" if gb else ""),
             ("Validity", f"{days} days" if days else ""),
-            ("Network", delivery.get("network", ""))]
+            ("Network", delivery.get("network", "")),
+            ("Total paid", f"${total:.2f}" if isinstance(total, (int, float)) else "")]
     detail_rows = "".join(
         f'<tr><td style="padding:7px 14px;color:{BROWN};font-size:13px">{k}</td>'
         f'<td style="padding:7px 14px;color:{NAVY};font-size:13px;font-weight:700;'
@@ -464,12 +517,23 @@ def process(inbox: Inbox, ws, d: dict):
               "No row was touched.")
         inbox.flag(uid)
         return
+    except RuntimeError as e:                    # e.g. renamed sheet headers
+        alert("Receipts sheet problem — bot cannot match orders", str(e))
+        return                                   # NOT flagged → retried
 
     if match is None:
+        # The delivery email can beat the purchase bot's sheet row (esim.dog
+        # fulfills fast). Flagging immediately would burn the email forever;
+        # give the row time to appear before giving up.
+        age = datetime.now(timezone.utc) - d["received_at"]
+        if age < timedelta(hours=UNMATCHED_GRACE_HOURS):
+            log.info(f"email uid={uid}: no matching row yet "
+                     f"({age.total_seconds() / 60:.0f} min old) — will retry")
+            return                               # NOT flagged → retried
         alert("Delivery email without a matching order",
               f"{d['gb']}GB / {d['days']}d / {d['location']}\n{d['success_url']}\n"
-              "No pending receipts row matched — if this was a manual "
-              "purchase, ignore this message.")
+              f"No pending receipts row matched within {UNMATCHED_GRACE_HOURS}h — "
+              "if this was a manual purchase, ignore this message.")
         inbox.flag(uid)
         return
 
@@ -478,6 +542,12 @@ def process(inbox: Inbox, ws, d: dict):
     if not (details.get("activation_code") or details.get("iccid")):
         log.warning(f"order {order_id}: no details on success page yet — will retry")
         return                                          # NOT flagged → retried
+
+    # Backfill plan facts the email didn't parse from the success page itself.
+    if d.get("gb") is None and details.get("plan_gb"):
+        d["gb"], d["days"] = details["plan_gb"], details.get("plan_days")
+    if not d.get("location") and details.get("page_region"):
+        d["location"] = details["page_region"]
 
     complete_row(ws, match["row"], d, details)
     try:
@@ -516,8 +586,11 @@ def main():
         for d in deliveries:
             try:
                 process(inbox, ws, d)
-            except Exception:
-                log.exception(f"email uid={d['uid']} failed — left for retry")
+            except Exception as e:
+                # No traceback: this repo's Actions logs are PUBLIC, and e.g. a
+                # Playwright error embeds the success-page URL. One redacted line.
+                log.error(f"email uid={d['uid']} failed — left for retry: "
+                          f"{_redact(f'{type(e).__name__}: {e}')}")
     finally:
         inbox.close()
 
