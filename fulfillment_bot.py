@@ -471,35 +471,55 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
         raise ValueError(f"missing customer email/order url (to={to!r})")
     esim = esim or {}
 
+    payload = order_payload(order_url)
+    total = payload.get("t")                     # what the customer actually paid
+    heb = payload.get("l") == "he"               # site language at purchase time
     gb, days = delivery.get("gb"), delivery.get("days")
-    total = order_payload(order_url).get("t")    # what the customer actually paid
-    rows = [("Order number", order_id),
-            ("Destination", delivery.get("location", "")),
-            ("Data", f"{gb:g} GB" if gb else ""),
-            ("Validity", f"{days} days" if days else ""),
-            ("Network", delivery.get("network", "")),
-            ("Total paid", f"${total:.2f}" if isinstance(total, (int, float)) else "")]
+    L = {
+        "subject": (f"ה-eSIM שלך מוכן לשימוש! \N{AIRPLANE} הזמנה {order_id}" if heb
+                    else f"Your eSIM is ready to use! \N{AIRPLANE} Order {order_id}"),
+        "title": "תודה על הרכישה! &#127881;" if heb else "Thank you for your purchase! &#127881;",
+        "ready": "ה-eSIM שלך מוכן לשימוש!" if heb else "Your eSIM is ready to use!",
+        "order": "הזמנה" if heb else "Order",
+        "activate_hint": ("להפעלת ה-eSIM, פתחו את עמוד ההזמנה שלכם:" if heb
+                          else "To activate your eSIM, open your order page:"),
+        "cta": "להפעלת ה-eSIM שלי" if heb else "Activate my eSIM &#8594;",
+        "guide": ("צריכים עזרה בהתקנה? מדריך מפורט שלב-אחר-שלב מחכה בעמוד ההזמנה." if heb
+                  else "Need help installing? A step-by-step guide is on your order page."),
+        "problem": "בעיה עם החבילה? נשמח לעזור:" if heb else "Any problem with your package? We're happy to help:",
+        "fallback": ("הכפתור לא עובד? העתיקו את הקישור הזה לדפדפן:" if heb
+                     else "Button not working? Copy this link into your browser:"),
+        "dir": "rtl" if heb else "ltr",
+    }
+    rows = [("מספר הזמנה" if heb else "Order number", order_id),
+            ("יעד" if heb else "Destination", delivery.get("location", "")),
+            ("נפח גלישה" if heb else "Data", f"{gb:g} GB" if gb else ""),
+            ("תוקף" if heb else "Validity",
+             (f"{days} ימים" if heb else f"{days} days") if days else ""),
+            ("רשת" if heb else "Network", delivery.get("network", "")),
+            ("סה״כ שולם" if heb else "Total paid",
+             f"${total:.2f}" if isinstance(total, (int, float)) else "")]
     detail_rows = "".join(
         f'<tr><td style="padding:7px 14px;color:{BROWN};font-size:13px">{k}</td>'
         f'<td style="padding:7px 14px;color:{NAVY};font-size:13px;font-weight:700;'
         f'text-align:right">{v}</td></tr>'
         for k, v in rows if v)
 
-    html = f"""<div style="font-family:'Nunito',Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px;background:{BEIGE};border-radius:16px">
-  <h1 style="font-size:22px;color:{NAVY};text-align:center;margin:0 0 6px">Thank you for your purchase! &#127881;</h1>
-  <p style="text-align:center;color:{NAVY};font-size:16px;font-weight:700;margin:0 0 4px">Your eSIM is ready to use!</p>
-  <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 20px">Order <strong style="color:{NAVY}">{order_id}</strong></p>
+    html = f"""<div dir="{L['dir']}" style="font-family:'Nunito',Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px;background:{BEIGE};border-radius:16px">
+  <h1 style="font-size:22px;color:{NAVY};text-align:center;margin:0 0 6px">{L['title']}</h1>
+  <p style="text-align:center;color:{NAVY};font-size:16px;font-weight:700;margin:0 0 4px">{L['ready']}</p>
+  <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 20px">{L['order']} <strong style="color:{NAVY}">{order_id}</strong></p>
   <table style="width:100%;background:#fff;border-radius:12px;border-collapse:collapse;margin:0 0 20px">{detail_rows}</table>
-  <p style="text-align:center;color:{BROWN};font-size:14px;margin:0 0 12px">To activate your eSIM, open your order page:</p>
+  <p style="text-align:center;color:{BROWN};font-size:14px;margin:0 0 12px">{L['activate_hint']}</p>
   <div style="text-align:center;margin:0 0 22px">
-    <a href="{order_url}" style="display:inline-block;background:{NAVY};color:#fff;font-weight:800;font-size:15px;text-decoration:none;padding:14px 34px;border-radius:12px">Activate my eSIM &#8594;</a>
+    <a href="{order_url}" style="display:inline-block;background:{NAVY};color:#fff;font-weight:800;font-size:15px;text-decoration:none;padding:14px 34px;border-radius:12px">{L['cta']}</a>
   </div>
-  {_esim_copy_html(esim)}
-  <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 6px">Need help installing? A step-by-step guide is on your order page.</p>
-  <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 18px">Any problem with your package? We're happy to help:
+  {_esim_copy_html(esim, heb)}
+  <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 6px">{L['guide']}</p>
+  <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 18px">{L['problem']}
     <a href="mailto:{SUPPORT_EMAIL}" style="color:{ACCENT};font-weight:700;text-decoration:none">{SUPPORT_EMAIL}</a></p>
   <hr style="border:none;border-top:1px solid #e5d5c0;margin:0 0 12px">
-  <p style="font-size:11px;color:#9a7a60;text-align:center;word-break:break-all;margin:0">Button not working? Copy this link into your browser:<br>{order_url}</p>
+  <p style="font-size:11px;color:#9a7a60;text-align:center;word-break:break-all;margin:0">{L['fallback']}<br><span dir="ltr">{order_url}</span></p>
 </div>"""
 
     # multipart/related so the QR renders inline (data: URIs are stripped by
@@ -513,7 +533,7 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
         msg.attach(img)
     msg["From"] = f"Waverole <{GMAIL_USER}>"
     msg["To"] = to
-    msg["Subject"] = f"Your eSIM is ready to use! \N{AIRPLANE} Order {order_id}"
+    msg["Subject"] = L["subject"]
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
         s.starttls()
         s.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
@@ -531,11 +551,15 @@ def _qr_bytes(esim: dict) -> bytes | None:
     return None
 
 
-def _esim_copy_html(esim: dict) -> str:
+def _esim_copy_html(esim: dict, heb: bool = False) -> str:
     """Permanent in-email copy of the eSIM: inline QR + the manual codes.
     Shown under the CTA; empty string when there is nothing to show."""
     if not esim:
         return ""
+    t_keep = ("ה-eSIM שלכם — שמרו את המייל הזה כעותק קבוע" if heb
+              else "Your eSIM — keep this email as your permanent copy")
+    t_scan = ("סרקו את הקוד ממכשיר אחר, או הוסיפו את ה-eSIM ידנית עם הקודים למעלה." if heb
+              else "Scan the QR from another device, or add the eSIM manually with the codes above.")
     rows = [("Activation Code", esim.get("activation_code", "")),
             ("SM-DP+ Address", esim.get("smdp", "")),
             ("ICCID", esim.get("iccid", "")),
@@ -552,10 +576,10 @@ def _esim_copy_html(esim: dict) -> str:
               'style="border-radius:12px;background:#fff;padding:8px"></div>'
               if _qr_bytes(esim) else "")
     return f"""<div style="background:#fff;border-radius:12px;padding:16px 10px;margin:0 0 22px">
-  <p style="text-align:center;color:{NAVY};font-size:13px;font-weight:800;margin:0 0 10px">Your eSIM — keep this email as your permanent copy</p>
+  <p style="text-align:center;color:{NAVY};font-size:13px;font-weight:800;margin:0 0 10px">{t_keep}</p>
   {qr_img}
-  <table style="width:100%;border-collapse:collapse">{code_rows}</table>
-  <p style="text-align:center;color:#9a7a60;font-size:11px;margin:8px 0 0">Scan the QR from another device, or add the eSIM manually with the codes above.</p>
+  <table style="width:100%;border-collapse:collapse" dir="ltr">{code_rows}</table>
+  <p style="text-align:center;color:#9a7a60;font-size:11px;margin:8px 0 0">{t_scan}</p>
 </div>"""
 
 
