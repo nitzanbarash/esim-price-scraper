@@ -77,11 +77,17 @@ def col_letter(idx: int) -> str:
     return result
 
 
-def strip_vpn_from_url(url: str) -> str:
-    """Remove any vpn parameter so the unwanted VPN service is never auto-added."""
+def force_vpn_false(url: str) -> str:
+    """
+    Force vpn=false on every link. Merely REMOVING the param is not enough:
+    on some packages (e.g. il 500MB) the site bundles the VPN by default when
+    the param is absent, which replaces the "One-time payment" line in the
+    Payment Summary with a VPN-inclusive "Total due today" — breaking price
+    extraction and inflating the price with the VPN subscription.
+    """
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
-    query.pop('vpn', None)
+    query['vpn'] = ['false']
     return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
 
@@ -157,6 +163,20 @@ class ESIMScraper:
                 m = re.search(r'(?:USD\s*\$?|\$)\s*([\d]+\.?[\d]*)', after)
                 if m:
                     return f"${float(m.group(1)):.2f}"
+            # Fallback: no "One-time payment" line (e.g. the site bundled an
+            # add-on and switched to "Total due today"). The eSIM item line
+            # right after "Payment Summary" still shows the package price —
+            # take the lowest price listed before the fee/total lines, which
+            # skips crossed-out prices and never includes VPN/fee amounts.
+            idx = page_text.find("Payment Summary")
+            if idx >= 0:
+                seg = page_text[idx:idx + 400]
+                cut = re.search(r'VPN|Service fee|Total due|One-time', seg)
+                if cut:
+                    seg = seg[:cut.start()]
+                prices = [float(x) for x in re.findall(r'\$\s*([\d]+\.[\d]{2})', seg)]
+                if prices:
+                    return f"${min(prices):.2f}"
             return None
         except Exception as e:
             print(f"  ❌ Error extracting price: {e}")
@@ -280,6 +300,18 @@ class ESIMScraper:
         except Exception:
             return {}
         result = {}
+        # Prefer the Payment Summary item line ("eSIM Israel • 500MB • 1d") —
+        # it shows the package actually selected. A body-wide GB search can hit
+        # the data-size selector chips instead (e.g. "15GB" while the selected
+        # package is 500MB, which doesn't even end in GB).
+        m = re.search(r'•\s*([\d.]+)\s*(GB|MB)\s*•\s*(\d+)\s*d\b', text, re.IGNORECASE)
+        if m:
+            val = float(m.group(1))
+            if m.group(2).upper() == 'MB':
+                val /= 1000.0
+            result['page_gb'] = ('%g' % val)
+            result['page_validity'] = m.group(3)
+            return result
         m = re.search(r'(\d+(?:\.\d+)?)\s*GB', text)
         if m:
             result['page_gb'] = m.group(1)
@@ -426,9 +458,9 @@ class ESIMScraper:
 
     async def scrape(self, url: str, variant: str = "") -> Dict:
         print(f"\n🔗 {url}")
-        clean_url = strip_vpn_from_url(url)
+        clean_url = force_vpn_false(url)
         if clean_url != url:
-            print("  🔐 Removed VPN parameter")
+            print("  🔐 Forced vpn=false")
         info = parse_url(clean_url)
 
         async with async_playwright() as p:
@@ -547,6 +579,7 @@ class ESIMScraper:
                     'my_price': _get('my_price'),
                     'old_gb': _get('gb'),
                     'old_validity': _get('validity'),
+                    'old_code': _get('code'),
                 })
         return items, col_index
 
@@ -602,7 +635,10 @@ class ESIMScraper:
                 continue
 
             # ── Update all fields ──
-            if res['code']:
+            # A code already in the sheet is the package's identity (the site
+            # and the purchase bot key on it) — never overwrite it. Only fill
+            # the auto-generated code into an EMPTY cell.
+            if res['code'] and not (it.get('old_code') or '').strip():
                 put(r, 'code', res['code'])
             if res['countries']:
                 put(r, 'countries', res['countries'])
