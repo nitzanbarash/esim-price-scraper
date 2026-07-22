@@ -48,6 +48,8 @@ from email.mime.multipart import MIMEMultipart
 import gspread
 import requests
 
+from esim_country_data import COUNTRY_DATA
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("fulfillment")
 
@@ -351,11 +353,19 @@ def _row_time(s: str):
 def _link_ok(link: str, location: str) -> bool:
     if not location or not link:
         return True
-    l, slug = link.lower(), location.lower().replace(" ", "-")
-    if slug in l:
+    l, loc = link.lower(), location.lower()
+    if loc.replace(" ", "-") in l:
         return True
+    # Single-country links carry only the ISO code (esim.dog/il), never the
+    # country name — every such order failed the match until mapped here
+    # (first hit: the il test SKU, order WR-845JFY).
+    m = re.search(r"esim\.dog/([a-z]{2})(?:[/?#]|$)", l)
+    if m and m.group(1) in COUNTRY_DATA:
+        name = COUNTRY_DATA[m.group(1)][0].lower()
+        if name in loc or loc in name:
+            return True
     m = re.search(r"[?&]region=([a-z\-]+)", l)
-    if m and m.group(1) in location.lower():
+    if m and m.group(1) in loc:
         return True
     return "region=" in l
 
