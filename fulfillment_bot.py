@@ -441,6 +441,96 @@ def complete_row(ws, row_number: int, delivery: dict, details: dict):
 
 # ── site fulfillment ─────────────────────────────────────────────────────────
 
+def awaiting_email_orders() -> list[dict]:
+    """Orders the site has marked fulfilled whose buyer was never confirmed
+    emailed. This is the safety net: the eSIM email is the customer's only
+    permanent copy, so an order stays on this list until it provably went
+    out — across runs, restarts and a missing address."""
+    try:
+        r = requests.get(ORDERS_URL, params={"status": "awaiting_email"}, timeout=20,
+                         headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+        r.raise_for_status()
+        return r.json().get("orders", [])
+    except Exception as e:
+        log.warning(f"could not read the delivery ledger: {_redact(str(e))}")
+        return []
+
+
+def report_email_sent(order_id: str, ok: bool, error: str = "", address: str = ""):
+    """Close (or keep open) this order's ledger entry."""
+    payload = {"order_id": order_id, "email_sent": bool(ok)}
+    if error:
+        payload["error"] = error[:300]
+    if ok and address:
+        payload["customer_email"] = address
+    try:
+        r = requests.post(ORDERS_URL, json=payload, timeout=20,
+                          headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+        r.raise_for_status()
+    except Exception as e:
+        log.warning(f"order {order_id}: ledger update failed: {_redact(str(e))}")
+
+
+def _delivery_from_record(o: dict) -> dict:
+    """Rebuild the plan facts send_customer_email needs from a ledger entry."""
+    e = o.get("esim") or {}
+    gb = days = None
+    if m := PLAN_RE.search(str(e.get("plan", ""))):
+        gb, days = float(m.group(1)), int(m.group(2))
+    elif m := re.search(r"(\d+(?:\.\d+)?)\s*GB\s*[-–]\s*(\d+)", str(e.get("plan", "")), re.I):
+        gb, days = float(m.group(1)), int(m.group(2))
+    return {"gb": gb, "days": days, "location": e.get("region", ""),
+            "network": e.get("networks", "")}
+
+
+def deliver_pending_emails(ws):
+    """Send every eSIM email still owed to a buyer, then confirm it.
+
+    Runs on EVERY invocation, not just when a new delivery email arrives —
+    that is the whole point: a send that failed for any reason (bot down,
+    SMTP refused, address missing at the time) is retried here until it
+    succeeds. When the site has no address on file we look it up in the
+    receipts sheet, so filling the Mail column by hand is a complete repair.
+    """
+    owed = awaiting_email_orders()
+    if not owed:
+        return
+    log.info(f"{len(owed)} order(s) still owed their eSIM email")
+
+    by_order = {}
+    try:
+        rows = ws.get_all_values()
+        hdr = [h.strip() for h in rows[0]]
+        i_ord = hdr.index("מס׳ הזמנה") if "מס׳ הזמנה" in hdr else None
+        i_mail = hdr.index("מייל - Mail") if "מייל - Mail" in hdr else None
+        if i_ord is not None and i_mail is not None:
+            for r in rows[1:]:
+                oid = r[i_ord].strip() if len(r) > i_ord else ""
+                if oid:
+                    by_order[oid] = r[i_mail].strip() if len(r) > i_mail else ""
+    except Exception as e:
+        log.warning(f"could not read addresses from the sheet: {e}")
+
+    for o in owed:
+        oid = str(o.get("order_id", ""))
+        to = str(o.get("customer_email", "")).strip() or by_order.get(oid, "")
+        if not to:
+            # Nothing to send to. Keep the entry open and let the site escalate
+            # to the owner — filling the sheet's Mail column repairs it.
+            report_email_sent(oid, False, "no customer address on file")
+            log.warning(f"order {oid}: still no customer address — email deferred")
+            continue
+        try:
+            send_customer_email(to, oid, str(o.get("order_url", "")),
+                                _delivery_from_record(o), esim=o.get("esim") or {},
+                                lang=str(o.get("lang", "")), total=o.get("paid_usd"))
+            report_email_sent(oid, True, address=to)
+            log.info(f"order {oid}: eSIM email delivered (ledger closed)")
+        except Exception as e:
+            report_email_sent(oid, False, str(e))
+            log.warning(f"order {oid}: eSIM email failed, will retry: {_redact(str(e))}")
+
+
 def report_fulfilled(order_id: str, delivery: dict, details: dict):
     payload = {
         "order_id": order_id,
@@ -469,7 +559,7 @@ NAVY, BEIGE, BROWN, ACCENT = "#1B365D", "#f7ede2", "#7a5c40", "#C27A4E"
 
 
 def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
-                        esim: dict | None = None):
+                        esim: dict | None = None, lang: str = "", total=None):
     """The buyer's 'your eSIM is ready' email. Sent from the real Waverole
     Gmail (waverolesupply) — the site's Resend sender (onboarding@resend.dev)
     looked untrustworthy, so this bot owns the customer email now.
@@ -477,13 +567,19 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
     The email carries the FULL activation details (QR inline + manual codes),
     not just a link: the site's order records expire after 90 days, and this
     email must stay a working copy of the eSIM forever (new phone, late trip)."""
-    if not (to and order_url):
-        raise ValueError(f"missing customer email/order url (to={to!r})")
+    # Only the address is mandatory. A missing order link costs the customer
+    # the QR button, NOT the eSIM — the activation codes below install it on
+    # any phone, so we still send rather than withhold their only copy.
+    if not to:
+        raise ValueError("missing customer email address")
     esim = esim or {}
 
     payload = order_payload(order_url)
-    total = payload.get("t")                     # what the customer actually paid
-    heb = payload.get("l") == "he"               # site language at purchase time
+    # Explicit values (from the site's own order record) win over whatever we
+    # can decode from the link — the record is authoritative and always there.
+    if total is None:
+        total = payload.get("t")                 # what the customer actually paid
+    heb = (lang or payload.get("l", "")) == "he" # site language at purchase time
     gb, days = delivery.get("gb"), delivery.get("days")
     L = {
         "subject": (f"ה-eSIM שלך מוכן לשימוש! \N{AIRPLANE} הזמנה {order_id}" if heb
@@ -515,21 +611,25 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
         f'text-align:right">{v}</td></tr>'
         for k, v in rows if v)
 
+    cta = (f"""<p style="text-align:center;color:{BROWN};font-size:14px;margin:0 0 12px">{L['activate_hint']}</p>
+  <div style="text-align:center;margin:0 0 22px">
+    <a href="{order_url}" style="display:inline-block;background:{NAVY};color:#fff;font-weight:800;font-size:15px;text-decoration:none;padding:14px 34px;border-radius:12px">{L['cta']}</a>
+  </div>""" if order_url else "")
+    footer = (f"""<hr style="border:none;border-top:1px solid #e5d5c0;margin:0 0 12px">
+  <p style="font-size:11px;color:#9a7a60;text-align:center;word-break:break-all;margin:0">{L['fallback']}<br><span dir="ltr">{order_url}</span></p>"""
+              if order_url else "")
+
     html = f"""<div dir="{L['dir']}" style="font-family:'Nunito',Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px;background:{BEIGE};border-radius:16px">
   <h1 style="font-size:22px;color:{NAVY};text-align:center;margin:0 0 6px">{L['title']}</h1>
   <p style="text-align:center;color:{NAVY};font-size:16px;font-weight:700;margin:0 0 4px">{L['ready']}</p>
   <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 20px">{L['order']} <strong style="color:{NAVY}">{order_id}</strong></p>
   <table style="width:100%;background:#fff;border-radius:12px;border-collapse:collapse;margin:0 0 20px">{detail_rows}</table>
-  <p style="text-align:center;color:{BROWN};font-size:14px;margin:0 0 12px">{L['activate_hint']}</p>
-  <div style="text-align:center;margin:0 0 22px">
-    <a href="{order_url}" style="display:inline-block;background:{NAVY};color:#fff;font-weight:800;font-size:15px;text-decoration:none;padding:14px 34px;border-radius:12px">{L['cta']}</a>
-  </div>
+  {cta}
   {_esim_copy_html(esim, heb)}
   <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 6px">{L['guide']}</p>
   <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 18px">{L['problem']}
     <a href="mailto:{SUPPORT_EMAIL}" style="color:{ACCENT};font-weight:700;text-decoration:none">{SUPPORT_EMAIL}</a></p>
-  <hr style="border:none;border-top:1px solid #e5d5c0;margin:0 0 12px">
-  <p style="font-size:11px;color:#9a7a60;text-align:center;word-break:break-all;margin:0">{L['fallback']}<br><span dir="ltr">{order_url}</span></p>
+  {footer}
 </div>"""
 
     # multipart/related so the QR renders inline (data: URIs are stripped by
@@ -653,26 +753,31 @@ def process(inbox: Inbox, ws, d: dict):
               f"{match['row']} of the receipts sheet has every detail.")
         inbox.flag(uid)
         return
+    # The buyer's email is now tracked in the site's delivery ledger (opened by
+    # report_fulfilled above). Send it right away for speed, but a failure here
+    # is no longer the end of the road: the entry stays open, deliver_pending_
+    # emails retries it every run, and the site escalates on its own. No alert
+    # from here — that would fire on every transient SMTP hiccup.
+    to = match.get("customer_email", "")
     try:
-        send_customer_email(match.get("customer_email", ""), order_id,
-                            match.get("order_url", ""), d, esim=details)
+        send_customer_email(to, order_id, match.get("order_url", ""), d, esim=details)
+        report_email_sent(order_id, True, address=to)
     except Exception as e:
-        alert(f"Order {order_id}: customer email FAILED",
-              f"{e}\nSend the ready-email manually to "
-              f"{match.get('customer_email') or '<missing address>'}:\n"
-              f"{match.get('order_url', '')}")
+        report_email_sent(order_id, False, str(e))
+        log.warning(f"order {order_id}: eSIM email failed, ledger keeps it "
+                    f"for retry: {_redact(str(e))}")
     inbox.flag(uid)
     log.info(f"order {order_id} COMPLETED (row {match['row']})")
 
 
 def main():
     inbox = Inbox()
+    ws = None
     try:
         deliveries = inbox.unprocessed()
         log.info(f"{len(deliveries)} unprocessed delivery email(s)")
-        if not deliveries:
-            return
-        ws = sheet_client().open_by_key(RECEIPTS_SHEET_ID).sheet1
+        if deliveries:
+            ws = sheet_client().open_by_key(RECEIPTS_SHEET_ID).sheet1
         for d in deliveries:
             try:
                 process(inbox, ws, d)
@@ -683,6 +788,16 @@ def main():
                           f"{_redact(f'{type(e).__name__}: {e}')}")
     finally:
         inbox.close()
+
+    # ALWAYS, even with an empty inbox: this is the retry loop that guarantees
+    # every buyer eventually receives their eSIM. It runs last so an email that
+    # just failed above gets a second chance in this same run.
+    try:
+        if ws is None:
+            ws = sheet_client().open_by_key(RECEIPTS_SHEET_ID).sheet1
+        deliver_pending_emails(ws)
+    except Exception as e:
+        log.error(f"delivery ledger sweep failed: {_redact(str(e))}")
 
 
 if __name__ == "__main__":
