@@ -22,8 +22,11 @@
  * One-time setup (in the Apps Script editor, script.google.com):
  *  1. Paste this file over Code.gs → Save (Cmd+S).
  *  2. Project Settings (⚙) → Script properties → add:
- *       SITE_TOKEN = the UPDATE_PACKAGES_TOKEN value (site's .env.local)
- *       GH_TOKEN   = GitHub PAT (repo+workflow) for esim-price-scraper
+ *       SITE_TOKEN   = the UPDATE_PACKAGES_TOKEN value (site's .env.local)
+ *       GH_TOKEN     = GitHub PAT (repo+workflow) for esim-price-scraper
+ *       ORDERS_TOKEN = the site's ORDERS_TOKEN (optional — lets the 1-min
+ *                      fulfillment tick see a paid order the moment the
+ *                      payment lands, instead of waiting for the PC bot)
  *  3. In the editor pick `setupTriggers` in the function dropdown → Run ▶
  *     → authorize when prompted. Done.
  *
@@ -304,6 +307,32 @@ function rowTime_(v) {
 }
 
 function orderAwaitingEsim_() {
+  // Signal 1 — the SITE's own queue: an order sits there as "pending" from
+  // the second the payment IPN lands, before the PC bot has done anything.
+  // The receipts-row signal below only exists AFTER the PC bot both bought
+  // and wrote the row — the night WR-845JFY got stuck proved that row can
+  // simply never appear. Optional: needs ORDERS_TOKEN in Script Properties
+  // (same value as the site's env var); skipped silently without it.
+  try {
+    const tok = PropertiesService.getScriptProperties().getProperty('ORDERS_TOKEN');
+    if (tok) {
+      const res = UrlFetchApp.fetch('https://www.waverole.com/api/orders?status=pending', {
+        headers: { Authorization: 'Bearer ' + tok },
+        muteHttpExceptions: true,
+      });
+      if (res.getResponseCode() === 200) {
+        const orders = JSON.parse(res.getContentText()).orders || [];
+        for (const o of orders) {
+          const age = Date.now() - new Date(o.ts).getTime();
+          if (Math.abs(age) < AWAITING_WINDOW_MS) return true;
+        }
+      }
+    }
+  } catch (err) {
+    Logger.log('site queue check failed: ' + err);   // fall through to the sheet
+  }
+  // Signal 2 — a receipts row with an order number and no activation code
+  // (order bought, eSIM email not yet processed).
   try {
     const sh = SpreadsheetApp.openById(RECEIPTS_ID).getSheets()[0];
     const last = sh.getLastRow();
