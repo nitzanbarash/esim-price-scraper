@@ -9,6 +9,7 @@ Networks, Breakout IP.
 
 Route selection: cheapest first, ties broken by quality (Blue>Pink>Black>Yellow>Green).
 Stock detection: if the page shows different GB/validity than the URL requested.
+Minimum size: packages under 1GB are not sold — flagged out-of-stock, not scraped.
 Profitability: 1GB packages allow up to -20% loss; all others require >=20% profit.
 Regional codes: A=mini, B=grande (e.g. 1.0A.10, 1.0B.5).
 """
@@ -57,6 +58,14 @@ HEADER_KEYS = {
 }
 
 ROUTE_QUALITY = ['Blue', 'Pink', 'Black', 'Yellow', 'Green']
+
+# Smallest package we still sell. Owner's decision (2026-07-22): sub-1GB plans
+# are pennies below the 1GB ones, and esim.dog's own 500MB row is unsellable
+# (data=0.5 makes their checkout answer "Plan data mismatch: expected 0.5GB,
+# got 0.49GB"). Rows below this are flagged, not deleted — the owner keeps the
+# link and can raise the size whenever they want the row back.
+MIN_SELLABLE_GB = 1.0
+BELOW_MIN_LABEL = 'מתחת ל-1GB'
 
 def route_quality_rank(name: str) -> int:
     """Lower = better. Strips emoji prefixes like '🎁'."""
@@ -610,6 +619,19 @@ class ESIMScraper:
 
         for it in items:
             r = it['row']
+
+            # Below the minimum size: flag and move on WITHOUT scraping. A
+            # non-empty "במלאי/רווחי" is what the site sync reads as
+            # out-of-stock, so the package disappears from waverole.com while
+            # the row itself stays intact in the sheet.
+            req_gb = to_val(parse_url(it['link']).get('gb'))
+            if req_gb is not None and req_gb < MIN_SELLABLE_GB:
+                put(r, 'updated', ts)
+                put(r, 'stock', BELOW_MIN_LABEL)
+                put(r, 'changed', f'{BELOW_MIN_LABEL} — לא נמכר')
+                print(f"  ⛔ Row {r}: {req_gb}GB is under {MIN_SELLABLE_GB:g}GB — not sold, skipped")
+                continue
+
             res = await self.scrape_confirmed(it['link'], it['variant'], it['old_price'])
             new_price = res['price']
 

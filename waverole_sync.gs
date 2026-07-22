@@ -72,15 +72,17 @@ function setupTriggers() {
   ScriptApp.newTrigger('checkSiteFresh').timeBased()
     .atHour(12).everyDays(1).inTimezone('Asia/Jerusalem').create();
   // GitHub throttles */5 cron on public repos to ~1/hour in practice, so the
-  // fulfillment bot is dispatched from here instead — Apps Script's 5-minute
-  // trigger actually fires every 5 minutes. Needs GH_TOKEN (skips without it).
-  ScriptApp.newTrigger('fulfillmentTick').timeBased().everyMinutes(5).create();
+  // fulfillment bot is dispatched from here instead. Fires every minute; the
+  // handler itself decides whether to dispatch — every minute while an order
+  // waits for its eSIM, every 5th minute otherwise. Needs GH_TOKEN (skips
+  // without it).
+  ScriptApp.newTrigger('fulfillmentTick').timeBased().everyMinutes(1).create();
   // Weekly Drive copies of both spreadsheets — the sheets ARE the business
   // (prices, receipts, eSIM codes); an accidental mass-delete or a broken
   // formula paste would otherwise be unrecoverable beyond version history.
   ScriptApp.newTrigger('weeklyBackup').timeBased()
     .onWeekDay(ScriptApp.WeekDay.SUNDAY).atHour(3).inTimezone('Asia/Jerusalem').create();
-  Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape + 12:00 watchdog + 5-min fulfillment tick + weekly backup');
+  Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape + 12:00 watchdog + 1-min fulfillment tick + weekly backup');
 }
 
 // ── helpers ─────────────────────────────────────────────────────────
@@ -252,6 +254,14 @@ function fulfillmentTick() {
   const props = PropertiesService.getScriptProperties();
   const token = props.getProperty('GH_TOKEN');
   if (!token) return;                        // not configured — GitHub cron still runs
+
+  // The trigger fires every MINUTE, but dispatching every minute would mean
+  // 1440 Actions runs a day for an inbox that is empty almost all the time.
+  // So: dispatch at once while a paid order is still waiting for its eSIM
+  // (customer gets the QR in ~1 minute instead of up to 5), and otherwise
+  // keep the old 5-minute cadence — same idle cost as before.
+  if (!orderAwaitingEsim_() && new Date().getMinutes() % 5 !== 0) return;
+
   try {
     const res = UrlFetchApp.fetch(FULFILL_DISPATCH, {
       method: 'post',
@@ -273,6 +283,47 @@ function fulfillmentTick() {
     }
     Logger.log('fulfillmentTick failed: ' + err);
   }
+}
+
+// Receipts columns (1-based) the tick reads. The purchase bot appends a row
+// the moment it PAYS; the fulfillment bot later fills the activation code in
+// from esim.dog's delivery email. A row with an order id and no activation
+// code is therefore an order mid-flight.
+const RCP_DATE_COL = 2;         // תאריך
+const RCP_ORDER_COL = 6;        // מס׳ הזמנה
+const RCP_ACTIVATION_COL = 8;   // Activation Code
+const AWAITING_WINDOW_MS = 30 * 60 * 1000;
+
+function rowTime_(v) {
+  if (v instanceof Date) return v.getTime();
+  // The bot writes DD/MM/YYYY HH:MM:SS — day first, so Date.parse would read
+  // 07/12 as 7 December in some locales and 12 July in others. Parse it by hand.
+  const m = String(v).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return NaN;
+  return new Date(+m[3], +m[2] - 1, +m[1], +m[4], +m[5], +(m[6] || 0)).getTime();
+}
+
+function orderAwaitingEsim_() {
+  try {
+    const sh = SpreadsheetApp.openById(RECEIPTS_ID).getSheets()[0];
+    const last = sh.getLastRow();
+    if (last < 2) return false;
+    const n = Math.min(15, last - 1);        // newest rows only — enough for any burst
+    const rows = sh.getRange(last - n + 1, 1, n, RCP_ACTIVATION_COL).getValues();
+    for (const row of rows) {
+      if (!String(row[RCP_ORDER_COL - 1] || '').trim()) continue;      // not an order row
+      if (String(row[RCP_ACTIVATION_COL - 1] || '').trim()) continue;  // already fulfilled
+      // Recent rows only, so one permanently stuck order cannot pin the
+      // dispatcher at a run every minute forever. The window is symmetric to
+      // absorb any timezone skew between the bot and this script.
+      const age = Date.now() - rowTime_(row[RCP_DATE_COL - 1]);
+      if (Math.abs(age) < AWAITING_WINDOW_MS) return true;
+    }
+  } catch (err) {
+    // Never let this gate break the dispatcher — fall back to the 5-min cadence.
+    Logger.log('orderAwaitingEsim_ failed: ' + err);
+  }
+  return false;
 }
 
 function dailyScrape() {
