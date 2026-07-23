@@ -414,6 +414,24 @@ def find_pending_row(ws, delivery: dict) -> dict | None:
     return cands[0]
 
 
+def already_completed(ws, success_url: str) -> bool:
+    """True if some row already holds this delivery's supplier page AND its
+    activation code — i.e. the purchase bot finished the order itself."""
+    if not success_url:
+        return False
+    rows = ws.get_all_values()
+    hdr = [h.strip() for h in rows[0]]
+    if "QR" not in hdr or "Activation Code" not in hdr:
+        return False
+    i_qr, i_act = hdr.index("QR"), hdr.index("Activation Code")
+    for r in rows[1:]:
+        qr = r[i_qr].strip() if len(r) > i_qr else ""
+        act = r[i_act].strip() if len(r) > i_act else ""
+        if qr == success_url and act:
+            return True
+    return False
+
+
 def complete_row(ws, row_number: int, delivery: dict, details: dict):
     hdr = [h.strip() for h in ws.row_values(1)]
     gb = delivery.get("gb")
@@ -712,9 +730,17 @@ def process(inbox: Inbox, ws, d: dict):
         return                                   # NOT flagged → retried
 
     if match is None:
-        # The delivery email can beat the purchase bot's sheet row (esim.dog
-        # fulfills fast). Flagging immediately would burn the email forever;
-        # give the row time to appear before giving up.
+        # Already done? The purchase bot now reads the eSIM straight off the
+        # success page, so by the time this email lands its row is usually
+        # complete — and a complete row is not "pending", so nothing matches.
+        # That is success, not a problem: flag it and stay quiet.
+        if already_completed(ws, d["success_url"]):
+            log.info(f"email uid={uid}: order already completed by the purchase bot")
+            inbox.flag(uid)
+            return
+        # Otherwise the email can simply have beaten the purchase bot's row.
+        # Flagging immediately would burn the email forever; give the row time
+        # to appear before giving up.
         age = datetime.now(timezone.utc) - d["received_at"]
         if age < timedelta(hours=UNMATCHED_GRACE_HOURS):
             log.info(f"email uid={uid}: no matching row yet "
