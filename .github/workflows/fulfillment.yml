@@ -24,16 +24,10 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}
-
+      # No browser any more: the bot reads the supplier's JSON endpoint
+      # directly, which cut this job from ~2 minutes to a few seconds.
       - name: Install dependencies
-        run: |
-          pip install -q gspread requests playwright opencv-python-headless numpy
-          python -m playwright install --with-deps chromium
+        run: pip install -q gspread requests
 
       - name: Run fulfillment bot
         env:

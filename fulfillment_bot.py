@@ -5,10 +5,12 @@ Order-fulfillment bot (bot #4) — runs in GitHub Actions ("on the internet").
 What it does, every run (stateless — safe to run as often as you like):
   1. Reads the waverolesupply@gmail.com inbox over IMAP and picks up every
      UNFLAGGED "Your eSIM is ready!" email from orders@updates.esim.dog.
-  2. Opens the email's success page (esim.dog/success?session_id=...) in a
-     headless browser, expands "eSIM Details", and extracts the activation
-     code / SM-DP+ / ICCID / APN. If the text is not exposed, it decodes the
-     QR image itself (the QR *is* the LPA activation string).
+  2. Reads the eSIM for that order's session id from the supplier's JSON
+     endpoint — activation code / SM-DP+ / ICCID / APN / QR in one request.
+     (This used to drive a headless browser over the supplier's JavaScript
+     order page. The page reads the same endpoint we now call directly, so
+     the browser cost a minute of CI per order for nothing — and it had
+     stopped finding the ICCID and APN after a label change.)
   3. Matches the email to the oldest compatible PENDING row in the receipts
      Google Sheet (has order number, no activation yet, same GB, compatible
      location, purchased before the email within MATCH_WINDOW_HOURS).
@@ -150,12 +152,55 @@ def _body_text(msg) -> str:
     return "\n".join(chunks)
 
 
+# Mail wraps long lines at ~76 characters, and a session id is long — so the
+# link arrives split in two and a plain search returns only the first half.
+# That truncated link 404s when opened, which is why a saved supplier link
+# sometimes did not work. A newline right around the wrap column is a wrap; one
+# after a short or an over-long line is a real break in the text, and stitching
+# it would glue the next words onto the URL.
+_WRAP_COLS = (66, 82)
+
+
+def _unwrap(text: str) -> str:
+    text = re.sub(r"=\r?\n", "", text)            # quoted-printable soft break
+    lines = text.replace("\r\n", "\n").split("\n")
+    out = lines[:1]
+    for prev, line in zip(lines, lines[1:]):
+        wrapped = _WRAP_COLS[0] <= len(prev) <= _WRAP_COLS[1]
+        if wrapped and line[:1] and (line[0].isalnum() or line[0] in "_-"):
+            out[-1] += line
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def find_success_urls(text: str) -> list[str]:
+    """Every plausible reading of the email's supplier link, longest first.
+
+    Un-wrapping is a guess — we cannot know from the text alone where the id
+    ends. So we do not have to: the supplier decides. fetch_esim_details tries
+    these in order and the real link is the one that answers with an eSIM.
+    """
+    plain = {m.group(0) for m in SUCCESS_URL_RE.finditer(text)}
+    joined = {m.group(0) for m in SUCCESS_URL_RE.finditer(_unwrap(text))}
+    # A stitched candidate is only worth trying if it extends one we saw
+    # intact — that way a bad join can never invent an unrelated link.
+    repaired = {j for j in joined if any(j.startswith(p) for p in plain)}
+    return sorted(plain | repaired, key=len, reverse=True)
+
+
+def find_success_url(text: str) -> str:
+    urls = find_success_urls(text)
+    return urls[0] if urls else ""
+
+
 def parse_delivery(uid: str, msg) -> dict | None:
     text = _body_text(msg)
-    m_url = SUCCESS_URL_RE.search(text)
-    if not m_url:
+    success_urls = find_success_urls(text)
+    if not success_urls:
         return None
-    out = {"uid": uid, "success_url": m_url.group(0), "gb": None, "days": None,
+    out = {"uid": uid, "success_url": success_urls[0], "success_urls": success_urls,
+           "gb": None, "days": None,
            "location": "", "network": "", "received_at": None}
     if m := PLAN_RE.search(text):
         out["gb"], out["days"] = float(m.group(1)), int(m.group(2))
@@ -242,89 +287,68 @@ class Inbox:
 
 # ── success page scraping ────────────────────────────────────────────────────
 
-def decode_qr_data_uri(data_uri: str) -> str:
-    """The QR image encodes the LPA activation string — decode it."""
+# ── supplier lookup ──────────────────────────────────────────────────────────
+SUPPLIER_ESIM_URL = "https://esim.dog/.netlify/functions/get-esim"
+SESSION_ID_RE = re.compile(r"(?:session_id|payment_intent)=([A-Za-z0-9_\-]+)")
+
+
+def fetch_esim_details(success_url) -> dict:
+    """Accepts one URL or several candidate readings of it (longest first).
+    The supplier settles which one is real: a truncated or mis-stitched id
+    simply does not resolve. The winner comes back as `used_url` so the
+    receipts row records a link that actually opens."""
+    urls = [success_url] if isinstance(success_url, str) else list(success_url or [])
+    for u in urls:
+        if got := _fetch_one_esim(u):
+            got["used_url"] = u
+            return got
+    return {}
+
+
+def _fetch_one_esim(success_url: str) -> dict:
+    """Read the finished eSIM straight from the supplier's own JSON endpoint.
+
+    This used to drive a headless browser: the supplier's order page is a
+    JavaScript app, so every completion cost a Playwright run on a CI machine
+    that took a minute just to boot — and it had stopped finding the ICCID and
+    APN, which sit behind a toggle whose label changed. The page reads its data
+    from a plain endpoint, and so do we: one request, every field present.
+
+    Returns {} while the eSIM is still being provisioned, so the caller simply
+    retries on its next run.
+    """
+    m = SESSION_ID_RE.search(success_url or "")
+    if not m:
+        return {}
     try:
-        import cv2
-        import numpy as np
-        raw = base64.b64decode(data_uri.split(",", 1)[1])
-        img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
-        text, *_ = cv2.QRCodeDetector().detectAndDecode(img)
-        return text or ""
+        r = requests.get(SUPPLIER_ESIM_URL, params={"session_id": m.group(1)},
+                         headers={"Accept": "application/json",
+                                  "User-Agent": "Mozilla/5.0"}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
     except Exception as e:
-        log.warning(f"QR decode failed: {e}")
-        return ""
+        log.warning(f"supplier lookup failed: {_redact(str(e))}")
+        return {}
 
-
-def scrape_success_page(url: str) -> dict:
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1280, "height": 900})
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(6000)
-
-            # Expand "eSIM Details" with a REAL click (JS clicks are ignored by
-            # React) to reveal ICCID / SM-DP+ / plan info in plain text. The
-            # toggle is a <button> wrapping a heading + subtext; the outer text
-            # nodes don't fire the handler, so target the button role first.
-            expanded = False
-            for target in (
-                page.get_by_role("button", name=re.compile("eSIM Details", re.I)),
-                page.get_by_text(re.compile("eSIM Details", re.I)),
-            ):
-                try:
-                    target.first.click(timeout=5000)
-                    page.wait_for_timeout(2500)
-                    expanded = True
-                    break
-                except Exception:
-                    continue
-            if not expanded:
-                log.info("eSIM Details expander not clicked (may already be open)")
-
-            html = page.content()
-            try:
-                text = page.inner_text("body")
-            except Exception:
-                text = ""
-            out = {}
-            # 1) Most reliable: LPA from the install-link carddata= param.
-            if m := CARDDATA_RE.search(html):
-                lpa = unquote(m.group(1))
-                if LPA_RE.match(lpa):
-                    out["activation_code"] = lpa
-            # 2) Plain-text LPA from the expanded "eSIM Details" section.
-            if not out.get("activation_code") and (m := LPA_RE.search(html)):
-                out["activation_code"] = m.group(0)
-            if m := ICCID_RE.search(html):
-                out["iccid"] = m.group(1)
-            if m := APN_RE.search(html):
-                out["apn"] = m.group(1)
-            elif m := APN_TEXT_RE.search(text):
-                out["apn"] = m.group(1)          # bare APNs like "wbdata"
-            # Plan/Region from the expanded panel — backfill for emails the
-            # PLAN_RE couldn't parse (delivery said "NoneGB" once already).
-            if m := PLAN_RE.search(text):
-                out["plan_gb"], out["plan_days"] = float(m.group(1)), int(m.group(2))
-            if m := REGION_TEXT_RE.search(text):
-                out["page_region"] = m.group(1).strip()
-            if m := re.search(r'src="(data:image/png;base64,[^"]+)"', html):
-                out["qr_code"] = m.group(1)[:100000]
-                if not out.get("activation_code"):
-                    if lpa := decode_qr_data_uri(m.group(1)):
-                        if LPA_RE.match(lpa):
-                            out["activation_code"] = lpa
-                            log.info("activation code recovered from the QR image")
-            if ac := out.get("activation_code"):
-                parts = ac.split("$")
-                if len(parts) >= 2:
-                    out["smdp"] = parts[1]
-            return out
-        finally:
-            browser.close()
+    s, e = (data.get("session") or {}), (data.get("esim") or {})
+    if not e.get("activation_code"):
+        return {}
+    code = str(e["activation_code"])
+    out = {
+        "activation_code": code,
+        "smdp": str(e.get("smdp_address") or (code.split("$")[1] if "$" in code else "")),
+        "iccid": str(e.get("iccid", "")),
+        "apn": str(e.get("apn", "")),
+        "qr_code": str(e.get("qr_code", "")),
+        "page_region": str(s.get("country_name", "")),
+    }
+    if gb := re.sub(r"[^\d.]", "", str(s.get("plan_data", ""))):
+        out["plan_gb"] = float(gb)
+    if days := re.sub(r"[^\d]", "", str(s.get("plan_validity", ""))):
+        out["plan_days"] = int(days)
+    if nets := " • ".join(x for x in (s.get("coverage"), s.get("networks")) if x):
+        out["networks"] = nets
+    return out
 
 
 # ── receipts sheet ───────────────────────────────────────────────────────────
@@ -414,21 +438,28 @@ def find_pending_row(ws, delivery: dict) -> dict | None:
     return cands[0]
 
 
-def already_completed(ws, success_url: str) -> bool:
+def already_completed(ws, success_url) -> bool:
     """True if some row already holds this delivery's supplier page AND its
     activation code — i.e. the purchase bot finished the order itself."""
-    if not success_url:
+    wanted = {success_url} if isinstance(success_url, str) else set(success_url or [])
+    wanted.discard("")
+    if not wanted:
         return False
     rows = ws.get_all_values()
     hdr = [h.strip() for h in rows[0]]
-    if "QR" not in hdr or "Activation Code" not in hdr:
+    if "Activation Code" not in hdr:
         return False
-    i_qr, i_act = hdr.index("QR"), hdr.index("Activation Code")
+    i_act = hdr.index("Activation Code")
+    # The supplier link lives in 'Link - esim.dog'; rows written before that
+    # change kept it in 'QR', so check both.
+    link_cols = [hdr.index(h) for h in ("Link - esim.dog", "QR") if h in hdr]
     for r in rows[1:]:
-        qr = r[i_qr].strip() if len(r) > i_qr else ""
         act = r[i_act].strip() if len(r) > i_act else ""
-        if qr == success_url and act:
-            return True
+        if not act:
+            continue
+        for i in link_cols:
+            if (r[i].strip() if len(r) > i else "") in wanted:
+                return True
     return False
 
 
@@ -437,7 +468,12 @@ def complete_row(ws, row_number: int, delivery: dict, details: dict):
     gb = delivery.get("gb")
     updates = {
         "GB (0/X) - ניצול": f"{gb:g} / {gb:g}" if gb else "",
-        "QR": delivery["success_url"],
+        # Each link in the column it is named after: the QR column gets the QR
+        # image, and the supplier column gets the order's PACKAGE-DETAILS page.
+        # It used to get the plan's shop page instead, which shows what we buy
+        # rather than what this customer got.
+        "QR": details.get("qr_code") or delivery["success_url"],
+        "Link - esim.dog": delivery["success_url"],
         "Activation Code": details.get("activation_code", ""),
         "SM-DP+ Address": details.get("smdp", ""),
         # Leading apostrophe: USER_ENTERED turns a 19-digit ICCID into a float
@@ -670,12 +706,22 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
 
 
 def _qr_bytes(esim: dict) -> bytes | None:
-    qc = (esim or {}).get("qr_code", "")
+    """The QR as raw PNG bytes, so it can be attached inline (mail clients
+    strip data: URIs, and a hotlinked image is blocked until the reader
+    clicks 'show images' — this email must work on first open)."""
+    qc = str((esim or {}).get("qr_code", ""))
     if qc.startswith("data:image/png;base64,"):
         try:
             return base64.b64decode(qc.split(",", 1)[1])
         except Exception:
-            pass
+            return None
+    if qc.startswith("https://"):
+        try:
+            r = requests.get(qc, timeout=20)
+            r.raise_for_status()
+            return r.content
+        except Exception as e:
+            log.warning(f"could not download the QR image: {e}")
     return None
 
 
@@ -734,7 +780,7 @@ def process(inbox: Inbox, ws, d: dict):
         # success page, so by the time this email lands its row is usually
         # complete — and a complete row is not "pending", so nothing matches.
         # That is success, not a problem: flag it and stay quiet.
-        if already_completed(ws, d["success_url"]):
+        if already_completed(ws, d.get("success_urls") or [d["success_url"]]):
             log.info(f"email uid={uid}: order already completed by the purchase bot")
             inbox.flag(uid)
             return
@@ -754,7 +800,11 @@ def process(inbox: Inbox, ws, d: dict):
         return
 
     order_id = match["order_id"]
-    details = scrape_success_page(d["success_url"])
+    details = fetch_esim_details(d.get("success_urls") or [d["success_url"]])
+    # Record the reading the supplier actually accepted, so the receipts row
+    # and the site both get a link that opens.
+    if details.get("used_url"):
+        d["success_url"] = details["used_url"]
     if not (details.get("activation_code") or details.get("iccid")):
         log.warning(f"order {order_id}: no details on success page yet — will retry")
         return                                          # NOT flagged → retried

@@ -263,6 +263,12 @@ function fulfillmentTick() {
   // So: dispatch at once while a paid order is still waiting for its eSIM
   // (customer gets the QR in ~1 minute instead of up to 5), and otherwise
   // keep the old 5-minute cadence — same idle cost as before.
+  // Finish any order whose eSIM was still being provisioned when the purchase
+  // bot handed over its supplier session. Usually a no-op — the site normally
+  // completes the order on the spot — but it is what closes the gap when the
+  // supplier is a few seconds slow, without waiting for the delivery email.
+  sweepProvisioningOrders_();
+
   if (!orderAwaitingEsim_() && new Date().getMinutes() % 5 !== 0) return;
 
   try {
@@ -304,6 +310,26 @@ function rowTime_(v) {
   const m = String(v).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
   if (!m) return NaN;
   return new Date(+m[3], +m[2] - 1, +m[1], +m[4], +m[5], +(m[6] || 0)).getTime();
+}
+
+function sweepProvisioningOrders_() {
+  const tok = PropertiesService.getScriptProperties().getProperty('ORDERS_TOKEN');
+  if (!tok) return;                          // optional — see setup notes above
+  try {
+    const res = UrlFetchApp.fetch('https://www.waverole.com/api/orders', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + tok },
+      payload: JSON.stringify({ action: 'sweep' }),
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() === 200) {
+      const done = (JSON.parse(res.getContentText()).fulfilled || []);
+      if (done.length) Logger.log('sweep completed: ' + done.join(', '));
+    }
+  } catch (err) {
+    Logger.log('sweep failed: ' + err);      // never break the dispatcher
+  }
 }
 
 function orderAwaitingEsim_() {
