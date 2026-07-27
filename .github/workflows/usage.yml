@@ -1,0 +1,36 @@
+name: Package usage (daily)
+
+# Bot #5: refreshes how much data each LIVE package has used — receipts sheet
+# + the customer's order page — and retires packages that are finished.
+# Only rows whose Status column is still active are checked, and the supplier
+# is asked about 50 of them per request, so this stays cheap as the number of
+# customers grows.
+on:
+  schedule:
+    - cron: "0 6 * * *"      # 09:00 Israel (06:00 UTC)
+  workflow_dispatch: {}       # run it now from the Actions tab
+
+concurrency:
+  group: usage
+  cancel-in-progress: false
+
+jobs:
+  usage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30       # room for thousands of packages
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -q gspread requests
+
+      - name: Update package usage
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+        run: python usage_bot.py

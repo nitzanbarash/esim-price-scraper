@@ -289,7 +289,53 @@ class Inbox:
 
 # ── supplier lookup ──────────────────────────────────────────────────────────
 SUPPLIER_ESIM_URL = "https://esim.dog/.netlify/functions/get-esim"
+SUPPLIER_USAGE_URL = "https://esim.dog/.netlify/functions/check-esim-usage"
 SESSION_ID_RE = re.compile(r"(?:session_id|payment_intent)=([A-Za-z0-9_\-]+)")
+GB = 1024 ** 3
+
+
+def fetch_usage(iccids: list[str]) -> dict:
+    """How much data each of these eSIMs has used, keyed by ICCID.
+
+    The supplier takes a LIST, so a hundred live packages cost one request
+    rather than a hundred — which is what makes a daily sweep over every
+    active customer cheap enough to run forever.
+
+    An unknown ICCID is simply absent from the reply (no error), so always
+    read the result by key and never by position.
+    """
+    iccids = [re.sub(r"\D", "", str(i or "")) for i in iccids]
+    iccids = [i for i in iccids if i]
+    if not iccids:
+        return {}
+    try:
+        r = requests.post(SUPPLIER_USAGE_URL, json={"iccidList": iccids},
+                          headers={"Accept": "application/json",
+                                   "User-Agent": "Mozilla/5.0"}, timeout=60)
+        r.raise_for_status()
+        rows = (r.json() or {}).get("usage") or []
+    except Exception as e:
+        log.warning(f"usage lookup failed for {len(iccids)} eSIM(s): {_redact(str(e))}")
+        return {}
+
+    out = {}
+    for u in rows:
+        iccid = re.sub(r"\D", "", str(u.get("iccid", "")))
+        total = float(u.get("totalData") or 0)
+        used = float(u.get("dataUsage") or 0)
+        if not iccid or total <= 0:
+            continue
+        out[iccid] = {
+            "used_gb": round(used / GB, 3),
+            "total_gb": round(total / GB, 3),
+            "pct": max(0, min(100, round(used / total * 100))),
+            "expires": str(u.get("expiryDate") or ""),
+            "remaining_days": u.get("remainingDays"),
+            # The supplier's own verdict ("used_expired", …). Used only as a
+            # corroborating hint — our stop rule is the one below.
+            "status": str(u.get("status") or ""),
+        }
+    return out
 
 
 def fetch_esim_details(success_url) -> dict:
@@ -467,7 +513,12 @@ def complete_row(ws, row_number: int, delivery: dict, details: dict):
     hdr = [h.strip() for h in ws.row_values(1)]
     gb = delivery.get("gb")
     updates = {
-        "GB (0/X) - ניצול": f"{gb:g} / {gb:g}" if gb else "",
+        # Consumption, as used / total — so a brand-new package is 0 of X.
+        # This used to write "X / X", which showed every eSIM as fully used
+        # from the moment it was delivered. The usage bot keeps it current.
+        "GB (0/X) - ניצול": f"0 / {gb:g}" if gb else "",
+        # Start the daily usage checks for this package.
+        "סטטוס - Status": "פעיל",
         # Each link in the column it is named after: the QR column gets the QR
         # image, and the supplier column gets the order's PACKAGE-DETAILS page.
         # It used to get the plan's shop page instead, which shows what we buy

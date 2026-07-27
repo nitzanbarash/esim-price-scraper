@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+Usage bot (bot #5) — runs once a day in GitHub Actions.
+
+Keeps every live package's consumption up to date in two places:
+the receipts sheet (for you) and waverole.com (for the customer, who sees a
+"1.2 of 5 GB used" bar on their order page without asking anyone).
+
+How it stays cheap with hundreds of packages live at once:
+
+  * Only rows whose Status column says the package is still worth checking
+    are looked at. A finished package is never queried again.
+  * The supplier's usage endpoint takes a LIST of eSIMs, so a hundred live
+    packages cost ONE request, not a hundred.
+  * The sheet is read once and written once, and the site is updated in
+    batches — no per-customer round trips anywhere in the run.
+
+When to stop checking a package (the Status column, R):
+  · used up   — consumption reached the package size
+  · finished  — its validity ran out. Counted with ONE SPARE DAY, so a
+                30-day package keeps being checked for 31: time zones and
+                the supplier's own clock disagree by hours, and a package
+                cut off a few hours early would look "finished" to the
+                customer while it still works.
+  · active    — anything else; checked again tomorrow.
+A blank Status means "never checked yet", so existing rows join in on their
+own with no migration.
+
+Required environment (GitHub Secrets):
+  GOOGLE_CREDENTIALS_JSON  service account with Editor on the receipts sheet
+  ORDERS_TOKEN             bearer token of waverole.com/api/orders
+  GMAIL_APP_PASSWORD       only used to email you if the run itself breaks
+"""
+
+import logging
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+
+import gspread
+import requests
+
+from fulfillment_bot import (
+    ORDERS_URL, RECEIPTS_SHEET_ID, TZ, alert, env, fetch_esim_details,
+    fetch_usage, sheet_client, _redact, _row_time,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger("usage")
+
+# Status column values. Hebrew, because a person reads this sheet.
+ACTIVE = "פעיל"
+USED_UP = "נוצל"
+EXPIRED = "הסתיים"
+STILL_CHECK = {"", ACTIVE}          # a blank cell means "not checked yet"
+
+GRACE_DAYS = 1          # the spare day described above
+UNKNOWN_MAX_DAYS = 90   # cap for rows with no plan length (we sell max 30 days)
+USAGE_CHUNK = 50        # eSIMs per supplier request
+SITE_CHUNK = 100        # orders per site request
+MAX_ICCID_LOOKUPS = 25  # repairs of rows missing an ICCID, per run
+
+COL_ICCID = "מס סידורי -ICCID"
+COL_STATUS = "סטטוס - Status"
+COL_USAGE = "GB (0/X) - ניצול"
+COL_ORDER = "מס׳ הזמנה"
+COL_LINK = "Link - esim.dog"
+COL_DATE = "תאריך - Date"
+COL_PLAN = "חבילה - Plan"
+
+
+def _parse_expiry(s: str):
+    """The supplier sends '2026-07-23T22:03:18+0000'."""
+    s = str(s or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _plan_days(row_plan: str) -> int | None:
+    """Days out of a plan label like '1GB - 30 days — Cellcom'."""
+    m = re.search(r"[-–]\s*(\d+)\s*(?:days?|d\b|ימים)", str(row_plan or ""), re.I)
+    return int(m.group(1)) if m else None
+
+
+def decide_status(usage: dict | None, bought_at, plan_days: int | None, now=None) -> str:
+    """Whether this package is still worth checking tomorrow.
+
+    `usage` is the supplier's reading, or None when it does not know this
+    eSIM. Falling back to the sheet's own dates matters: an eSIM the supplier
+    has forgotten must not stay in the daily sweep forever.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    if usage:
+        if usage["total_gb"] > 0 and usage["used_gb"] >= usage["total_gb"]:
+            return USED_UP
+        exp = _parse_expiry(usage.get("expires", ""))
+        if exp and now > exp + timedelta(days=GRACE_DAYS):
+            return EXPIRED
+        # No expiry date yet usually means the customer has not installed it,
+        # so its clock has not started. Keep checking.
+        if exp is None and usage.get("status") in ("used_expired", "expired", "used_up"):
+            return EXPIRED
+        return ACTIVE
+
+    # The supplier does not know it. Retire it once its own validity is past,
+    # otherwise keep it (a fresh order may not have registered yet).
+    if bought_at:
+        age = now - bought_at.astimezone(timezone.utc)
+        # No plan length on the row (older rows stored only a network name).
+        # The longest package we sell is 30 days, so UNKNOWN_MAX_DAYS is far
+        # past any real expiry — without a cap those rows would be queried
+        # every day forever.
+        limit = (plan_days + GRACE_DAYS) if plan_days else UNKNOWN_MAX_DAYS
+        if age > timedelta(days=limit):
+            return EXPIRED
+    return ACTIVE
+
+
+def push_to_site(items: list[dict]) -> int:
+    """Send consumption to waverole.com so the order pages show it."""
+    done = 0
+    token = env("ORDERS_TOKEN")
+    for i in range(0, len(items), SITE_CHUNK):
+        chunk = items[i:i + SITE_CHUNK]
+        try:
+            r = requests.post(ORDERS_URL, json={"action": "usage_batch", "items": chunk},
+                              headers={"Authorization": f"Bearer {token}"}, timeout=60)
+            r.raise_for_status()
+            body = r.json()
+            done += len(body.get("updated") or [])
+            missing = body.get("not_found") or []
+            if missing:
+                # Normal for orders older than the site's 90-day record, and
+                # for anything bought before the site existed.
+                log.info(f"{len(missing)} order(s) are no longer on the site — sheet only")
+        except Exception as e:
+            log.warning(f"site usage update failed for {len(chunk)} order(s): {_redact(str(e))}")
+    return done
+
+
+def main() -> int:
+    ws = sheet_client().open_by_key(RECEIPTS_SHEET_ID).sheet1
+    rows = ws.get_all_values()
+    if not rows:
+        log.info("receipts sheet is empty")
+        return 0
+    hdr = [h.strip() for h in rows[0]]
+    missing = [c for c in (COL_ICCID, COL_STATUS, COL_USAGE, COL_ORDER) if c not in hdr]
+    if missing:
+        alert("Usage bot cannot read the receipts sheet",
+              f"These columns are missing: {missing}\n"
+              "Add them back (or tell me the new names) — until then usage is not updated.")
+        return 1
+    idx = {c: hdr.index(c) for c in hdr}
+    cell = lambda r, c: (r[idx[c]].strip() if c in idx and len(r) > idx[c] else "")
+
+    # ── who is still worth checking ──
+    todo = []
+    for n, r in enumerate(rows[1:], start=2):
+        if not cell(r, COL_ORDER):
+            continue
+        if cell(r, COL_STATUS) not in STILL_CHECK:
+            continue                                  # finished — never again
+        todo.append({
+            "row": n,
+            "order_id": cell(r, COL_ORDER),
+            "iccid": re.sub(r"\D", "", cell(r, COL_ICCID)),
+            "link": cell(r, COL_LINK),
+            "status": cell(r, COL_STATUS),
+            "usage_cell": cell(r, COL_USAGE),
+            "bought_at": _row_time(cell(r, COL_DATE)),
+            "plan_days": _plan_days(cell(r, COL_PLAN)),
+        })
+    log.info(f"{len(todo)} package(s) still being checked "
+             f"(out of {len(rows) - 1} row(s) in the sheet)")
+    if not todo:
+        return 0
+
+    # ── rows that never got an ICCID: recover it from their supplier link ──
+    repairs = [t for t in todo if not t["iccid"] and t["link"]][:MAX_ICCID_LOOKUPS]
+    for t in repairs:
+        got = fetch_esim_details(t["link"])
+        if got.get("iccid"):
+            t["iccid"] = re.sub(r"\D", "", got["iccid"])
+            t["new_iccid"] = t["iccid"]
+            log.info(f"row {t['row']}: recovered the eSIM id from its order link")
+
+    # ── one supplier request per 50 packages ──
+    usage = {}
+    known = [t["iccid"] for t in todo if t["iccid"]]
+    for i in range(0, len(known), USAGE_CHUNK):
+        usage.update(fetch_usage(known[i:i + USAGE_CHUNK]))
+    log.info(f"the supplier reported on {len(usage)} of {len(known)} package(s)")
+
+    # ── decide, then write the sheet ONCE ──
+    cells, site_items, counts = [], [], {ACTIVE: 0, USED_UP: 0, EXPIRED: 0}
+    for t in todo:
+        u = usage.get(t["iccid"]) if t["iccid"] else None
+        status = decide_status(u, t["bought_at"], t["plan_days"])
+        counts[status] += 1
+
+        if t.get("new_iccid"):
+            cells.append(gspread.Cell(t["row"], idx[COL_ICCID] + 1, f"'{t['new_iccid']}"))
+        if u:
+            text = f"{u['used_gb']:g} / {u['total_gb']:g}"
+            if text != t["usage_cell"]:
+                cells.append(gspread.Cell(t["row"], idx[COL_USAGE] + 1, text))
+            site_items.append({"order_id": t["order_id"], "used_gb": u["used_gb"],
+                               "total_gb": u["total_gb"], "expires": u["expires"]})
+        if status != t["status"]:
+            cells.append(gspread.Cell(t["row"], idx[COL_STATUS] + 1, status))
+
+    if cells:
+        ws.update_cells(cells, value_input_option="USER_ENTERED")
+    log.info(f"sheet: {len(cells)} cell(s) updated · still active {counts[ACTIVE]} · "
+             f"used up {counts[USED_UP]} · finished {counts[EXPIRED]}")
+
+    if site_items:
+        log.info(f"site: {push_to_site(site_items)} order page(s) now show current usage")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        # A silent failure here means customers' usage bars quietly freeze.
+        log.exception("usage run failed")
+        alert("Usage bot failed", f"{type(e).__name__}: {_redact(str(e))}\n\n"
+              "Usage bars on order pages will be stale until the next run.")
+        sys.exit(1)
