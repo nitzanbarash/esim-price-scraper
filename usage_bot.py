@@ -68,6 +68,28 @@ COL_LINK = "Link - esim.dog"
 COL_QR = "QR"
 COL_DATE = "תאריך - Date"
 COL_PLAN = "חבילה - Plan"
+COL_WAVEROLE = "Link - waverole"
+
+
+def fetch_order_link(order_id: str) -> str:
+    """The customer's own page link, from the site.
+
+    It is a signed token, so it cannot be rebuilt from an order number — if a
+    row lost it, this is the only way to get back in and see what the customer
+    sees. Rows written by hand, or before the queue exposed the link, are
+    missing it.
+    """
+    try:
+        r = requests.get(ORDERS_URL, params={"order_id": order_id},
+                         headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"},
+                         timeout=20)
+        if r.status_code == 404:
+            return ""                    # older than the site's 90-day record
+        r.raise_for_status()
+        return str(r.json().get("order_url") or "")
+    except Exception as e:
+        log.warning(f"could not look up {order_id}: {_redact(str(e))}")
+        return ""
 
 
 def _parse_expiry(s: str):
@@ -182,6 +204,7 @@ def main() -> int:
             "usage_cell": cell(r, COL_USAGE),
             "bought_at": _row_time(cell(r, COL_DATE)),
             "plan_days": _plan_days(cell(r, COL_PLAN)),
+            "waverole": cell(r, COL_WAVEROLE),
         })
     log.info(f"{len(todo)} package(s) still being checked "
              f"(out of {len(rows) - 1} row(s) in the sheet)")
@@ -209,6 +232,13 @@ def main() -> int:
                              + (f" — {got['networks']}" if got.get("networks") else "")) if gb else ""
         log.info(f"row {t['row']}: filled in missing details from its order link")
 
+    # ── rows with no customer link: ask the site for it ──
+    for t in todo:
+        if not t["waverole"] and COL_WAVEROLE in idx:
+            if link := fetch_order_link(t["order_id"]):
+                t["new_waverole"] = link
+                log.info(f"row {t['row']}: recovered the customer's page link")
+
     # ── one supplier request per 50 packages ──
     usage = {}
     known = [t["iccid"] for t in todo if t["iccid"]]
@@ -227,6 +257,8 @@ def main() -> int:
             cells.append(gspread.Cell(t["row"], idx[COL_ICCID] + 1, f"'{t['new_iccid']}"))
         if t.get("new_plan") and COL_PLAN in idx:
             cells.append(gspread.Cell(t["row"], idx[COL_PLAN] + 1, t["new_plan"]))
+        if t.get("new_waverole"):
+            cells.append(gspread.Cell(t["row"], idx[COL_WAVEROLE] + 1, t["new_waverole"]))
         if u:
             text = f"{u['used_gb']:g} / {u['total_gb']:g}"
             if text != t["usage_cell"]:
