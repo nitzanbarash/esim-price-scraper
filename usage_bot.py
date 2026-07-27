@@ -65,6 +65,7 @@ COL_STATUS = "סטטוס - Status"
 COL_USAGE = "GB (0/X) - ניצול"
 COL_ORDER = "מס׳ הזמנה"
 COL_LINK = "Link - esim.dog"
+COL_QR = "QR"
 COL_DATE = "תאריך - Date"
 COL_PLAN = "חבילה - Plan"
 
@@ -176,6 +177,7 @@ def main() -> int:
             "order_id": cell(r, COL_ORDER),
             "iccid": re.sub(r"\D", "", cell(r, COL_ICCID)),
             "link": cell(r, COL_LINK),
+            "qr": cell(r, COL_QR),
             "status": cell(r, COL_STATUS),
             "usage_cell": cell(r, COL_USAGE),
             "bought_at": _row_time(cell(r, COL_DATE)),
@@ -186,14 +188,26 @@ def main() -> int:
     if not todo:
         return 0
 
-    # ── rows that never got an ICCID: recover it from their supplier link ──
-    repairs = [t for t in todo if not t["iccid"] and t["link"]][:MAX_ICCID_LOOKUPS]
+    # ── rows missing the facts this sweep runs on: recover them ──
+    # Both from the supplier link and from the QR column, because rows written
+    # before the columns were straightened out keep their order link there.
+    # Anything we learn is written back, so a row is only ever repaired once.
+    repairs = [t for t in todo if not (t["iccid"] and t["plan_days"])
+               and (t["link"] or t["qr"])][:MAX_ICCID_LOOKUPS]
     for t in repairs:
-        got = fetch_esim_details(t["link"])
-        if got.get("iccid"):
-            t["iccid"] = re.sub(r"\D", "", got["iccid"])
-            t["new_iccid"] = t["iccid"]
-            log.info(f"row {t['row']}: recovered the eSIM id from its order link")
+        got = fetch_esim_details([u for u in (t["link"], t["qr"]) if u])
+        if not got:
+            continue
+        if got.get("iccid") and not t["iccid"]:
+            t["iccid"] = t["new_iccid"] = re.sub(r"\D", "", got["iccid"])
+        # The plan length decides when to stop checking a package the usage
+        # endpoint has never heard of; without it the row lingers for months.
+        if got.get("plan_days") and not t["plan_days"]:
+            t["plan_days"] = int(got["plan_days"])
+            gb = got.get("plan_gb")
+            t["new_plan"] = (f"{gb:g}GB - {t['plan_days']} days"
+                             + (f" — {got['networks']}" if got.get("networks") else "")) if gb else ""
+        log.info(f"row {t['row']}: filled in missing details from its order link")
 
     # ── one supplier request per 50 packages ──
     usage = {}
@@ -211,6 +225,8 @@ def main() -> int:
 
         if t.get("new_iccid"):
             cells.append(gspread.Cell(t["row"], idx[COL_ICCID] + 1, f"'{t['new_iccid']}"))
+        if t.get("new_plan") and COL_PLAN in idx:
+            cells.append(gspread.Cell(t["row"], idx[COL_PLAN] + 1, t["new_plan"]))
         if u:
             text = f"{u['used_gb']:g} / {u['total_gb']:g}"
             if text != t["usage_cell"]:
