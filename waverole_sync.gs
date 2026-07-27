@@ -22,11 +22,17 @@
  * One-time setup (in the Apps Script editor, script.google.com):
  *  1. Paste this file over Code.gs → Save (Cmd+S).
  *  2. Project Settings (⚙) → Script properties → add:
- *       SITE_TOKEN   = the UPDATE_PACKAGES_TOKEN value (site's .env.local)
+ *       UPDATE_PACKAGES_TOKEN = the site's UPDATE_PACKAGES_TOKEN
+ *                      (was called SITE_TOKEN here; both names still work)
  *       GH_TOKEN     = GitHub PAT (repo+workflow) for esim-price-scraper
- *       ORDERS_TOKEN = the site's ORDERS_TOKEN (optional — lets the 1-min
- *                      fulfillment tick see a paid order the moment the
- *                      payment lands, instead of waiting for the PC bot)
+ *       ORDERS_TOKEN = the site's ORDERS_TOKEN — the SAME value the PC bot
+ *                      and GitHub Actions already use. There is only ever
+ *                      ONE of these: the site checks one string, so every
+ *                      client presents that same string. Never mint a second
+ *                      one — it is also the HMAC key that signs the payment
+ *                      callback, so a mismatch silently rejects real orders.
+ *                      Optional here; without it the 1-min fulfillment tick
+ *                      cannot see a paid order until the PC bot reports it.
  *  3. In the editor pick `setupTriggers` in the function dropdown → Run ▶
  *     → authorize when prompted. Done.
  *
@@ -168,8 +174,13 @@ function buildPackages_(rowsWanted) {   // rowsWanted: null = all, or Set of she
 }
 
 function post_(packages) {
-  const token = PropertiesService.getScriptProperties().getProperty('SITE_TOKEN');
-  if (!token) throw new Error('חסר SITE_TOKEN ב-Script Properties (הגדרות הפרויקט)');
+  // Same secret the site calls UPDATE_PACKAGES_TOKEN. It was originally added
+  // here under the name SITE_TOKEN, and one secret wearing two names is how
+  // you end up unable to tell which key is which. Prefer the site's name;
+  // keep reading the old one so the existing property keeps working.
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty('UPDATE_PACKAGES_TOKEN') || props.getProperty('SITE_TOKEN');
+  if (!token) throw new Error('חסר UPDATE_PACKAGES_TOKEN ב-Script Properties (הגדרות הפרויקט)');
   const res = UrlFetchApp.fetch(ENDPOINT, {
     method: 'post',
     contentType: 'application/json',
