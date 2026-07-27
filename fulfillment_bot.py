@@ -797,7 +797,9 @@ def _esim_copy_html(esim: dict, heb: bool = False) -> str:
     if not code_rows and not _qr_bytes(esim):
         return ""
     qr_img = ('<div style="text-align:center;margin:0 0 10px">'
-              '<img src="cid:qr" alt="eSIM QR code" width="180" height="180" '
+              # 200 = the supplier QR's own resolution. Mail clients do not
+              # resample kindly, and a scaled QR is a QR that fails to scan.
+              '<img src="cid:qr" alt="eSIM QR code" width="200" height="200" '
               'style="border-radius:12px;background:#fff;padding:8px"></div>'
               if _qr_bytes(esim) else "")
     return f"""<div style="background:#fff;border-radius:12px;padding:16px 10px;margin:0 0 22px">
