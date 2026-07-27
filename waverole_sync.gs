@@ -279,6 +279,10 @@ function fulfillmentTick() {
   // completes the order on the spot — but it is what closes the gap when the
   // supplier is a few seconds slow, without waiting for the delivery email.
   sweepProvisioningOrders_();
+  // Watch whether the supplier can still sell us packages, and email once on
+  // each change. Also keeps the site's cached verdict warm, so a shopper's
+  // page load never has to wait for a live check.
+  supplierWatch_();
 
   if (!orderAwaitingEsim_() && new Date().getMinutes() % 5 !== 0) return;
 
@@ -321,6 +325,56 @@ function rowTime_(v) {
   const m = String(v).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
   if (!m) return NaN;
   return new Date(+m[3], +m[2] - 1, +m[1], +m[4], +m[5], +(m[6] || 0)).getTime();
+}
+
+// ── supplier watch — every minute ───────────────────────────────────
+// On 2026-07-27 the supplier answered HTTP 200 on every page while all of its
+// JavaScript build files 404'd: the site rendered, the Checkout button did
+// nothing, and nobody could buy. We could still have taken payments for
+// packages we had no way to obtain.
+//
+// So this asks the site to re-run its real check (page loads AND its build
+// files exist), which both keeps the cached verdict warm for shoppers and
+// tells us the moment selling becomes impossible — or possible again.
+// Emails only on a CHANGE, so a long outage does not send 1440 messages.
+function supplierWatch_() {
+  const props = PropertiesService.getScriptProperties();
+  const tok = props.getProperty('ORDERS_TOKEN');
+  if (!tok) return;                          // not configured — site self-checks
+
+  let selling, reason;
+  try {
+    const res = UrlFetchApp.fetch('https://www.waverole.com/api/supplier-status', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + tok },
+      payload: JSON.stringify({ action: 'refresh' }),
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() !== 200) return;
+    const body = JSON.parse(res.getContentText());
+    selling = body.selling !== false;
+    reason = body.reason || '';
+  } catch (e) {
+    return;                                  // a watch failure is not an outage
+  }
+
+  const was = props.getProperty('SUPPLIER_SELLING');
+  const now = selling ? 'yes' : 'no';
+  if (was === now) return;                   // nothing changed — stay quiet
+  props.setProperty('SUPPLIER_SELLING', now);
+  if (was === null) return;                  // first ever run — no news yet
+
+  if (!selling) {
+    alert_('הספק לא זמין — המכירות נעצרו אוטומטית',
+      'לא ניתן לרכוש חבילות מהספק כרגע, ולכן האתר עבר למצב תחזוקה ואי אפשר לקנות בו.\n\n' +
+      'סיבה: ' + reason + '\n\n' +
+      'הזמנות קיימות ממשיכות לפעול כרגיל — רק מכירות חדשות מושבתות.\n' +
+      'האתר ייפתח מחדש מעצמו תוך כדקה מרגע שהספק יחזור.');
+  } else {
+    report_('הספק חזר — המכירות נפתחו מחדש',
+      'ניתן שוב לרכוש חבילות מהספק, והאתר חזר לפעולה רגילה.');
+  }
 }
 
 function sweepProvisioningOrders_() {
