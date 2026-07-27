@@ -372,8 +372,31 @@ function supplierWatch_() {
       'הזמנות קיימות ממשיכות לפעול כרגיל — רק מכירות חדשות מושבתות.\n' +
       'האתר ייפתח מחדש מעצמו תוך כדקה מרגע שהספק יחזור.');
   } else {
+    // Buying works again — hand back every order that was paid for but could
+    // not be bought while the supplier was down, before saying all is well.
+    const rescued = retryUnfulfilled_(tok);
     report_('הספק חזר — המכירות נפתחו מחדש',
-      'ניתן שוב לרכוש חבילות מהספק, והאתר חזר לפעולה רגילה.');
+      'ניתן שוב לרכוש חבילות מהספק, והאתר חזר לפעולה רגילה.' +
+      (rescued ? '\n\nהוחזרו לתור ' + rescued + ' הזמנות ששולמו ולא סופקו בזמן התקלה.' : ''));
+  }
+}
+
+// Give paid-but-unbought orders back to the bot. Returns how many.
+// Orders that have used up their retries are NOT returned here — the site
+// emails about those separately, because they need a person.
+function retryUnfulfilled_(tok) {
+  try {
+    const res = UrlFetchApp.fetch('https://www.waverole.com/api/orders', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + tok },
+      payload: JSON.stringify({ action: 'retry_unfulfilled' }),
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() !== 200) return 0;
+    return (JSON.parse(res.getContentText()).requeued || []).length;
+  } catch (e) {
+    return 0;
   }
 }
 
