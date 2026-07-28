@@ -76,6 +76,10 @@ function setupTriggers() {
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('onEditPush')
     .forSpreadsheet(SHEET_ID).onEdit().create();
+  // Same idea for the receipts sheet: a consumption figure edited there
+  // reaches the customer's usage meter within seconds.
+  ScriptApp.newTrigger('onReceiptsEdit')
+    .forSpreadsheet(RECEIPTS_ID).onEdit().create();
   ScriptApp.newTrigger('dailyScrape').timeBased()
     .atHour(10).everyDays(1).inTimezone('Asia/Jerusalem').create();
   ScriptApp.newTrigger('checkSiteFresh').timeBased()
@@ -233,6 +237,58 @@ function onEditPush(e) {
   } catch (err) {
     // colMap_/post_ already emailed the specific reason; log and stop.
     Logger.log('onEditPush failed: ' + err);
+  }
+}
+
+// ── receipts sheet → customer's usage meter, instantly ──────────────
+// The daily usage bot refreshes every live package once a day. This closes
+// the gap in between: edit the consumption cell in the receipts sheet and the
+// customer's order page shows the new figure within seconds — the same
+// arrangement the price sheet has with the shop.
+//
+// Only MANUAL edits reach here; Apps Script does not fire onEdit for writes
+// made by a script, so the daily bot is not double-counted (it pushes to the
+// site directly anyway).
+const RCPT_USAGE_COL = 'GB (0/X) - ניצול';
+const RCPT_ORDER_COL = 'מס׳ הזמנה';
+
+function onReceiptsEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    const sh = e.range.getSheet();
+    const hdr = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h).trim());
+    const usageCol = hdr.indexOf(RCPT_USAGE_COL) + 1;
+    const orderCol = hdr.indexOf(RCPT_ORDER_COL) + 1;
+    if (!usageCol || !orderCol) return;
+    if (e.range.getColumn() > usageCol || e.range.getLastColumn() < usageCol) return;
+
+    const tok = PropertiesService.getScriptProperties().getProperty('ORDERS_TOKEN');
+    if (!tok) return;
+
+    const items = [];
+    for (let r = Math.max(2, e.range.getRow()); r <= e.range.getLastRow(); r++) {
+      const orderId = String(sh.getRange(r, orderCol).getValue()).trim();
+      // The cell reads "used / total", e.g. "0.44 / 1".
+      const m = String(sh.getRange(r, usageCol).getValue()).match(/([\d.]+)\s*\/\s*([\d.]+)/);
+      if (!orderId || !m) continue;
+      const used = parseFloat(m[1]), total = parseFloat(m[2]);
+      if (!(total > 0) || !(used >= 0)) continue;
+      items.push({ order_id: orderId, used_gb: used, total_gb: total });
+    }
+    if (!items.length) return;
+
+    const res = UrlFetchApp.fetch('https://www.waverole.com/api/orders', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + tok },
+      payload: JSON.stringify({ action: 'usage_batch', items: items }),
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() !== 200) {
+      Logger.log('usage push failed: ' + res.getContentText().slice(0, 200));
+    }
+  } catch (err) {
+    Logger.log('onReceiptsEdit failed: ' + err);
   }
 }
 
