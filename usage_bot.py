@@ -108,6 +108,25 @@ def _parse_expiry(s: str):
         return None
 
 
+def _parse_usage_cell(text: str) -> dict | None:
+    """Read the sheet's own "used / total" figure, e.g. "0.076 / 1".
+
+    Used as the fallback when the supplier declines to report on a package,
+    so a finished package still shows the customer its final reading instead
+    of an empty meter.
+    """
+    m = re.match(r"\s*([\d.]+)\s*/\s*([\d.]+)\s*$", str(text or ""))
+    if not m:
+        return None
+    try:
+        used, total = float(m.group(1)), float(m.group(2))
+    except ValueError:
+        return None
+    if total <= 0 or used < 0:
+        return None
+    return {"used_gb": used, "total_gb": total, "expires": None}
+
+
 def _plan_days(row_plan: str) -> int | None:
     """Days out of a plan label like '1GB - 30 days — Cellcom'."""
     m = re.search(r"[-–]\s*(\d+)\s*(?:days?|d\b|ימים)", str(row_plan or ""), re.I)
@@ -187,6 +206,20 @@ def main() -> int:
     idx = {c: hdr.index(c) for c in hdr}
     cell = lambda r, c: (r[idx[c]].strip() if c in idx and len(r) > idx[c] else "")
 
+    # ── one-off: send the sheet's figures to the site and stop ──
+    # For rows retired before the site was ever told their final reading. They
+    # are skipped by the sweep below forever, so their customers were left
+    # looking at an empty meter with no way for it to ever fill in.
+    if "--backfill" in sys.argv:
+        items = []
+        for r in rows[1:]:
+            oid = cell(r, COL_ORDER)
+            if oid and (u := _parse_usage_cell(cell(r, COL_USAGE))):
+                items.append({"order_id": oid, **u})
+        log.info(f"backfill: {len(items)} row(s) with a usage figure")
+        log.info(f"site: {push_to_site(items)} order page(s) updated")
+        return 0
+
     # ── who is still worth checking ──
     todo = []
     for n, r in enumerate(rows[1:], start=2):
@@ -265,6 +298,13 @@ def main() -> int:
                 cells.append(gspread.Cell(t["row"], idx[COL_USAGE] + 1, text))
             site_items.append({"order_id": t["order_id"], "used_gb": u["used_gb"],
                                "total_gb": u["total_gb"], "expires": u["expires"]})
+        elif (sheet_u := _parse_usage_cell(t["usage_cell"])):
+            # The supplier went quiet — which it does precisely when a package
+            # is spent, the moment the customer most wants to see where they
+            # stand. Send what the sheet already knows rather than nothing:
+            # the customer's meter showed BLANK for every finished package
+            # because this push only ever ran when the supplier answered.
+            site_items.append({"order_id": t["order_id"], **sheet_u})
         if status != t["status"]:
             cells.append(gspread.Cell(t["row"], idx[COL_STATUS] + 1, status))
 
