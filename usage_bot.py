@@ -142,30 +142,39 @@ def decide_status(usage: dict | None, bought_at, plan_days: int | None, now=None
     """
     now = now or datetime.now(timezone.utc)
 
+    def too_old(limit_days: int) -> bool:
+        if not bought_at:
+            return False
+        return now - bought_at.astimezone(timezone.utc) > timedelta(days=limit_days)
+
     if usage:
         if usage["total_gb"] > 0 and usage["used_gb"] >= usage["total_gb"]:
             return USED_UP
         exp = _parse_expiry(usage.get("expires", ""))
-        if exp and now > exp + timedelta(days=GRACE_DAYS):
+        if exp:
+            return EXPIRED if now > exp + timedelta(days=GRACE_DAYS) else ACTIVE
+        if usage.get("status") in ("used_expired", "expired", "used_up"):
             return EXPIRED
-        # No expiry date yet usually means the customer has not installed it,
-        # so its clock has not started. Keep checking.
-        if exp is None and usage.get("status") in ("used_expired", "expired", "used_up"):
-            return EXPIRED
-        return ACTIVE
+        # Answered, but with no expiry date at all — which is the NORM for
+        # some of the supplier's providers, not a passing state. Read alone
+        # that means "still active", so these packages were asked about every
+        # day forever: the sweep would have grown without limit as customers
+        # accumulated, and every one of them stayed on the customer's page as
+        # a live package long after it died.
+        #
+        # No date is still a real possibility that the customer never
+        # installed it, so its clock never started — retiring at the plan's
+        # own length would cut those off early. The 90-day cap is the
+        # compromise: far past any package we sell, but finite.
+        return EXPIRED if too_old(UNKNOWN_MAX_DAYS) else ACTIVE
 
     # The supplier does not know it. Retire it once its own validity is past,
     # otherwise keep it (a fresh order may not have registered yet).
-    if bought_at:
-        age = now - bought_at.astimezone(timezone.utc)
-        # No plan length on the row (older rows stored only a network name).
-        # The longest package we sell is 30 days, so UNKNOWN_MAX_DAYS is far
-        # past any real expiry — without a cap those rows would be queried
-        # every day forever.
-        limit = (plan_days + GRACE_DAYS) if plan_days else UNKNOWN_MAX_DAYS
-        if age > timedelta(days=limit):
-            return EXPIRED
-    return ACTIVE
+    # No plan length on the row (older rows stored only a network name)? The
+    # longest package we sell is 30 days, so UNKNOWN_MAX_DAYS is far past any
+    # real expiry — without a cap those rows would be queried every day forever.
+    return (EXPIRED if too_old((plan_days + GRACE_DAYS) if plan_days else UNKNOWN_MAX_DAYS)
+            else ACTIVE)
 
 
 def push_to_site(items: list[dict]) -> int:

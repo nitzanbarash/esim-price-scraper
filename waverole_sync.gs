@@ -309,7 +309,24 @@ function onReceiptsEdit(e) {
     if (e.range.getColumn() > usageCol || e.range.getLastColumn() < usageCol) return;
 
     const tok = PropertiesService.getScriptProperties().getProperty('ORDERS_TOKEN');
-    if (!tok) return;
+    if (!tok) {
+      // Do NOT fail silently. Without the token this whole feature does
+      // nothing, looks exactly like a broken sheet, and gives no clue why —
+      // which is how it sat unnoticed. One email, at most once a day, then
+      // back to quiet.
+      const props = PropertiesService.getScriptProperties();
+      const today = Utilities.formatDate(new Date(), 'Asia/Jerusalem', 'yyyy-MM-dd');
+      if (props.getProperty('TOKEN_WARNED_ON') !== today) {
+        props.setProperty('TOKEN_WARNED_ON', today);
+        alert_('חסר ORDERS_TOKEN — מד הניצול לא מתעדכן',
+          'ערכת את עמודת הניצול בטבלת הקבלות, אבל הסנכרון המיידי לאתר לא רץ ' +
+          'כי אין ORDERS_TOKEN במאפייני הסקריפט.\n\n' +
+          'תיקון: עורך הסקריפט → ⚙️ הגדרות הפרויקט → מאפייני סקריפט → ' +
+          'הוספת מאפיין → שם: ORDERS_TOKEN → הדבק את הערך → שמירה.\n' +
+          'אחר כך הרץ checkReceiptsSync כדי לוודא שהכול עובד.');
+      }
+      return;
+    }
 
     const items = [];
     for (let r = Math.max(2, e.range.getRow()); r <= e.range.getLastRow(); r++) {
@@ -336,6 +353,85 @@ function onReceiptsEdit(e) {
   } catch (err) {
     Logger.log('onReceiptsEdit failed: ' + err);
   }
+}
+
+/**
+ * Why is the usage meter not updating? Run this and read the log.
+ *
+ * Every part of this chain fails quietly by design (a sync problem must never
+ * block someone editing a sheet), so when it does not work there is nothing
+ * to see anywhere. This checks each link in order and says which one is broken
+ * in plain words — instead of leaving "it just doesn't update" to guesswork.
+ */
+function checkReceiptsSync() {
+  const out = [];
+  const ok = (s) => out.push('✅ ' + s);
+  const bad = (s) => out.push('❌ ' + s);
+
+  const tok = PropertiesService.getScriptProperties().getProperty('ORDERS_TOKEN');
+  if (tok) ok('ORDERS_TOKEN קיים במאפייני הסקריפט (' + tok.length + ' תווים)');
+  else bad('חסר ORDERS_TOKEN → הגדרות הפרויקט ⚙️ → מאפייני סקריפט → ' +
+           'שם: ORDERS_TOKEN, ערך: הטוקן של האתר');
+
+  const trig = ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'onReceiptsEdit');
+  if (trig.length) ok('הטריגר onReceiptsEdit מותקן (' + trig.length + ')');
+  else bad('הטריגר onReceiptsEdit לא מותקן → הרץ setupTriggers מהתפריט');
+
+  let sh = null;
+  try {
+    sh = SpreadsheetApp.openById(RECEIPTS_ID).getSheets()[0];
+    ok('טבלת הקבלות נפתחת: "' + sh.getName() + '"');
+  } catch (e) {
+    bad('אין גישה לטבלת הקבלות: ' + e);
+  }
+
+  let sample = null;
+  if (sh) {
+    const hdr = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h).trim());
+    const uc = hdr.indexOf(RCPT_USAGE_COL) + 1, oc = hdr.indexOf(RCPT_ORDER_COL) + 1;
+    if (uc) ok('עמודת הניצול "' + RCPT_USAGE_COL + '" נמצאה (עמודה ' + uc + ')');
+    else bad('לא נמצאה עמודה בשם "' + RCPT_USAGE_COL + '" — שינוי שם הכותרת מנתק את הסנכרון');
+    if (oc) ok('עמודת מספר ההזמנה נמצאה (עמודה ' + oc + ')');
+    else bad('לא נמצאה עמודה בשם "' + RCPT_ORDER_COL + '"');
+
+    if (uc && oc) {
+      const last = sh.getLastRow();
+      for (let r = 2; r <= last; r++) {
+        const id = String(sh.getRange(r, oc).getValue()).trim();
+        const m = String(sh.getRange(r, uc).getValue()).match(/([\d.]+)\s*\/\s*([\d.]+)/);
+        if (id && m) { sample = { row: r, id: id, used: parseFloat(m[1]), total: parseFloat(m[2]) }; break; }
+      }
+      if (sample) ok('שורה לדוגמה: ' + sample.id + ' = ' + sample.used + '/' + sample.total + ' GB (שורה ' + sample.row + ')');
+      else out.push('ℹ️ אין עדיין שורה עם ניצול בפורמט "0.4 / 1" — לכן אין מה לשלוח');
+    }
+  }
+
+  // The real proof: send that reading to the site now and report the answer.
+  if (tok && sample) {
+    const res = UrlFetchApp.fetch('https://www.waverole.com/api/orders', {
+      method: 'post', contentType: 'application/json',
+      headers: { Authorization: 'Bearer ' + tok },
+      payload: JSON.stringify({ action: 'usage_batch', items: [
+        { order_id: sample.id, used_gb: sample.used, total_gb: sample.total }] }),
+      muteHttpExceptions: true,
+    });
+    const code = res.getResponseCode(), txt = res.getContentText();
+    if (code === 200) {
+      const body = JSON.parse(txt || '{}');
+      if ((body.updated || []).length) ok('האתר עודכן בהצלחה עבור ' + sample.id + ' — הסנכרון עובד מקצה לקצה');
+      else if ((body.not_found || []).length) bad('האתר לא מכיר את ההזמנה ' + sample.id + ' (ייתכן שנמחקה או ישנה מ-90 יום)');
+      else out.push('ℹ️ האתר ענה 200 בלי לעדכן: ' + txt.slice(0, 200));
+    } else if (code === 401 || code === 403) {
+      bad('האתר דחה את הטוקן (' + code + ') — ה-ORDERS_TOKEN כאן שונה מזה שבאתר');
+    } else {
+      bad('האתר החזיר ' + code + ': ' + txt.slice(0, 200));
+    }
+  }
+
+  const text = out.join('\n');
+  Logger.log(text);
+  return text;
 }
 
 function fullSync() { post_(buildPackages_(null)); }

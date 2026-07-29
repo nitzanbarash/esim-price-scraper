@@ -294,12 +294,53 @@ SESSION_ID_RE = re.compile(r"(?:session_id|payment_intent)=([A-Za-z0-9_\-]+)")
 GB = 1024 ** 3
 
 
+# esim.dog does not run one eSIM network — it resells several, and the usage
+# endpoint answers for ONE of them per request, chosen by `providerCode`. Left
+# unset it answers for the default provider only, and an eSIM belonging to any
+# other simply comes back absent, exactly like an id it has never heard of.
+#
+# That silence is why the usage bot appeared to do nothing: measured
+# 2026-07-29 across the six eSIMs actually sold, the default provider answered
+# for ONE and provider 4 answered for the other FIVE. Every Israeli Hot Mobile
+# package — i.e. nearly everything being sold — was invisible, so the meter on
+# those customers' pages stayed at whatever it was seeded with and the 90%
+# emails could never fire.
+#
+# Ordered by how much of the catalogue each one covers, so the common case is
+# settled in the first request. Provider 3 is deliberately included even
+# though it answers with a zero-filled placeholder for ids it does not own:
+# `total <= 0` throws those away below, which is also what protects us from
+# recording "0 of 0 GB" as if it were a real reading.
+USAGE_PROVIDER_CODES = (None, 4, 3, 2, 1)
+
+
+def _usage_request(iccids: list[str], provider) -> list:
+    """One usage call, for one provider. [] on anything unexpected."""
+    payload = {"iccidList": iccids}
+    if provider is not None:
+        payload["providerCode"] = provider
+    try:
+        r = requests.post(SUPPLIER_USAGE_URL, json=payload,
+                          headers={"Accept": "application/json",
+                                   "User-Agent": "Mozilla/5.0"}, timeout=60)
+        r.raise_for_status()
+        return (r.json() or {}).get("usage") or []
+    except Exception as e:
+        log.warning(f"usage lookup failed for {len(iccids)} eSIM(s) "
+                    f"(provider {provider}): {_redact(str(e))}")
+        return []
+
+
 def fetch_usage(iccids: list[str]) -> dict:
     """How much data each of these eSIMs has used, keyed by ICCID.
 
     The supplier takes a LIST, so a hundred live packages cost one request
     rather than a hundred — which is what makes a daily sweep over every
-    active customer cheap enough to run forever.
+    active customer cheap enough to run forever. Each provider still needs its
+    own request (see USAGE_PROVIDER_CODES), but only for the eSIMs nobody has
+    accounted for yet, so a fleet on one provider costs one request and the
+    later providers are asked about a shrinking remainder — usually nothing at
+    all, which ends the sweep early.
 
     An unknown ICCID is simply absent from the reply (no error), so always
     read the result by key and never by position.
@@ -308,33 +349,36 @@ def fetch_usage(iccids: list[str]) -> dict:
     iccids = [i for i in iccids if i]
     if not iccids:
         return {}
-    try:
-        r = requests.post(SUPPLIER_USAGE_URL, json={"iccidList": iccids},
-                          headers={"Accept": "application/json",
-                                   "User-Agent": "Mozilla/5.0"}, timeout=60)
-        r.raise_for_status()
-        rows = (r.json() or {}).get("usage") or []
-    except Exception as e:
-        log.warning(f"usage lookup failed for {len(iccids)} eSIM(s): {_redact(str(e))}")
-        return {}
 
     out = {}
-    for u in rows:
-        iccid = re.sub(r"\D", "", str(u.get("iccid", "")))
-        total = float(u.get("totalData") or 0)
-        used = float(u.get("dataUsage") or 0)
-        if not iccid or total <= 0:
-            continue
-        out[iccid] = {
-            "used_gb": round(used / GB, 3),
-            "total_gb": round(total / GB, 3),
-            "pct": max(0, min(100, round(used / total * 100))),
-            "expires": str(u.get("expiryDate") or ""),
-            "remaining_days": u.get("remainingDays"),
-            # The supplier's own verdict ("used_expired", …). Used only as a
-            # corroborating hint — our stop rule is the one below.
-            "status": str(u.get("status") or ""),
-        }
+    for provider in USAGE_PROVIDER_CODES:
+        missing = [i for i in iccids if i not in out]
+        if not missing:
+            break
+        found_here = 0
+        for u in _usage_request(missing, provider):
+            iccid = re.sub(r"\D", "", str(u.get("iccid", "")))
+            total = float(u.get("totalData") or 0)
+            used = float(u.get("dataUsage") or 0)
+            # total <= 0 is a placeholder for an eSIM this provider does not
+            # own, not a real package — never record it as a reading.
+            if not iccid or total <= 0 or iccid in out:
+                continue
+            found_here += 1
+            out[iccid] = {
+                "used_gb": round(used / GB, 3),
+                "total_gb": round(total / GB, 3),
+                "pct": max(0, min(100, round(used / total * 100))),
+                "expires": str(u.get("expiryDate") or ""),
+                "remaining_days": u.get("remainingDays"),
+                # The supplier's own verdict ("used_expired", …). Used only as
+                # a corroborating hint — our stop rule is the one below.
+                "status": str(u.get("status") or ""),
+                "provider": provider,
+            }
+        if found_here:
+            log.info(f"provider {provider if provider is not None else 'default'}: "
+                     f"{found_here} of {len(missing)} eSIM(s) answered")
     return out
 
 
