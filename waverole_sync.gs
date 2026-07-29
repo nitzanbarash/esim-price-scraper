@@ -219,6 +219,18 @@ function post_(packages) {
 }
 
 // ── actions ─────────────────────────────────────────────────────────
+// Editing a run of cells used to fire one full site push PER EDIT. A few
+// minutes of ordinary work on the sheet produced 28 overlapping runs, one of
+// which hung for 175 seconds — and because Apps Script caps how much runs at
+// once, that flood starved the every-minute fulfilment dispatcher, which is
+// what makes a customer's eSIM late.
+//
+// So an edit now queues its row and tries to flush straight away. If another
+// flush already holds the lock it just leaves the row queued: whoever is
+// flushing, or the next minute tick, will send it. Isolated edits stay
+// instant, a burst collapses into one push, and nothing piles up.
+const PENDING_ROWS_KEY = 'PENDING_SYNC_ROWS';
+
 function onEditPush(e) {
   try {
     if (!e || !e.range) return;
@@ -229,14 +241,48 @@ function onEditPush(e) {
     const watched = Object.values(map).map(i => i + 1);
     const c1 = e.range.getColumn(), c2 = e.range.getLastColumn();
     if (!watched.some(c => c >= c1 && c <= c2)) return;   // not a synced column
-    const rows = new Set();
-    for (let r = Math.max(2, e.range.getRow()); r <= e.range.getLastRow(); r++) rows.add(r);
-    if (!rows.size) return;
-    const pkgs = buildPackages_(rows);
-    if (pkgs.length) post_(pkgs);
+    const rows = [];
+    for (let r = Math.max(2, e.range.getRow()); r <= e.range.getLastRow(); r++) rows.push(r);
+    if (!rows.length) return;
+    queueRows_(rows);
+    flushPendingRows_();
   } catch (err) {
     // colMap_/post_ already emailed the specific reason; log and stop.
     Logger.log('onEditPush failed: ' + err);
+  }
+}
+
+function queueRows_(rows) {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(PENDING_ROWS_KEY) || '';
+  if (raw === 'ALL') return;                  // already sending everything
+  const have = raw.split(',').filter(Boolean);
+  const all = [...new Set(have.concat(rows.map(String)))];
+  // Script Properties cap a value at 9 KB. Thousands of queued rows means
+  // something is rewriting the whole sheet anyway, so fall back to a full
+  // sync rather than dropping rows silently.
+  props.setProperty(PENDING_ROWS_KEY, all.length > 800 ? 'ALL' : all.join(','));
+}
+
+/** Send whatever is queued. Returns how many packages went out. */
+function flushPendingRows_() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return 0;          // someone else is already sending
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const raw = props.getProperty(PENDING_ROWS_KEY) || '';
+    if (!raw) return 0;
+    props.deleteProperty(PENDING_ROWS_KEY);   // claim them before the slow part
+    const pkgs = raw === 'ALL'
+      ? buildPackages_(null)
+      : buildPackages_(new Set(raw.split(',').filter(Boolean).map(Number)));
+    if (pkgs.length) post_(pkgs);
+    return pkgs.length;
+  } catch (err) {
+    Logger.log('flushPendingRows_ failed: ' + err);
+    return 0;
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -339,6 +385,9 @@ function fulfillmentTick() {
   // each change. Also keeps the site's cached verdict warm, so a shopper's
   // page load never has to wait for a live check.
   supplierWatch_();
+  // Anything an edit queued but could not send (its flush was already busy)
+  // goes out here, so a price change can never sit unsent.
+  flushPendingRows_();
 
   if (!orderAwaitingEsim_() && new Date().getMinutes() % 5 !== 0) return;
 
