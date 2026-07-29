@@ -468,6 +468,14 @@ def _link_ok(link: str, location: str) -> bool:
     if not location or not link:
         return True
     l, loc = link.lower(), location.lower()
+    # A per-order success link names no country at all — it is a session id.
+    # This check exists to reject a row bought for a DIFFERENT destination, and
+    # a link that states no destination cannot do that: answering False here
+    # vetoed every row in the sheet the moment the column started holding the
+    # order's own page instead of the plan's shop page, so no delivery email
+    # could be matched to anything and every order needed a human.
+    if SESSION_ID_RE.search(link):
+        return True
     if loc.replace(" ", "-") in l:
         return True
     # Single-country links carry only the ISO code (esim.dog/il), never the
@@ -500,6 +508,30 @@ def find_pending_row(ws, delivery: dict) -> dict | None:
 
     email_time = delivery["received_at"].astimezone(TZ)
     window = timedelta(hours=MATCH_WINDOW_HOURS)
+
+    # ── the certain answer first: the same purchase session ──
+    # The purchase bot writes the order's supplier page into the row, and the
+    # delivery email is about that very page — so when both are present this
+    # is an identity, not a guess. Everything below is the fallback for rows
+    # that predate it (matching on size, destination and a time window, which
+    # can only ever be circumstantial and needs a human when two orders look
+    # alike).
+    wanted = {m.group(1) for u in (delivery.get("success_urls")
+                                   or [delivery.get("success_url", "")])
+              if (m := SESSION_ID_RE.search(str(u or "")))}
+    if wanted:
+        for n, r in enumerate(rows[1:], start=2):
+            get = lambda i: r[i].strip() if i is not None and len(r) > i else ""
+            if not get(i_order) or get(i_act) or get(i_iccid):
+                continue                                # not pending
+            for col in (i_link, idx("QR")):             # older rows kept it in QR
+                m = SESSION_ID_RE.search(get(col))
+                if m and m.group(1) in wanted:
+                    log.info(f"row {n} matched by purchase session (exact)")
+                    return {"row": n, "time": _row_time(get(i_date)),
+                            "order_id": get(i_order), "customer_email": get(i_mail),
+                            "order_url": get(i_wave)}
+
     cands = []
     for n, r in enumerate(rows[1:], start=2):
         get = lambda i: r[i].strip() if i is not None and len(r) > i else ""
