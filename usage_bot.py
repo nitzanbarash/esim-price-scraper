@@ -93,19 +93,41 @@ def fetch_order_link(order_id: str) -> str:
 
 
 def _parse_expiry(s: str):
-    """The supplier sends '2026-07-23T22:03:18+0000'."""
+    """The supplier's expiry date, ALWAYS as an aware datetime.
+
+    Its providers do not agree on a format: some send an offset
+    ('2026-07-23T22:03:18+0000'), others send none at all
+    ('2026-08-31T09:43:27'). A date without an offset parses to a naive
+    datetime, and comparing that to `now` raises
+
+        TypeError: can't compare offset-naive and offset-aware datetimes
+
+    which killed the whole daily run — every customer's meter froze because
+    of one date string. It stayed hidden until a customer first ACTIVATED an
+    eSIM on such a provider, since before activation the expiry comes back
+    null and this branch is never reached.
+
+    A missing offset is read as UTC: the same supplier stamps its other dates
+    '+0000' and 'Z', so UTC is its house clock. Even if a provider meant local
+    time somewhere, GRACE_DAYS covers the difference — which is what that
+    spare day is for.
+    """
     s = str(s or "").strip()
     if not s:
         return None
+    parsed = None
     for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
         try:
-            return datetime.strptime(s, fmt)
+            parsed = datetime.strptime(s, fmt)
+            break
         except ValueError:
             continue
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _parse_usage_cell(text: str) -> dict | None:
@@ -290,9 +312,20 @@ def main() -> int:
 
     # ── decide, then write the sheet ONCE ──
     cells, site_items, counts = [], [], {ACTIVE: 0, USED_UP: 0, EXPIRED: 0}
+    skipped = 0
     for t in todo:
         u = usage.get(t["iccid"]) if t["iccid"] else None
-        status = decide_status(u, t["bought_at"], t["plan_days"])
+        # One package must never take the sweep down with it. A single
+        # unreadable date from the supplier used to raise out of the whole
+        # run, so NOBODY's meter was updated — the blast radius of one bad
+        # string was every customer. Skip the row, keep going, say so at the
+        # end.
+        try:
+            status = decide_status(u, t["bought_at"], t["plan_days"])
+        except Exception as e:
+            skipped += 1
+            log.warning(f"row {t['row']} ({t['order_id']}): skipped — {type(e).__name__}: {e}")
+            continue
         counts[status] += 1
 
         if t.get("new_iccid"):
@@ -320,7 +353,13 @@ def main() -> int:
     if cells:
         ws.update_cells(cells, value_input_option="USER_ENTERED")
     log.info(f"sheet: {len(cells)} cell(s) updated · still active {counts[ACTIVE]} · "
-             f"used up {counts[USED_UP]} · finished {counts[EXPIRED]}")
+             f"used up {counts[USED_UP]} · finished {counts[EXPIRED]}"
+             + (f" · SKIPPED {skipped}" if skipped else ""))
+    if skipped:
+        alert("Usage bot skipped some packages",
+              f"{skipped} of {len(todo)} package(s) could not be read this run "
+              "(details in the GitHub Actions log). Everyone else was updated "
+              "normally — those rows keep their previous figure.")
 
     if site_items:
         log.info(f"site: {push_to_site(site_items)} order page(s) now show current usage")
