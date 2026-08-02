@@ -1,0 +1,30 @@
+name: Tests
+
+# The bots run unattended against a supplier we do not control, and a crash in
+# one of them is invisible until a customer notices. These tests pin the
+# decisions that must survive whatever the supplier sends — run on every push,
+# so a break is caught here rather than by a frozen usage meter days later.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -q gspread requests
+
+      # No secrets: every test is offline, with the supplier's real payload
+      # shapes faked in. Nothing here touches the sheet, the site or a customer.
+      - name: Usage bot
+        run: python test_usage_bot.py
