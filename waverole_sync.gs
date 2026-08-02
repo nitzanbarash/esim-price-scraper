@@ -735,7 +735,33 @@ function testAlert() {
 }
 
 // ── watchdog: is the live site actually fresh? ──────────────────────
+// The handlers that must be installed for the automation to exist at all.
+// Kept next to the watchdog rather than inside setupTriggers so that adding a
+// feature here forces the question "and is it actually running?".
+const EXPECTED_TRIGGERS = ['onEditPush', 'onReceiptsEdit', 'dailyScrape',
+                           'checkSiteFresh', 'fulfillmentTick', 'weeklyBackup'];
+
 function checkSiteFresh() {
+  // Is the automation even installed?
+  //
+  // A trigger that was never created fails in the most expensive way there is:
+  // in perfect silence. onReceiptsEdit sat missing for days — the code existed,
+  // was correct, was tested, and simply had never been deployed, so editing the
+  // receipts sheet did nothing and there was nothing anywhere to say why. Newly
+  // written code that is never installed looks exactly like broken code.
+  try {
+    const installed = ScriptApp.getProjectTriggers().map(t => t.getHandlerFunction());
+    const absent = EXPECTED_TRIGGERS.filter(f => installed.indexOf(f) < 0);
+    if (absent.length) {
+      alert_('טריגרים חסרים — חלק מהאוטומציה לא רצה בכלל',
+        'הטריגרים האלה לא מותקנים: ' + absent.join(', ') + '\n\n' +
+        'כל עוד הם חסרים הם פשוט לא קורים, בלי שום הודעת שגיאה.\n' +
+        'תיקון: עורך הסקריפט → בחר setupTriggers בתפריט הפונקציות → הרץ ▶');
+    }
+  } catch (err) {
+    Logger.log('trigger check failed: ' + err);
+  }
+
   // Upstream first: if the SCRAPER stopped writing, the sheet quietly ages,
   // every sync "succeeds" with stale numbers, and the purchase bot compares
   // esim.dog against yesterday's prices. Last-modified of the price sheet is
