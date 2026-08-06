@@ -1,4 +1,4 @@
-name: Package usage (daily)
+name: Package usage (every 4h)
 
 # Bot #5: refreshes how much data each LIVE package has used — receipts sheet
 # + the customer's order page — and retires packages that are finished.
@@ -7,7 +7,12 @@ name: Package usage (daily)
 # customers grows.
 on:
   schedule:
-    - cron: "0 6 * * *"      # 09:00 Israel (06:00 UTC)
+    # Every 4 hours, keeping the old 09:00 Israel slot as one of them. A meter
+    # a customer watches should not be a day stale. This costs nothing: the
+    # repo is public, so Actions minutes are free and unmetered, and the
+    # supplier is asked in batches of 50 — six runs a day is a rounding error
+    # to it.
+    - cron: "0 2,6,10,14,18,22 * * *"   # 05,09,13,17,21,01 Israel
   workflow_dispatch: {}       # run it now from the Actions tab
 
 concurrency:

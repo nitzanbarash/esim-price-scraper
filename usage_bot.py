@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Usage bot (bot #5) — runs once a day in GitHub Actions.
+Usage bot (bot #5) — runs every 4 hours in GitHub Actions.
 
 Keeps every live package's consumption up to date in two places:
 the receipts sheet (for you) and waverole.com (for the customer, who sees a
@@ -22,7 +22,7 @@ When to stop checking a package (the Status column, R):
                 the supplier's own clock disagree by hours, and a package
                 cut off a few hours early would look "finished" to the
                 customer while it still works.
-  · active    — anything else; checked again tomorrow.
+  · active    — anything else; checked again on the next run.
 A blank Status means "never checked yet", so existing rows join in on their
 own with no migration.
 
