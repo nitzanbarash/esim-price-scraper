@@ -16,6 +16,7 @@ verbatim. When it invents a new one, add it here first and watch this fail.
 Run:  python test_usage_bot.py
 """
 
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -187,6 +188,84 @@ for bad in ["", "  ", "nonsense", "1 / 0", "-1 / 5", "1 / "]:
 check("plan days", _plan_days("10GB - 30 days — LTE + 5G • Movistar Spain"), 30)
 check("plan days, hebrew", _plan_days("1GB - 7 ימים"), 7)
 check("plan days, absent", _plan_days("Cellcom"), None)
+
+
+# ── the mailbox connection ───────────────────────────────────────────────────
+# Also from a real outage: imaplib was built with no timeout, Gmail accepted
+# the socket and then went quiet, and the run blocked until the 10-minute job
+# limit killed it. Holding the concurrency slot that long got the dispatch
+# queued behind it cancelled, so ONE stuck socket produced a stream of
+# "all jobs have failed" mail. A hang must be impossible, not merely unlikely.
+print("\nInbox — a silent server can never hang the run")
+
+# getattr, not attribute access: if the constant is gone this must read as one
+# clean FAIL, not an AttributeError that aborts the file and hides every check
+# below it — the failure we are guarding against deserves a full picture.
+_timeout = getattr(fulfillment_bot, "IMAP_TIMEOUT", None)
+check("a timeout is set at all",
+      isinstance(_timeout, (int, float)) and 0 < _timeout < 300, True)
+
+os.environ.setdefault("GMAIL_APP_PASSWORD", "test-not-a-real-password")
+
+seen = {}
+
+
+def fake_imap(host, **kw):
+    seen.update(kw)
+    return mock.MagicMock()
+
+
+with mock.patch.object(fulfillment_bot.imaplib, "IMAP4_SSL", fake_imap):
+    fulfillment_bot.Inbox()
+# The timeout rides on the socket, so login/search/fetch inherit it — which is
+# only true if it is passed to the CONSTRUCTOR, not set afterwards. Assert it
+# is a real positive number rather than comparing it to the constant: with the
+# timeout missing, both sides would read None and the check would pass on a
+# bot that hangs exactly as before.
+_passed = seen.get("timeout")
+check("the timeout reaches imaplib",
+      isinstance(_passed, (int, float)) and _passed == _timeout, True)
+
+# A blip is ridden out...
+tries = []
+
+
+def flaky_imap(host, **kw):
+    tries.append(1)
+    if len(tries) < 3:
+        raise TimeoutError("gmail went quiet")
+    return mock.MagicMock()
+
+
+_open = getattr(fulfillment_bot, "_open_inbox", None)
+check("main opens the inbox through the retrying helper",
+      callable(_open) and "_open_inbox()" in open("fulfillment_bot.py").read(), True)
+
+with mock.patch.object(fulfillment_bot.imaplib, "IMAP4_SSL", flaky_imap), \
+     mock.patch.object(fulfillment_bot.time, "sleep", lambda s: None):
+    if _open:
+        _open()
+check("a brief refusal is retried, not alerted", len(tries), 3)
+
+# ...but a real outage still fails loudly rather than pretending it ran.
+tries.clear()
+
+
+def dead_imap(host, **kw):
+    tries.append(1)
+    raise TimeoutError("gmail is down")
+
+
+raised = False
+with mock.patch.object(fulfillment_bot.imaplib, "IMAP4_SSL", dead_imap), \
+     mock.patch.object(fulfillment_bot.time, "sleep", lambda s: None):
+    try:
+        if _open:
+            _open()
+    except TimeoutError:
+        raised = True
+check("a sustained outage is not swallowed", raised, True)
+check("retries are bounded", len(tries), 3)
 
 
 print("\n" + ("=" * 60))

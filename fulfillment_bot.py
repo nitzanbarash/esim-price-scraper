@@ -39,6 +39,7 @@ import os
 import re
 import smtplib
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from urllib.parse import unquote
@@ -65,6 +66,14 @@ ORDERS_URL = "https://www.waverole.com/api/orders"
 MATCH_WINDOW_HOURS = int(os.getenv("MATCH_WINDOW_HOURS", "12"))
 UNMATCHED_GRACE_HOURS = 2  # how long an unmatched delivery email keeps retrying
 LOOKBACK_DAYS = 7          # only consider emails from the last week
+# Gmail accepts the TCP connection and then simply stops answering when it
+# throttles a client — and this bot connects every 5 minutes, ~288 times a
+# day. With no timeout imaplib blocks on that read FOREVER: the run burned its
+# full 10-minute job budget, held the concurrency slot the whole time, and the
+# dispatch waiting behind it was cancelled — which is why one stuck socket
+# turned into a stream of "all jobs have failed" emails. Fail in a minute
+# instead; the next run five minutes later picks the work up untouched.
+IMAP_TIMEOUT = 60
 TZ = ZoneInfo("Asia/Jerusalem")
 
 # Both live formats seen in real delivery emails: ?session_id=cs_live_... and
@@ -237,7 +246,9 @@ def _all_mail_folder(box) -> str:
 
 class Inbox:
     def __init__(self):
-        self.box = imaplib.IMAP4_SSL("imap.gmail.com")
+        # The timeout rides on the socket, so login/list/search/fetch below are
+        # all covered by it — not just the connect.
+        self.box = imaplib.IMAP4_SSL("imap.gmail.com", timeout=IMAP_TIMEOUT)
         self.box.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
         folder = _all_mail_folder(self.box)
         log.info(f"searching folder: {folder}")
@@ -975,8 +986,27 @@ def process(inbox: Inbox, ws, d: dict):
     log.info(f"order {order_id} COMPLETED (row {match['row']})")
 
 
+def _open_inbox(attempts: int = 3):
+    """Connect to Gmail, riding out a brief refusal.
+
+    Nothing is lost when this ultimately fails — the bot keeps no state of its
+    own, so the next run five minutes from now sees exactly the same mail. The
+    retry is only here so a two-second blip does not become an alert in the
+    owner's inbox. A real outage still fails loudly, on purpose.
+    """
+    for i in range(1, attempts + 1):
+        try:
+            return Inbox()
+        except Exception as e:
+            if i == attempts:
+                raise
+            log.warning(f"IMAP connect failed ({type(e).__name__}: {e}) — "
+                        f"retry {i}/{attempts - 1} in {i * 5}s")
+            time.sleep(i * 5)
+
+
 def main():
-    inbox = Inbox()
+    inbox = _open_inbox()
     ws = None
     try:
         deliveries = inbox.unprocessed()
