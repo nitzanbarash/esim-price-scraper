@@ -406,6 +406,26 @@ def fetch_esim_details(success_url) -> dict:
     return {}
 
 
+def _sup(v) -> str:
+    """A supplier field as text, with every spelling of "nothing" removed.
+
+    `.get(key, "")` does NOT protect against this. The supplier sends a real
+    JSON `null` for a field it has no value for — the key is present, so the
+    default never applies, and `str()` turns it into the literal "None".
+
+    That string is truthy, so it survived the "skip empty rows" filter and
+    travelled all the way into the buyer's eSIM email as
+
+        APN     None
+
+    which reads like an instruction to type it in. A plan with no APN needs
+    the field left BLANK; typing anything there stops the data working. Empty
+    means empty, in the sheet, on the order page and in the email.
+    """
+    s = "" if v is None else str(v).strip()
+    return "" if s.lower() in ("none", "null", "undefined", "nan", "n/a") else s
+
+
 def _fetch_one_esim(success_url: str) -> dict:
     """Read the finished eSIM straight from the supplier's own JSON endpoint.
 
@@ -437,11 +457,11 @@ def _fetch_one_esim(success_url: str) -> dict:
     code = str(e["activation_code"])
     out = {
         "activation_code": code,
-        "smdp": str(e.get("smdp_address") or (code.split("$")[1] if "$" in code else "")),
-        "iccid": str(e.get("iccid", "")),
-        "apn": str(e.get("apn", "")),
-        "qr_code": str(e.get("qr_code", "")),
-        "page_region": str(s.get("country_name", "")),
+        "smdp": _sup(e.get("smdp_address")) or (code.split("$")[1] if "$" in code else ""),
+        "iccid": _sup(e.get("iccid")),
+        "apn": _sup(e.get("apn")),
+        "qr_code": _sup(e.get("qr_code")),
+        "page_region": _sup(s.get("country_name")),
     }
     if gb := re.sub(r"[^\d.]", "", str(s.get("plan_data", ""))):
         out["plan_gb"] = float(gb)
@@ -872,10 +892,14 @@ def _esim_copy_html(esim: dict, heb: bool = False) -> str:
               else "Your eSIM — keep this email as your permanent copy")
     t_scan = ("סרקו את הקוד ממכשיר אחר, או הוסיפו את ה-eSIM ידנית עם הקודים למעלה." if heb
               else "Scan the QR from another device, or add the eSIM manually with the codes above.")
-    rows = [("Activation Code", esim.get("activation_code", "")),
-            ("SM-DP+ Address", esim.get("smdp", "")),
-            ("ICCID", esim.get("iccid", "")),
-            ("APN", esim.get("apn", ""))]
+    # _sup again, deliberately. This block is also rendered from records the
+    # SITE stored — including ones written before the parser stopped turning a
+    # null into "None" — so the guard has to sit where the buyer's email is
+    # built, not only where the supplier is read.
+    rows = [("Activation Code", _sup(esim.get("activation_code"))),
+            ("SM-DP+ Address", _sup(esim.get("smdp"))),
+            ("ICCID", _sup(esim.get("iccid"))),
+            ("APN", _sup(esim.get("apn")))]
     code_rows = "".join(
         f'<tr><td style="padding:6px 12px;color:{BROWN};font-size:12px;white-space:nowrap">{k}</td>'
         f'<td style="padding:6px 12px;color:{NAVY};font-size:12px;font-family:ui-monospace,Menlo,monospace;'

@@ -268,6 +268,49 @@ check("a sustained outage is not swallowed", raised, True)
 check("retries are bounded", len(tries), 3)
 
 
+# ── what reaches the buyer ───────────────────────────────────────────────────
+# From a real complaint: "the package doesn't work". The supplier sent
+# `"apn": null` — a plan that needs the APN field left BLANK — and .get(k,"")
+# did not catch it, because the key IS there. str(None) made the literal
+# "None", which is truthy, so it survived the "skip empty rows" filter and was
+# mailed to the buyer as `APN  None`, reading like something to type in.
+# Typing anything into an APN that must stay empty is what stops the data.
+print("\nnothing the supplier omits may reach the buyer as a word")
+
+_sup = getattr(fulfillment_bot, "_sup", None)
+check("the parser has a null-safe reader", callable(_sup), True)
+if _sup:
+    for junk in [None, "None", "null", "NULL", "undefined", "n/a", "  none  ", ""]:
+        check(f"{junk!r} reads as empty", _sup(junk), "")
+    check("a real APN survives", _sup("internet.provider.com"), "internet.provider.com")
+    check("a real ICCID survives", _sup(8948010010087222062), "8948010010087222062")
+
+# The exact payload that caused the complaint, verbatim.
+REAL = {"session": {"country_name": "Greece", "plan_data": "20GB", "plan_validity": "30",
+                    "coverage": "LTE + 5G", "networks": "Vodafone Greece"},
+        "esim": {"qr_code": "LPA:1$smdp.io$K2-XXXXXX", "iccid": "8948010010087222062",
+                 "activation_code": "LPA:1$smdp.io$K2-XXXXXX", "apn": None,
+                 "smdp_address": "smdp.io"}}
+
+with mock.patch.object(fulfillment_bot.requests, "get",
+                       lambda *a, **k: mock.Mock(status_code=200, raise_for_status=lambda: None,
+                                                 json=lambda: REAL)):
+    got = fulfillment_bot.fetch_esim_details("https://esim.dog/success?session_id=cs_live_x")
+check("a null APN becomes empty, not 'None'", got.get("apn"), "")
+check("the rest of the eSIM is still read", got.get("iccid"), "8948010010087222062")
+
+# And the buyer's own email must not carry the row at all.
+html = fulfillment_bot._esim_copy_html(got, heb=True)
+check("no APN row in the email", "APN" in html, False)
+check("the codes the buyer needs are still there", "smdp.io" in html, True)
+
+# Same guard when the record comes back from the SITE, already poisoned.
+poisoned = {"activation_code": "LPA:1$smdp.io$K2-XXXXXX", "smdp": "smdp.io",
+            "iccid": "8948010010087222062", "apn": "None"}
+check("a stored 'None' is not mailed either",
+      "APN" in fulfillment_bot._esim_copy_html(poisoned, heb=True), False)
+
+
 print("\n" + ("=" * 60))
 if _fails:
     print(f"{len(_fails)} FAILED: " + ", ".join(_fails))
