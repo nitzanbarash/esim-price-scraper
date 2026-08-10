@@ -311,6 +311,63 @@ check("a stored 'None' is not mailed either",
       "APN" in fulfillment_bot._esim_copy_html(poisoned, heb=True), False)
 
 
+# ── the supplier's batch cap ─────────────────────────────────────────────────
+# The eleventh live package broke the sweep for everyone. The supplier answers
+#     {"error":"Maximum 10 eSIMs can be queried at once."}
+# with a 400 that rejects the WHOLE request, not the excess — so the day a
+# eleventh eSIM was sold, every meter froze and stayed frozen. A customer
+# burned a full 10GB during the outage and got no 90%, 98% or "finished"
+# email, because all of them hang off this one call. This is a growth cliff:
+# it cannot be allowed to depend on how many customers we happen to have.
+print("\nfetch_usage — never asks for more than the supplier allows")
+
+check("the cap is declared", getattr(fulfillment_bot, "USAGE_BATCH", None), 10)
+
+MANY = [f"894801001008{n:07d}" for n in range(23)]
+
+
+def capped_supplier(cap=10):
+    """The real endpoint: over the cap it 400s the entire request."""
+    sizes = []
+
+    def _post(url, json=None, **kw):
+        asked = list((json or {}).get("iccidList") or [])
+        sizes.append(len(asked))
+        if len(asked) > cap:
+            raise RuntimeError("400 Client Error: Bad Request")
+        return mock.Mock(status_code=200, raise_for_status=lambda: None,
+                         json=lambda: {"usage": [row(i, 0.5, 10) for i in asked]})
+
+    return _post, sizes
+
+
+post, sizes = capped_supplier()
+with mock.patch.object(fulfillment_bot.requests, "post", post):
+    got = fulfillment_bot.fetch_usage(MANY)
+check("every one of 23 is resolved", len(got), 23)
+check("no request exceeded the cap", max(sizes) <= 10, True)
+check("split into the fewest calls", sizes[:3], [10, 10, 3])
+
+# A fleet at exactly the cap must still be one call, not two.
+post, sizes = capped_supplier()
+with mock.patch.object(fulfillment_bot.requests, "post", post):
+    fulfillment_bot.fetch_usage(MANY[:10])
+check("exactly ten is a single call", sizes, [10])
+
+# One rejected chunk must not cost the others their readings.
+def one_bad_chunk(url, json=None, **kw):
+    asked = list((json or {}).get("iccidList") or [])
+    if MANY[0] in asked:
+        raise RuntimeError("supplier hiccup")
+    return mock.Mock(status_code=200, raise_for_status=lambda: None,
+                     json=lambda: {"usage": [row(i, 0.5, 10) for i in asked]})
+
+
+with mock.patch.object(fulfillment_bot.requests, "post", one_bad_chunk):
+    got = fulfillment_bot.fetch_usage(MANY)
+check("a failed chunk only costs its own rows", len(got), 13)
+
+
 print("\n" + ("=" * 60))
 if _fails:
     print(f"{len(_fails)} FAILED: " + ", ".join(_fails))

@@ -324,34 +324,49 @@ GB = 1024 ** 3
 # recording "0 of 0 GB" as if it were a real reading.
 USAGE_PROVIDER_CODES = (None, 4, 3, 2, 1)
 
+# The supplier's hard cap, in its own words:
+#     {"error":"Maximum 10 eSIMs can be queried at once."}
+# Ask for eleven and it rejects the WHOLE request with a 400 — not the excess,
+# everything — so one order too many silently froze every customer's meter.
+# This is a growth cliff, not a glitch: it fired the day the eleventh live
+# package was sold and would have stayed broken forever after. Never send the
+# whole fleet in one call, however small the fleet looks today.
+USAGE_BATCH = 10
+
 
 def _usage_request(iccids: list[str], provider) -> list:
-    """One usage call, for one provider. [] on anything unexpected."""
-    payload = {"iccidList": iccids}
-    if provider is not None:
-        payload["providerCode"] = provider
-    try:
-        r = requests.post(SUPPLIER_USAGE_URL, json=payload,
-                          headers={"Accept": "application/json",
-                                   "User-Agent": "Mozilla/5.0"}, timeout=60)
-        r.raise_for_status()
-        return (r.json() or {}).get("usage") or []
-    except Exception as e:
-        log.warning(f"usage lookup failed for {len(iccids)} eSIM(s) "
-                    f"(provider {provider}): {_redact(str(e))}")
-        return []
+    """Usage for these eSIMs from one provider, in cap-sized calls. [] on error.
+
+    A failed chunk costs only its own rows: the others still return, and any
+    ICCID left unanswered simply moves on to the next provider in the sweep.
+    """
+    rows: list = []
+    for start in range(0, len(iccids), USAGE_BATCH):
+        chunk = iccids[start:start + USAGE_BATCH]
+        payload = {"iccidList": chunk}
+        if provider is not None:
+            payload["providerCode"] = provider
+        try:
+            r = requests.post(SUPPLIER_USAGE_URL, json=payload,
+                              headers={"Accept": "application/json",
+                                       "User-Agent": "Mozilla/5.0"}, timeout=60)
+            r.raise_for_status()
+            rows += (r.json() or {}).get("usage") or []
+        except Exception as e:
+            log.warning(f"usage lookup failed for {len(chunk)} eSIM(s) "
+                        f"(provider {provider}): {_redact(str(e))}")
+    return rows
 
 
 def fetch_usage(iccids: list[str]) -> dict:
     """How much data each of these eSIMs has used, keyed by ICCID.
 
-    The supplier takes a LIST, so a hundred live packages cost one request
-    rather than a hundred — which is what makes a daily sweep over every
-    active customer cheap enough to run forever. Each provider still needs its
-    own request (see USAGE_PROVIDER_CODES), but only for the eSIMs nobody has
-    accounted for yet, so a fleet on one provider costs one request and the
-    later providers are asked about a shrinking remainder — usually nothing at
-    all, which ends the sweep early.
+    The supplier takes a LIST, but only ten at a time (USAGE_BATCH), so a
+    fleet costs one request per ten rather than one per eSIM — still cheap
+    enough to sweep every active customer forever. Each provider needs its own
+    pass (see USAGE_PROVIDER_CODES), but only over the eSIMs nobody has
+    accounted for yet, so the later providers are asked about a shrinking
+    remainder — usually nothing at all, which ends the sweep early.
 
     An unknown ICCID is simply absent from the reply (no error), so always
     read the result by key and never by position.
