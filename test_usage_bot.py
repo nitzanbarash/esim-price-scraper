@@ -16,6 +16,7 @@ verbatim. When it invents a new one, add it here first and watch this fail.
 Run:  python test_usage_bot.py
 """
 
+import imaplib
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -366,6 +367,142 @@ def one_bad_chunk(url, json=None, **kw):
 with mock.patch.object(fulfillment_bot.requests, "post", one_bad_chunk):
     got = fulfillment_bot.fetch_usage(MANY)
 check("a failed chunk only costs its own rows", len(got), 13)
+
+
+# ── the mailbox read ─────────────────────────────────────────────────────────
+# The fulfillment job runs every 5 minutes forever. It used to spend one IMAP
+# round-trip per message per run on a mailbox nobody prunes, which is why a job
+# with seconds of work in it drifted to half a minute and, on 2026-08-11,
+# finally crossed the 60s socket timeout and failed the run.
+print("\nmailbox — one round-trip per batch, matched by UID")
+
+
+class FakeBox:
+    """Enough IMAP to answer unprocessed(). Sequence numbers deliberately do
+    NOT equal UIDs and headers come back in a different order from the one
+    asked for — both are true of the real server, and both are invisible until
+    a bot pairs one buyer's email with another's."""
+
+    def __init__(self, msgs, fail_first_chunk=False):
+        self.msgs = msgs                    # {uid: (subject, from_addr)}
+        self.header_calls: list[list] = []
+        self.full_fetches: list[str] = []
+        self.fail_first_chunk = fail_first_chunk
+
+    def uid(self, cmd, *args):
+        if cmd == "search":
+            return "OK", [" ".join(self.msgs).encode()]
+        asked, items = args[0], args[1]
+        if "HEADER.FIELDS" in items:
+            uids = asked.split(",")
+            self.header_calls.append(uids)
+            if self.fail_first_chunk and len(self.header_calls) == 1:
+                return "NO", [None]
+            out = []
+            for seq, uid in enumerate(reversed(uids), start=1000):
+                subject, frm = self.msgs[uid]
+                head = f"Subject: {subject}\r\nFrom: {frm}\r\n\r\n".encode()
+                out.append((f"{seq} FETCH (UID {uid} BODY[HEADER.FIELDS "
+                            f"(SUBJECT FROM)] {{{len(head)}}}".encode(), head))
+                out.append(b")")
+            return "OK", out
+        self.full_fetches.append(asked)
+        subject, frm = self.msgs[asked]
+        return "OK", [(b"1 FETCH (RFC822 {0}",
+                       f"Subject: {subject}\r\nFrom: {frm}\r\n\r\nbody\r\n".encode())]
+
+
+def make_inbox(msgs, **kw):
+    inbox = object.__new__(fulfillment_bot.Inbox)     # no socket, no login
+    inbox.box = FakeBox(msgs, **kw)
+    return inbox
+
+
+DELIVERY = fulfillment_bot.DELIVERY_SUBJECT
+# 250 messages: 248 unrelated (the mailbox nobody prunes) and 2 real ones.
+NOISE = {str(1000 + i): (f"GitHub Actions run {i} failed", "notify@github.com")
+         for i in range(248)}
+REAL = {"1500": (f"{DELIVERY} to use!", "orders@updates.esim.dog"),
+        # Forwarded by hand from the owner's own address — a FROM filter in the
+        # IMAP query would drop this, which is why the filtering is in Python.
+        "1501": (f"Fwd: {DELIVERY} to use!", fulfillment_bot.ALERTS_EMAIL)}
+# The bot's OWN outgoing customer email: same subject, sitting in All Mail.
+MINE = {"1502": (f"{DELIVERY} to use!", fulfillment_bot.GMAIL_USER)}
+ALL = {**NOISE, **REAL, **MINE}
+
+with mock.patch.object(fulfillment_bot, "parse_delivery",
+                       lambda uid, msg: {"uid": uid}):
+    inbox = make_inbox(ALL)
+    got = inbox.unprocessed()
+    calls = inbox.box.header_calls
+    check("251 messages cost 2 header round-trips, not 251", len(calls), 2)
+    check("batches respect HEADER_BATCH", [len(c) for c in calls], [200, 51])
+    check("every message was asked about", sum(len(c) for c in calls), 251)
+    # The forwarded copy comes FROM the owner, so a From-based skip would eat a
+    # real delivery; only the bot's own outgoing mail may be skipped.
+    check("both real deliveries found, self-sent skipped",
+          sorted(d["uid"] for d in got), ["1500", "1501"])
+    check("only the real ones cost a full fetch",
+          sorted(inbox.box.full_fetches), ["1500", "1501"])
+
+    # If headers were paired by position the reversed order above would hand
+    # message 1500's subject to some unrelated GitHub notification.
+    inbox = make_inbox({**NOISE, **REAL})
+    check("headers matched by UID, not arrival order",
+          sorted(d["uid"] for d in inbox.unprocessed()), ["1500", "1501"])
+
+    # A refused chunk must cost only its own messages — nothing is flagged
+    # until it is processed, so the next run picks them up untouched.
+    inbox = make_inbox(ALL, fail_first_chunk=True)
+    got = inbox.unprocessed()
+    check("a refused header chunk still returns the rest",
+          sorted(d["uid"] for d in got), ["1500", "1501"])
+    check_no_raise("a refused header chunk does not raise",
+                   lambda: make_inbox(ALL, fail_first_chunk=True).unprocessed())
+
+    check_no_raise("an empty mailbox is fine", lambda: make_inbox({}).unprocessed())
+
+
+# ── what a failure is allowed to cost ────────────────────────────────────────
+# The ledger sweep is the promise that every buyer eventually gets their eSIM.
+# It used to sit downstream of the mailbox read, so a Gmail blip cancelled the
+# retry for customers whose email had nothing to do with the mailbox.
+print("\nmain() — a blip must not cancel the delivery safety net")
+
+
+def run_main(mail_error):
+    swept, alerts = [], []
+    with mock.patch.object(fulfillment_bot, "_open_inbox",
+                           mock.Mock(side_effect=mail_error)), \
+         mock.patch.object(fulfillment_bot, "sheet_client", mock.Mock()), \
+         mock.patch.object(fulfillment_bot, "deliver_pending_emails",
+                           lambda ws: swept.append(True)), \
+         mock.patch.object(fulfillment_bot, "alert",
+                           lambda s, b: alerts.append(s)):
+        try:
+            fulfillment_bot.main()
+            code = 0
+        except SystemExit as e:
+            code = e.code
+    return code, swept, alerts
+
+
+for label, err in [("a socket timeout", TimeoutError("timed out")),
+                   ("a refused connection", ConnectionResetError("reset by peer")),
+                   ("an IMAP abort", imaplib.IMAP4.abort("server said no"))]:
+    code, swept, alerts = run_main(err)
+    check(f"{label}: the sweep still runs", swept, [True])
+    check(f"{label}: the run stays green", code, 0)
+    check(f"{label}: no email is sent", alerts, [])
+
+for label, err in [
+        ("a rejected password",
+         imaplib.IMAP4.error("[AUTHENTICATIONFAILED] Invalid credentials (Failure)")),
+        ("a missing secret", RuntimeError("Missing env/secret: GMAIL_APP_PASSWORD"))]:
+    code, swept, alerts = run_main(err)
+    check(f"{label}: fails the run loudly", code, 1)
+    check(f"{label}: emails the owner", len(alerts), 1)
+    check(f"{label}: the sweep STILL runs first", swept, [True])
 
 
 print("\n" + ("=" * 60))

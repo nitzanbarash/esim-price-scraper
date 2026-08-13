@@ -74,6 +74,7 @@ LOOKBACK_DAYS = 7          # only consider emails from the last week
 # turned into a stream of "all jobs have failed" emails. Fail in a minute
 # instead; the next run five minutes later picks the work up untouched.
 IMAP_TIMEOUT = 60
+HEADER_BATCH = 200         # message headers per IMAP round-trip (see _headers)
 TZ = ZoneInfo("Asia/Jerusalem")
 
 # Both live formats seen in real delivery emails: ?session_id=cs_live_... and
@@ -255,6 +256,41 @@ class Inbox:
         # imaplib needs the mailbox name quoted when it contains spaces.
         self.box.select(f'"{folder}"' if " " in folder else folder)
 
+    def _headers(self, uids: list[str]) -> dict:
+        """SUBJECT+FROM for many messages, one round-trip per HEADER_BATCH.
+
+        This was one FETCH per message, and that is what made a job with a few
+        seconds of work in it routinely take half a minute. The search below
+        cannot narrow much: the bot flags only the delivery emails it has
+        processed, so "unflagged in the last week" is essentially the ENTIRE
+        mailbox — sent customer mail, alerts, everything — and each one cost a
+        full network round-trip, every five minutes, all day. The tail of that
+        is what eventually crosses IMAP_TIMEOUT and fails a run.
+
+        The reply is keyed by SEQUENCE number and the server may return the
+        messages in any order, so UID is asked for as a field and read back out
+        of each response. Matching these by position looks like it works right
+        up until the day it silently pairs one email's headers with another's.
+        """
+        out = {}
+        for i in range(0, len(uids), HEADER_BATCH):
+            chunk = uids[i:i + HEADER_BATCH]
+            typ, data = self.box.uid(
+                "fetch", ",".join(chunk),
+                "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])")
+            if typ != "OK":
+                # Nothing is flagged until it is fully processed, so the next
+                # run sees these same messages untouched. Skip, don't fail.
+                log.warning(f"header fetch failed for {len(chunk)} message(s) "
+                            f"— left for the next run")
+                continue
+            for part in data or []:
+                if not isinstance(part, tuple) or len(part) < 2 or part[1] is None:
+                    continue                    # the b')' separators between messages
+                if m := re.search(rb"UID (\d+)", part[0] or b""):
+                    out[m.group(1).decode()] = email.message_from_bytes(part[1])
+        return out
+
     def unprocessed(self) -> list[dict]:
         # No FROM filter in the IMAP query: forwarded copies (Fwd:) come from
         # the owner's address, not esim.dog. Validation happens in Python —
@@ -263,13 +299,17 @@ class Inbox:
         # signal than the envelope sender anyway.
         since = (datetime.now() - timedelta(days=LOOKBACK_DAYS)).strftime("%d-%b-%Y")
         typ, data = self.box.uid("search", None, f"(UNFLAGGED SINCE {since})")
+        uids = [b.decode() for b in (data[0] or b"").split()]
+        # Logged BEFORE the fetch, so a run that dies in it still says how much
+        # it was carrying. This number is the job's real workload, and the day
+        # it starts climbing is the day the runs get slow again.
+        log.info(f"{len(uids)} unflagged message(s) since {since}")
+        heads = self._headers(uids)
         out = []
-        for uid_b in (data[0] or b"").split():
-            uid = uid_b.decode()
-            typ, sub = self.box.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])")
-            if typ != "OK" or not sub or sub[0] is None:
+        for uid in uids:
+            head = heads.get(uid)
+            if head is None:
                 continue
-            head = email.message_from_bytes(sub[0][1])
             subject = _decode(head.get("Subject"))
             if DELIVERY_SUBJECT.lower() not in subject.lower():
                 continue                        # cheap header-only skip
@@ -1044,24 +1084,53 @@ def _open_inbox(attempts: int = 3):
             time.sleep(i * 5)
 
 
+def _needs_a_human(e: Exception) -> bool:
+    """Is this mailbox failure one that will still be here in five minutes?
+
+    A refused connection, a slow socket, a Gmail hiccup: the bot keeps no state
+    of its own, so the next run reads exactly the same mail and loses nothing.
+    Failing the job for one of those sends an "all jobs have failed" email that
+    says nothing, links a log the owner cannot open, and — repeated often
+    enough — teaches them to ignore the next one, which will be the real one.
+
+    A rejected password or a missing secret is the opposite: it never fixes
+    itself, and every run that stays quiet about it is orders piling up unseen.
+    """
+    if isinstance(e, RuntimeError):        # missing secret, renamed sheet headers
+        return True
+    text = f"{type(e).__name__}: {e}".lower()
+    return any(w in text for w in ("authenticationfailed", "invalid credentials",
+                                   "authentication failed", "application-specific"))
+
+
 def main():
-    inbox = _open_inbox()
     ws = None
+    mail_error = None
     try:
-        deliveries = inbox.unprocessed()
-        log.info(f"{len(deliveries)} unprocessed delivery email(s)")
-        if deliveries:
-            ws = sheet_client().open_by_key(RECEIPTS_SHEET_ID).sheet1
-        for d in deliveries:
-            try:
-                process(inbox, ws, d)
-            except Exception as e:
-                # No traceback: this repo's Actions logs are PUBLIC, and e.g. a
-                # Playwright error embeds the success-page URL. One redacted line.
-                log.error(f"email uid={d['uid']} failed — left for retry: "
-                          f"{_redact(f'{type(e).__name__}: {e}')}")
-    finally:
-        inbox.close()
+        inbox = _open_inbox()
+        try:
+            deliveries = inbox.unprocessed()
+            log.info(f"{len(deliveries)} unprocessed delivery email(s)")
+            if deliveries:
+                ws = sheet_client().open_by_key(RECEIPTS_SHEET_ID).sheet1
+            for d in deliveries:
+                try:
+                    process(inbox, ws, d)
+                except Exception as e:
+                    # No traceback: this repo's Actions logs are PUBLIC, and e.g. a
+                    # Playwright error embeds the success-page URL. One redacted line.
+                    log.error(f"email uid={d['uid']} failed — left for retry: "
+                              f"{_redact(f'{type(e).__name__}: {e}')}")
+        finally:
+            inbox.close()
+    except Exception as e:
+        # Caught, not raised: the sweep below is the promise that every buyer
+        # gets their eSIM, and it used to be skipped entirely whenever reading
+        # the mailbox failed — so a Gmail blip silently cancelled the retry for
+        # customers whose email had nothing to do with the mailbox.
+        mail_error = e
+        log.error(f"mailbox unreadable this cycle — nothing lost, the next run "
+                  f"re-reads it: {_redact(f'{type(e).__name__}: {e}')}")
 
     # ALWAYS, even with an empty inbox: this is the retry loop that guarantees
     # every buyer eventually receives their eSIM. It runs last so an email that
@@ -1072,6 +1141,15 @@ def main():
         deliver_pending_emails(ws)
     except Exception as e:
         log.error(f"delivery ledger sweep failed: {_redact(str(e))}")
+
+    if mail_error is not None and _needs_a_human(mail_error):
+        alert("Cannot read the delivery mailbox — ACTION NEEDED",
+              f"{_redact(f'{type(mail_error).__name__}: {mail_error}')}\n\n"
+              f"This is not the kind of failure that clears on its own, so no "
+              f"delivery email is being processed until it is fixed. Paid "
+              f"orders are NOT lost — they stay queued and are picked up as "
+              f"soon as the bot can read {GMAIL_USER} again.")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
