@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import re
+import time as _time
 from datetime import datetime
 from typing import Optional, Dict, List
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -611,13 +612,47 @@ class ESIMScraper:
             updates.append({'range': f'{col_letter(col[key])}{row}',
                             'values': [[value]]})
 
+        def flush(done_count):
+            if not updates:
+                return
+            self.setup_google_sheets()
+            CHUNK = 50
+            for i in range(0, len(updates), CHUNK):
+                batch = updates[i:i + CHUNK]
+                for attempt in range(4):
+                    try:
+                        self.sheet_service.spreadsheets().values().batchUpdate(
+                            spreadsheetId=SHEET_ID,
+                            body={'data': batch, 'value_input_option': 'USER_ENTERED'}
+                        ).execute(num_retries=3)
+                        break
+                    except Exception as e:
+                        print(f"  ⚠️ write chunk {i // CHUNK + 1} attempt {attempt + 1} "
+                              f"failed: {e}")
+                        if attempt == 3:
+                            raise
+                        self.setup_google_sheets()
+            print(f"  💾 saved through package {done_count}/{len(items)} "
+                  f"({_time.time() - t0:.0f}s elapsed)")
+            updates.clear()
+
         def to_val(p):
             try:
                 return float(str(p).replace('$', '').replace(',', ''))
             except Exception:
                 return None
 
+        done = 0
+        t0 = _time.time()
         for it in items:
+            # Save every 10 packages. The write used to happen once at the very
+            # end, so a run killed by the workflow time limit (4x on
+            # 2026-08-19) lost EVERYTHING and the sheet went a full day stale.
+            # Each package's updates are self-contained - flushing loses at
+            # most the tail.
+            if done and done % 10 == 0:
+                flush(done)
+            done += 1
             r = it['row']
 
             # Below the minimum size: flag and move on WITHOUT scraping. A
@@ -731,25 +766,8 @@ class ESIMScraper:
             else:
                 put(r, 'stock', '')
 
-        if updates:
-            self.setup_google_sheets()
-            CHUNK = 50
-            for i in range(0, len(updates), CHUNK):
-                batch = updates[i:i + CHUNK]
-                for attempt in range(4):
-                    try:
-                        self.sheet_service.spreadsheets().values().batchUpdate(
-                            spreadsheetId=SHEET_ID,
-                            body={'data': batch, 'value_input_option': 'USER_ENTERED'}
-                        ).execute(num_retries=3)
-                        break
-                    except Exception as e:
-                        print(f"  ⚠️ write chunk {i // CHUNK + 1} attempt {attempt + 1} "
-                              f"failed: {e}")
-                        if attempt == 3:
-                            raise
-                        self.setup_google_sheets()
-            print(f"\n📊 Sheet updated for {len(items)} packages at {ts}")
+        flush(len(items))
+        print(f"\n📊 Sheet updated for {len(items)} packages at {ts}")
         print("\n✅ Done!")
 
 

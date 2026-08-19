@@ -723,6 +723,61 @@ def awaiting_email_orders() -> list[dict]:
         return []
 
 
+STALE_PENDING_MIN = 15
+
+
+def check_stale_pending():
+    """Alert while a PAID order sits 'pending' with nothing buying it.
+
+    The purchase bot lives on a home PC; every failure mode of that machine
+    (off, crashed, stuck ledger claim) looks from here like an order aging
+    quietly in the queue — which is exactly how WR-ZWLM87 waited 9 hours on
+    2026-08-19 with every screen green. This runs in the cloud every 5
+    minutes, so the owner hears about it no matter what died: first alert
+    once the order is STALE_PENDING_MIN old, then a reminder every ~2 hours.
+    The age bands keep that stateless — with a 5-minute cadence a 10-minute
+    band fires once or twice per band, never forever.
+
+    probe=1: reading the queue here must not refresh the purchase bot's
+    heartbeat, or this very check would hide the outage it looks for.
+    """
+    r = requests.get(ORDERS_URL, params={"status": "pending", "probe": "1"},
+                     timeout=20,
+                     headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+    r.raise_for_status()
+    now = datetime.now(timezone.utc)
+    for o in r.json().get("orders", []):
+        ts = str(o.get("ts", ""))
+        try:
+            age_min = (now - datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                       ).total_seconds() / 60
+        except ValueError:
+            continue
+        fresh_alert = STALE_PENDING_MIN <= age_min < STALE_PENDING_MIN + 10
+        reminder = age_min >= 120 and (age_min % 120) < 10
+        if fresh_alert or reminder:
+            oid = o.get("order_id", "?")
+            log.error(f"order {oid} has been PAID and pending for "
+                      f"{age_min:.0f} min - nothing is buying it")
+            alert(
+                f"Order {oid} paid {age_min:.0f} min ago — nothing is buying it",
+                f"SKU: {o.get('sku', '?')}\n"
+                f"Paid at: {ts}\n"
+                f"Amount: ${o.get('paid_usd', '?')}\n\n"
+                "The order is still 'pending' in the site queue. Either the "
+                "purchase bot on the PC is down, or its ledger holds a stuck "
+                "claim for this order.\n\n"
+                "CHECK, IN ORDER:\n"
+                "1. Bot panel on the PC - the BOT row must say RUNNING "
+                "(key 1 starts it; the watchdog restarts it within 5 min).\n"
+                "2. A red STUCK row in the panel -> in a command window run:\n"
+                "     venv\\Scripts\\python.exe -m bot.main --stuck\n"
+                "   and follow what it prints.\n"
+                "3. Bot running, nothing stuck, order still pending -> read "
+                "bot.log for why the order is being refused.",
+            )
+
+
 def report_email_sent(order_id: str, ok: bool, error: str = "", address: str = ""):
     """Close (or keep open) this order's ledger entry."""
     payload = {"order_id": order_id, "email_sent": bool(ok)}
@@ -1141,6 +1196,15 @@ def main():
         deliver_pending_emails(ws)
     except Exception as e:
         log.error(f"delivery ledger sweep failed: {_redact(str(e))}")
+
+    # The purchase-side net: a paid order still 'pending' means NOTHING is
+    # buying it (PC off, bot dead, stuck ledger claim). Independent of the
+    # mailbox and the sheet on purpose - it must fire when everything else
+    # is down.
+    try:
+        check_stale_pending()
+    except Exception as e:
+        log.error(f"stale-pending check failed: {_redact(str(e))}")
 
     if mail_error is not None and _needs_a_human(mail_error):
         alert("Cannot read the delivery mailbox — ACTION NEEDED",
