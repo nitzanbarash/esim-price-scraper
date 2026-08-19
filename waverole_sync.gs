@@ -734,6 +734,86 @@ function testAlert() {
   Logger.log('test alert sent to ' + ALERT_EMAIL);
 }
 
+// Freshness of the SCRAPER's own work, not of the file. Generous because the
+// scrape is daily and its stamp carries GitHub's UTC clock: 24h cadence +
+// timezone skew + a slow run must not cry wolf, while "did not run at all"
+// shows up around 48h.
+const MAX_SCRAPE_STALE_HOURS = 30;
+const GH_RUNS = 'https://api.github.com/repos/nitzanbarash/esim-price-scraper/actions/workflows/scrape.yml/runs?per_page=5';
+
+// A cell written with USER_ENTERED comes back as a Date when Sheets
+// recognised the format and as text when it did not. Handle both rather than
+// trusting either.
+function toDate_(v) {
+  // Duck-typed, not `instanceof Date`: values handed over by the Sheets
+  // service can come from another JS realm, where instanceof silently
+  // answers false — and a date read as "no date" would mail a stale-data
+  // alarm every single morning. getTime also screens out Invalid Date.
+  if (v && typeof v.getTime === 'function') {
+    return isNaN(v.getTime()) ? null : v;
+  }
+  const m = String(v == null ? '' : v).trim()
+    .match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  return m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]) : null;
+}
+
+/**
+ * How fresh is the data the scraper actually wrote?
+ *
+ * The old check asked Drive for the FILE's last-modified time, which moves
+ * whenever anyone touches the spreadsheet — including the owner's own edits.
+ * On 2026-08-19 every scrape run was killed by the workflow time limit and
+ * this still reported healthy, because the file had been edited by hand that
+ * morning. So read the scraper's OWN per-row stamp instead: it is the only
+ * value nothing but a completed scrape can produce.
+ *
+ * Per-row rather than newest-row: the scraper now saves in batches, so a run
+ * cut off half way leaves some rows fresh and the rest a day old — a state
+ * the newest stamp alone would report as perfect.
+ *
+ * Columns are found by header text here rather than through HEADERS, so the
+ * sync payload cannot be changed by accident from this side.
+ */
+function scraperFreshness_() {
+  const values = sheet_().getDataRange().getValues();
+  const head = values[0].map(h => String(h).trim());
+  const iLink = head.indexOf('קישור');
+  const iUpd = head.indexOf('עודכן לאחרונה');
+  if (iLink < 0 || iUpd < 0) {
+    return { error: 'לא נמצאה עמודת "קישור" או "עודכן לאחרונה" בשורת הכותרות' };
+  }
+
+  const cutoff = Date.now() - MAX_SCRAPE_STALE_HOURS * 36e5;
+  let total = 0, stale = 0, blank = 0, oldest = null;
+  for (let r = 1; r < values.length; r++) {
+    // Only rows the scraper is responsible for. A row with no link is never
+    // stamped, and counting it would make every sheet permanently "stale".
+    if (String(values[r][iLink] || '').indexOf('http') !== 0) continue;
+    total++;
+    const d = toDate_(values[r][iUpd]);
+    if (!d) { blank++; continue; }
+    if (d.getTime() < cutoff) stale++;
+    if (oldest === null || d < oldest) oldest = d;
+  }
+  return { total: total, stale: stale, blank: blank, oldest: oldest };
+}
+
+/** The newest FINISHED run of the scrape workflow, or null if unknowable. */
+function lastScrapeRun_() {
+  const token = PropertiesService.getScriptProperties().getProperty('GH_TOKEN');
+  if (!token) return null;               // not configured — skipped, not failed
+  const res = UrlFetchApp.fetch(GH_RUNS, {
+    headers: { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json' },
+    muteHttpExceptions: true,
+  });
+  if (res.getResponseCode() !== 200) return null;
+  const runs = JSON.parse(res.getContentText()).workflow_runs || [];
+  for (let i = 0; i < runs.length; i++) {
+    if (runs[i].status === 'completed') return runs[i];
+  }
+  return null;
+}
+
 // ── watchdog: is the live site actually fresh? ──────────────────────
 // The handlers that must be installed for the automation to exist at all.
 // Kept next to the watchdog rather than inside setupTriggers so that adding a
@@ -741,8 +821,22 @@ function testAlert() {
 const EXPECTED_TRIGGERS = ['onEditPush', 'onReceiptsEdit', 'dailyScrape',
                            'checkSiteFresh', 'fulfillmentTick', 'weeklyBackup'];
 
+/**
+ * The daily 12:00 health check.
+ *
+ * Every check appends to ONE list of problems and a single place at the end
+ * decides between the alert and the all-clear. That structure is the fix for
+ * the failure this function itself had: the checks used to email
+ * independently, so the site-freshness check could send "✅ הכל תקין" in the
+ * same minute the scraper check found the prices a day old (2026-08-19). An
+ * all-clear must be a statement about EVERY check, or it is worse than no
+ * email at all — it actively tells the owner to stop looking.
+ */
 function checkSiteFresh() {
-  // Is the automation even installed?
+  const problems = [];
+  const passed = [];
+
+  // 1. Is the automation even installed?
   //
   // A trigger that was never created fails in the most expensive way there is:
   // in perfect silence. onReceiptsEdit sat missing for days — the code existed,
@@ -753,67 +847,97 @@ function checkSiteFresh() {
     const installed = ScriptApp.getProjectTriggers().map(t => t.getHandlerFunction());
     const absent = EXPECTED_TRIGGERS.filter(f => installed.indexOf(f) < 0);
     if (absent.length) {
-      alert_('טריגרים חסרים — חלק מהאוטומציה לא רצה בכלל',
-        'הטריגרים האלה לא מותקנים: ' + absent.join(', ') + '\n\n' +
-        'כל עוד הם חסרים הם פשוט לא קורים, בלי שום הודעת שגיאה.\n' +
-        'תיקון: עורך הסקריפט → בחר setupTriggers בתפריט הפונקציות → הרץ ▶');
+      problems.push('טריגרים חסרים — חלק מהאוטומציה לא רצה בכלל: ' + absent.join(', ') +
+        '\n   כל עוד הם חסרים הם פשוט לא קורים, בלי שום הודעת שגיאה.' +
+        '\n   תיקון: עורך הסקריפט → בחר setupTriggers בתפריט הפונקציות → הרץ ▶');
+    } else {
+      passed.push('כל הטריגרים מותקנים (' + EXPECTED_TRIGGERS.length + ')');
     }
   } catch (err) {
-    Logger.log('trigger check failed: ' + err);
+    problems.push('בדיקת הטריגרים נכשלה: ' + err);
   }
 
-  // Upstream first: if the SCRAPER stopped writing, the sheet quietly ages,
-  // every sync "succeeds" with stale numbers, and the purchase bot compares
-  // esim.dog against yesterday's prices. Last-modified of the price sheet is
-  // a good liveness proxy (the daily scrape rewrites it every morning).
+  // 2. Did the last scrape run actually SUCCEED? The most direct signal there
+  //    is — a cancelled or failed run is known within minutes, instead of
+  //    waiting for the data to age past a threshold.
   try {
-    const modified = DriveApp.getFileById(SHEET_ID).getLastUpdated();
-    const sheetAgeH = (Date.now() - modified.getTime()) / 36e5;
-    if (sheetAgeH > MAX_STALE_HOURS) {
-      alert_('טבלת המחירים עצמה לא התעדכנה ' + Math.round(sheetAgeH) + ' שעות',
-        'העדכון האחרון של הקובץ: ' + modified.toISOString() +
-        '\nכנראה שהסקרייפר היומי (GitHub Actions) לא רץ או נכשל — ' +
-        'בדוק את esim-price-scraper → Actions → price scrape.' +
-        '\nעד שיתוקן, הבוטים עובדים לפי מחירים ישנים.');
+    const run = lastScrapeRun_();
+    if (run && run.conclusion !== 'success') {
+      problems.push('הריצה האחרונה של סקרייפר המחירים הסתיימה ב-' + run.conclusion +
+        ' (' + run.created_at + ')' +
+        '\n   ' + run.html_url +
+        '\n   כלומר המחירים בטבלה לא התעדכנו מאז. אם זה cancelled — הריצה' +
+        '\n   נחתכה על מגבלת הזמן של ה-workflow.');
+    } else if (run) {
+      passed.push('ריצת הסקרייפר האחרונה: success (' + run.created_at + ')');
     }
   } catch (err) {
-    Logger.log('sheet-freshness check failed: ' + err);
+    Logger.log('scrape-run check failed: ' + err);   // never block the rest
   }
+
+  // 3. Upstream end-to-end: did fresh prices actually LAND in the sheet?
+  //    If the scraper stopped writing, the sheet quietly ages, every sync
+  //    "succeeds" with stale numbers, and the purchase bot compares esim.dog
+  //    against yesterday's prices.
+  try {
+    const f = scraperFreshness_();
+    if (f.error) {
+      problems.push('בדיקת רעננות הטבלה נכשלה: ' + f.error);
+    } else if (f.stale || f.blank) {
+      problems.push('בטבלת המחירים ' + (f.stale + f.blank) + ' מתוך ' + f.total +
+        ' שורות לא עודכנו ביותר מ-' + MAX_SCRAPE_STALE_HOURS + ' שעות' +
+        (f.blank ? ' (' + f.blank + ' מהן בלי חותמת בכלל)' : '') +
+        '.\n   העדכון הישן ביותר: ' + (f.oldest ? f.oldest.toISOString() : 'לא ידוע') +
+        '\n   הבוטים עובדים לפי המחירים האלה — בדוק את esim-price-scraper → Actions.');
+    } else {
+      passed.push('כל ' + f.total + ' שורות המחירים עודכנו ב-' +
+        MAX_SCRAPE_STALE_HOURS + ' השעות האחרונות');
+    }
+  } catch (err) {
+    problems.push('בדיקת רעננות הטבלה נכשלה: ' + err);
+  }
+
+  // 4. Downstream: does the live site actually serve fresh data?
   try {
     const res = UrlFetchApp.fetch(OVERLAY_URL + '?cb=' + Date.now(),
       { muteHttpExceptions: true });
     if (res.getResponseCode() !== 200) {
-      alert_('watchdog: האתר לא מחזיר את קובץ הנתונים',
-        'HTTP ' + res.getResponseCode() + ' מ-' + OVERLAY_URL);
-      return;
-    }
-    const updated = new Date(JSON.parse(res.getContentText()).updated);
-    const hours = (Date.now() - updated.getTime()) / 36e5;
-    const ageStr = hours.toFixed(1) + ' שעות';
-    Logger.log('site data age: ' + hours.toFixed(1) + 'h');
-    // The overlay `updated` only moves when a price actually CHANGED (the
-    // endpoint skips no-op commits). A successful recent sync is just as
-    // fresh — the site provably has today's numbers, they're identical.
-    const lastOk = PropertiesService.getScriptProperties().getProperty('LAST_SYNC_OK');
-    const okHours = lastOk ? (Date.now() - new Date(lastOk).getTime()) / 36e5 : Infinity;
-    if (!(hours < MAX_STALE_HOURS) && !(okHours < MAX_STALE_HOURS)) {
-      alert_('הנתונים באתר לא התעדכנו ' + Math.round(hours) + ' שעות',
-        'העדכון האחרון באתר: ' + updated.toISOString() +
-        '\nוגם לא היה סנכרון מוצלח ב-' + MAX_STALE_HOURS + ' השעות האחרונות.' +
-        '\nכנראה שהסנכרון היומי לא רץ או נכשל.' +
-        '\nלתיקון מיידי: להריץ fullSync מעורך ה-Apps Script.');
-    } else if (!(hours < MAX_STALE_HOURS)) {
-      report_('הבדיקה היומית עברה — האתר מעודכן ✓',
-        'הסנכרון האחרון רץ בהצלחה לפני ' + okHours.toFixed(1) + ' שעות ולא מצא ' +
-        'שינויי מחירים (ולכן חותמת האתר לא זזה — זה תקין).' +
-        '\nחותמת נתוני האתר: ' + updated.toISOString());
+      problems.push('האתר לא מחזיר את קובץ הנתונים: HTTP ' +
+        res.getResponseCode() + ' מ-' + OVERLAY_URL);
     } else {
-      // Daily all-clear so a quiet inbox is proof it ran, not that it broke.
-      report_('הבדיקה היומית עברה — האתר מעודכן ✓',
-        'הנתונים באתר עודכנו לפני ' + ageStr + ' (הכל תקין).' +
-        '\nעדכון אחרון באתר: ' + updated.toISOString());
+      const updated = new Date(JSON.parse(res.getContentText()).updated);
+      const hours = (Date.now() - updated.getTime()) / 36e5;
+      Logger.log('site data age: ' + hours.toFixed(1) + 'h');
+      // The overlay `updated` only moves when a price actually CHANGED (the
+      // endpoint skips no-op commits). A successful recent sync is just as
+      // fresh — the site provably has today's numbers, they're identical.
+      const lastOk = PropertiesService.getScriptProperties().getProperty('LAST_SYNC_OK');
+      const okHours = lastOk ? (Date.now() - new Date(lastOk).getTime()) / 36e5 : Infinity;
+      if (hours < MAX_STALE_HOURS) {
+        passed.push('נתוני האתר עודכנו לפני ' + hours.toFixed(1) + ' שעות');
+      } else if (okHours < MAX_STALE_HOURS) {
+        passed.push('הסנכרון האחרון רץ בהצלחה לפני ' + okHours.toFixed(1) +
+          ' שעות ולא מצא שינויי מחירים (ולכן חותמת האתר לא זזה — זה תקין)');
+      } else {
+        problems.push('הנתונים באתר לא התעדכנו ' + Math.round(hours) + ' שעות' +
+          '\n   העדכון האחרון באתר: ' + updated.toISOString() +
+          '\n   וגם לא היה סנכרון מוצלח ב-' + MAX_STALE_HOURS + ' השעות האחרונות.' +
+          '\n   לתיקון מיידי: להריץ fullSync מעורך ה-Apps Script.');
+      }
     }
   } catch (err) {
-    alert_('watchdog נכשל', String(err));
+    problems.push('בדיקת האתר נכשלה: ' + err);
+  }
+
+  // 5. One verdict, one email.
+  const passedText = passed.length
+    ? '\n\nמה כן נבדק ועבר:\n• ' + passed.join('\n• ') : '';
+  if (problems.length) {
+    alert_('הבדיקה היומית מצאה ' + problems.length + ' תקלות',
+      problems.map(function (p, i) { return (i + 1) + '. ' + p; }).join('\n\n') + passedText);
+  } else {
+    // Daily all-clear so a quiet inbox is proof it ran, not that it broke.
+    report_('הבדיקה היומית עברה — הכל תקין ✓',
+      'כל הבדיקות עברו:\n• ' + passed.join('\n• '));
   }
 }
