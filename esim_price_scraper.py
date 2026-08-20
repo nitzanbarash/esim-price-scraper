@@ -17,6 +17,7 @@ Regional codes: A=mini, B=grande (e.g. 1.0A.10, 1.0B.5).
 import asyncio
 import json
 import os
+import sys
 import re
 import time as _time
 from datetime import datetime
@@ -67,6 +68,14 @@ ROUTE_QUALITY = ['Blue', 'Pink', 'Black', 'Yellow', 'Green']
 # link and can raise the size whenever they want the row back.
 MIN_SELLABLE_GB = 1.0
 BELOW_MIN_LABEL = 'מתחת ל-1GB'
+
+# How long the scrape may run before it stops itself and saves what it has.
+# The workflow allows more than this, deliberately: a run killed from OUTSIDE
+# dies at an arbitrary point with nothing able to report what it skipped,
+# which is how 2026-08-19 produced four "cancelled" runs and no explanation.
+# Stopping ourselves keeps the last save and the summary. Healthy runs take
+# 17-26 minutes, so this only fires when something is genuinely wrong.
+SCRAPE_BUDGET_MIN = float(os.environ.get('SCRAPE_BUDGET_MIN', 45))
 
 def route_quality_rank(name: str) -> int:
     """Lower = better. Strips emoji prefixes like '🎁'."""
@@ -596,11 +605,11 @@ class ESIMScraper:
     async def run(self):
         if not self.sheet_service:
             print("⚠️  Google Sheets not configured. Cannot run.")
-            return
+            return -1
         items, col = self.read_rows()
         if not items:
             print("ℹ️  No links found in column E.")
-            return
+            return -1
 
         print(f"\n📋 Checking {len(items)} packages...\n")
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -643,8 +652,16 @@ class ESIMScraper:
                 return None
 
         done = 0
+        skipped = 0
         t0 = _time.time()
+        deadline = t0 + SCRAPE_BUDGET_MIN * 60
         for it in items:
+            # Out of time: save, say exactly what was left unchecked, and stop.
+            if _time.time() > deadline:
+                skipped = len(items) - done
+                print(f"\n⏳ Reached the {SCRAPE_BUDGET_MIN:g}-minute budget — "
+                      f"stopping with {skipped} of {len(items)} packages unchecked.")
+                break
             # Save every 10 packages. The write used to happen once at the very
             # end, so a run killed by the workflow time limit (4x on
             # 2026-08-19) lost EVERYTHING and the sheet went a full day stale.
@@ -667,7 +684,13 @@ class ESIMScraper:
                 print(f"  ⛔ Row {r}: {req_gb}GB is under {MIN_SELLABLE_GB:g}GB — not sold, skipped")
                 continue
 
+            t_pkg = _time.time()
             res = await self.scrape_confirmed(it['link'], it['variant'], it['old_price'])
+            # A package that takes minutes is the whole story of a run that ran
+            # out of time, and the per-row cost is invisible in a total.
+            dt = _time.time() - t_pkg
+            if dt > 60:
+                print(f"  🐌 Row {r} took {dt:.0f}s")
             new_price = res['price']
 
             if new_price is None:
@@ -766,14 +789,25 @@ class ESIMScraper:
             else:
                 put(r, 'stock', '')
 
-        flush(len(items))
-        print(f"\n📊 Sheet updated for {len(items)} packages at {ts}")
-        print("\n✅ Done!")
+        flush(done)
+        mins = (_time.time() - t0) / 60
+        print(f"\n📊 Sheet updated for {done} of {len(items)} packages "
+              f"at {ts} ({mins:.0f} min)")
+        if skipped:
+            print(f"⚠️  {skipped} packages still hold yesterday's prices.")
+        else:
+            print("\n✅ Done!")
+        return skipped
 
 
 async def main():
     scraper = ESIMScraper()
-    await scraper.run()
+    skipped = await scraper.run()
+    # The daily watchdog reads this run's conclusion. A green tick over a
+    # half-checked sheet is worse than a red one: it tells the owner to stop
+    # looking at the exact moment the prices went stale.
+    if skipped:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

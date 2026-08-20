@@ -800,18 +800,23 @@ function scraperFreshness_() {
 
 /** The newest FINISHED run of the scrape workflow, or null if unknowable. */
 function lastScrapeRun_() {
+  // esim-price-scraper is a PUBLIC repo, so its run history needs no token.
+  // The first version bailed out when GH_TOKEN was unset and returned "no
+  // problem found" — a check that quietly declines to run, which is the same
+  // shape of bug as the all-clear this whole function exists to prevent.
+  // The token is sent when present only because it raises the rate limit.
   const token = PropertiesService.getScriptProperties().getProperty('GH_TOKEN');
-  if (!token) return null;               // not configured — skipped, not failed
-  const res = UrlFetchApp.fetch(GH_RUNS, {
-    headers: { Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json' },
-    muteHttpExceptions: true,
-  });
-  if (res.getResponseCode() !== 200) return null;
+  const headers = { Accept: 'application/vnd.github+json' };
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const res = UrlFetchApp.fetch(GH_RUNS, { headers: headers, muteHttpExceptions: true });
+  if (res.getResponseCode() !== 200) {
+    throw new Error('GitHub API החזיר ' + res.getResponseCode());
+  }
   const runs = JSON.parse(res.getContentText()).workflow_runs || [];
   for (let i = 0; i < runs.length; i++) {
     if (runs[i].status === 'completed') return runs[i];
   }
-  return null;
+  return null;                           // genuinely no finished run yet
 }
 
 // ── watchdog: is the live site actually fresh? ──────────────────────
@@ -872,7 +877,10 @@ function checkSiteFresh() {
       passed.push('ריצת הסקרייפר האחרונה: success (' + run.created_at + ')');
     }
   } catch (err) {
-    Logger.log('scrape-run check failed: ' + err);   // never block the rest
+    // Not fatal to the other checks, but it cannot count as a pass either —
+    // an unreachable check is an unknown, and unknowns belong in the alert.
+    problems.push('לא ניתן לבדוק את ריצת הסקרייפר מול GitHub: ' + err +
+      '\n   כלומר אין לי אישור שהסריקה האחרונה הצליחה.');
   }
 
   // 3. Upstream end-to-end: did fresh prices actually LAND in the sheet?

@@ -14,7 +14,9 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Backstop only. Every step below carries its own limit, so the job limit
+    # should never be what stops us — if it is, a step is missing a timeout.
+    timeout-minutes: 70
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -23,17 +25,52 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip
 
       - name: Install dependencies
+        timeout-minutes: 6
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright Chromium + system deps
-        run: python -m playwright install --with-deps chromium
+      # Chromium is ~170MB fetched from Microsoft's CDN. Caching it means the
+      # daily run does not depend on that download being fast, or up.
+      - name: Cache Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
-      - name: Run scraper
+      # This step hung for 30 min (2026-08-19 07:31) and 90 min (2026-08-19
+      # 21:05) while normally finishing in 21-28s, and on the 90-min run the
+      # scraper never started at all. It does two things that can block
+      # forever, so both are pinned:
+      #   * apt-get, run by --with-deps under sudo. The runner image runs
+      #     unattended-upgrades in the background; if it holds the dpkg lock,
+      #     apt-get waits for it with no limit. DPkg::Lock::Timeout turns that
+      #     endless wait into a plain error, and it goes in apt.conf because
+      #     Playwright builds the apt-get command line itself.
+      #   * a CDN download with no ceiling of its own.
+      # timeout-minutes is the backstop under both: a hang now costs 8 minutes
+      # and shows up as a FAILED step naming the cause, instead of eating the
+      # whole run and reporting "cancelled".
+      - name: Install Playwright Chromium + system deps
+        timeout-minutes: 8
         env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          echo 'DPkg::Lock::Timeout "120";' | sudo tee /etc/apt/apt.conf.d/99lock-timeout
+          python -m playwright install --with-deps chromium \
+            || python -m playwright install --with-deps chromium
+
+      # The scraper stops itself at SCRAPE_BUDGET_MIN and saves what it has,
+      # so this limit is the backstop, deliberately above the budget. A run
+      # killed here would die between two saves with nothing to say what it
+      # skipped — which is why the budget is the smaller number.
+      - name: Run scraper
+        timeout-minutes: 55
+        env:
+          SCRAPE_BUDGET_MIN: "45"
           # The service-account JSON is stored as a repo secret, never in the code.
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: python esim_price_scraper.py
