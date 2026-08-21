@@ -725,18 +725,65 @@ def awaiting_email_orders() -> list[dict]:
 
 STALE_PENDING_MIN = 15
 
+# When to shout about a paid order nobody is buying, in minutes since payment.
+# The first version reminded every 2 hours for as long as the order sat there,
+# and per order — four stuck test orders produced ~100 identical emails in a
+# day (2026-08-20). An alert that cannot be exhausted trains you to ignore the
+# whole channel, which costs more than the alert ever bought. So: a ladder that
+# ENDS. After the last rung the order is still broken and still listed by the
+# bot panel's Orders screen and the daily digest, but it stops mailing.
+STALE_ALERT_LADDER_MIN = (15, 60, 240, 720, 1440)
+# Belt and braces on top of the stored rung below: even with no memory at all,
+# a rung goes quiet this many minutes after it came due. The stored state is
+# what makes each rung mail exactly ONCE; this is what bounds the damage if the
+# site cannot store it (an old deploy, a KV outage) - tens of emails in the
+# worst case instead of one every five minutes forever.
+STALE_ALERT_BACKSTOP_MIN = 30
+
+# Which rungs have already been mailed is kept ON THE ORDER, at the site
+# (`stale_alert_rung`), never inferred from the clock here. This job is
+# stateless and runs every 5 minutes with drift, so any time-window guess is
+# wrong in one of two ways: wider than the drift and it mails twice, narrower
+# and a late run skips the rung entirely. The window version of this was still
+# sending 35 emails where 5 were wanted.
+
+
+def _rung_for(age_min: float) -> int:
+    """Highest ladder rung this order has reached, 0 before the first."""
+    reached = [t for t in STALE_ALERT_LADDER_MIN if age_min >= t]
+    return reached[-1] if reached else 0
+
+
+def _mark_alerted(marks):
+    """Record the rungs just mailed, so the next run does not repeat them."""
+    if not marks:
+        return
+    try:
+        r = requests.post(ORDERS_URL, json={"action": "alert_sent", "marks": marks},
+                          timeout=20,
+                          headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+        r.raise_for_status()
+    except Exception as e:
+        # Worst case the next run repeats one email. Failing to mark must not
+        # cost the alert itself - the alert is the thing that matters.
+        log.warning(f"could not record stale-alert state: {_redact(str(e))}")
+
 
 def check_stale_pending():
-    """Alert while a PAID order sits 'pending' with nothing buying it.
+    """Alert while PAID orders sit 'pending' with nothing buying them.
 
     The purchase bot lives on a home PC; every failure mode of that machine
     (off, crashed, stuck ledger claim) looks from here like an order aging
     quietly in the queue — which is exactly how WR-ZWLM87 waited 9 hours on
     2026-08-19 with every screen green. This runs in the cloud every 5
-    minutes, so the owner hears about it no matter what died: first alert
-    once the order is STALE_PENDING_MIN old, then a reminder every ~2 hours.
-    The age bands keep that stateless — with a 5-minute cadence a 10-minute
-    band fires once or twice per band, never forever.
+    minutes, so the owner hears about it no matter what died.
+
+    ONE email covers every order due, each order climbs a ladder that ENDS,
+    and each rung is mailed exactly once because the site remembers it. All
+    three were missing: the first version mailed per order on a repeating
+    2-hour modulo, and four stuck test orders produced ~100 identical emails
+    in a day (2026-08-20). An alert you cannot exhaust teaches you to ignore
+    the channel, which costs more than the alert was ever worth.
 
     probe=1: reading the queue here must not refresh the purchase bot's
     heartbeat, or this very check would hide the outage it looks for.
@@ -746,6 +793,8 @@ def check_stale_pending():
                      headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
     r.raise_for_status()
     now = datetime.now(timezone.utc)
+
+    due, marks, silent = [], [], 0
     for o in r.json().get("orders", []):
         ts = str(o.get("ts", ""))
         try:
@@ -753,29 +802,59 @@ def check_stale_pending():
                        ).total_seconds() / 60
         except ValueError:
             continue
-        fresh_alert = STALE_PENDING_MIN <= age_min < STALE_PENDING_MIN + 10
-        reminder = age_min >= 120 and (age_min % 120) < 10
-        if fresh_alert or reminder:
-            oid = o.get("order_id", "?")
-            log.error(f"order {oid} has been PAID and pending for "
-                      f"{age_min:.0f} min - nothing is buying it")
-            alert(
-                f"Order {oid} paid {age_min:.0f} min ago — nothing is buying it",
-                f"SKU: {o.get('sku', '?')}\n"
-                f"Paid at: {ts}\n"
-                f"Amount: ${o.get('paid_usd', '?')}\n\n"
-                "The order is still 'pending' in the site queue. Either the "
-                "purchase bot on the PC is down, or its ledger holds a stuck "
-                "claim for this order.\n\n"
-                "CHECK, IN ORDER:\n"
-                "1. Bot panel on the PC - the BOT row must say RUNNING "
-                "(key 1 starts it; the watchdog restarts it within 5 min).\n"
-                "2. A red STUCK row in the panel -> in a command window run:\n"
-                "     venv\\Scripts\\python.exe -m bot.main --stuck\n"
-                "   and follow what it prints.\n"
-                "3. Bot running, nothing stuck, order still pending -> read "
-                "bot.log for why the order is being refused.",
-            )
+        if age_min < STALE_PENDING_MIN:
+            continue
+        log.error(f"order {o.get('order_id', '?')} has been PAID and pending "
+                  f"for {age_min:.0f} min - nothing is buying it")
+        rung = _rung_for(age_min)
+        fresh = rung > (int(o.get("stale_alert_rung") or 0))
+        if fresh and age_min < rung + STALE_ALERT_BACKSTOP_MIN:
+            due.append((age_min, o))
+            marks.append({"order_id": o.get("order_id"), "rung": rung})
+        else:
+            silent += 1
+
+    if not due:
+        if silent:
+            log.warning(f"{silent} order(s) still pending; every alert rung "
+                        f"already sent - see the bot panel, Orders screen")
+        return
+
+    due.sort(key=lambda x: -x[0])
+    lines = []
+    for age_min, o in due:
+        age = (f"{age_min:.0f} min" if age_min < 90
+               else f"{age_min / 60:.1f} hours")
+        lines.append(
+            f"  {o.get('order_id', '?')}  -  {age} ago  -  "
+            f"${o.get('paid_usd', '?')}  -  SKU {o.get('sku', '?')}"
+        )
+    n = len(due)
+    alert(
+        f"{n} paid order{'s' if n > 1 else ''} waiting - nothing is buying "
+        f"{'them' if n > 1 else 'it'}",
+        f"{n} order{'s have' if n > 1 else ' has'} been paid for and "
+        f"{'are' if n > 1 else 'is'} still sitting in the site queue:\n\n"
+        + "\n".join(lines) +
+        (f"\n\n(plus {silent} older one(s) already reported)" if silent else "")
+        + "\n\n"
+        "Either the purchase bot on the PC is down, or its ledger holds a "
+        "stuck claim.\n\n"
+        "OPEN THE BOT PANEL ON THE PC AND PRESS 5 (Orders).\n"
+        "That screen lists these orders, says why each one is stuck, and "
+        "fixes them: release a stuck claim, retry, or close an order you "
+        "have already handled yourself.\n\n"
+        "If the panel will not open:\n"
+        "1. The BOT row must say RUNNING (key 1 starts it; the watchdog "
+        "restarts it within 5 min).\n"
+        "2. In a command window:  venv\\Scripts\\python.exe -m bot.main --stuck\n"
+        "3. Bot running, nothing stuck, order still pending -> read bot.log.\n\n"
+        f"Reminders for one order stop "
+        f"{STALE_ALERT_LADDER_MIN[-1] // 60} hours after payment, fixed or "
+        f"not - do not read silence as resolved. The Orders screen always "
+        f"shows the truth.",
+    )
+    _mark_alerted(marks)
 
 
 def report_email_sent(order_id: str, ok: bool, error: str = "", address: str = ""):
