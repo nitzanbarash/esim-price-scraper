@@ -506,6 +506,70 @@ for label, err in [
 
 
 print("\n" + ("=" * 60))
+# ── the receipt columns the owner added 2026-08-29 ──────────────────────────
+# A discount, an activation flag and a status colour all describe the same
+# customer, and each of them was getting written from a source that could lie:
+# today's list price for a sale made weeks ago, a supplier that goes quiet on
+# spent packages, and a colour painted by a bot that runs once a day.
+
+print("\n-- discount: only a giveaway is unambiguous --")
+_prices = {"2.49.20": 6.99, "3.52.10": 16.00}
+check("a free package is 100%, with the figure",
+      usage_bot.discount_text("2.49.20", "0", _prices), "100% ($6.99 הנחה)")
+check("'0$' is the same as '0'",
+      usage_bot.discount_text("2.49.20", "0$", _prices), "100% ($6.99 הנחה)")
+check("free, but the SKU has no list price: no invented figure",
+      usage_bot.discount_text("GLOBAL-1GB", "0", _prices), "100%")
+# 'מחיר סופי' is rewritten daily. Eleven real rows sold at $6.00 against a
+# $6.49 list would otherwise have been stamped "8% off" — drift, not a discount.
+check("sold slightly under today's list: left alone",
+      usage_bot.discount_text("2.49.20", "6.00", _prices), "")
+# The case the column was missing: an ordinary full-price sale. "-" is a
+# statement ("we looked, no discount"); blank is the absence of one.
+check("sold at full price: says so",
+      usage_bot.discount_text("2.49.20", "6.99", _prices), "-")
+check("sold above today's list (scraper marked it down since): still no discount",
+      usage_bot.discount_text("2.49.20", "7.50", _prices), "-")
+check("SKU absent from the price sheet: nothing to measure, stays blank",
+      usage_bot.discount_text("NOSUCH-SKU", "6.99", _prices), "")
+check("no price recorded yet: left alone",
+      usage_bot.discount_text("2.49.20", "", _prices), "")
+
+print("\n-- activation is one-way --")
+check("data moved, so it was installed",
+      usage_bot.activation_text({"used_gb": 0.5}, "no"), "Activated")
+check("bought but never touched",
+      usage_bot.activation_text({"used_gb": 0}, "no"), "no")
+# The supplier stops answering for spent packages, which is exactly when a
+# naive reading would rewrite a real customer's history back to 'no'.
+check("supplier went quiet: stays Activated",
+      usage_bot.activation_text(None, "Activated"), "Activated")
+check("meter reads zero again: stays Activated",
+      usage_bot.activation_text({"used_gb": 0}, "Activated"), "Activated")
+check("never seen and no reading: still no",
+      usage_bot.activation_text(None, "no"), "no")
+# A spent package: the supplier stops answering, but the sheet still holds the
+# last real reading. Ignoring it stamped 'no' on packages that plainly ran.
+check("supplier quiet, but the sheet remembers data moved",
+      usage_bot.activation_text(None, "", {"used_gb": 18.0, "total_gb": 20.0}),
+      "Activated")
+check("supplier quiet and the sheet reads zero: no",
+      usage_bot.activation_text(None, "", {"used_gb": 0.0, "total_gb": 20.0}),
+      "no")
+
+print("\n-- a fault the owner wrote must survive the sweep --")
+# STILL_CHECK is what protects it: the row is never revisited, so a package
+# that later finishes cannot overwrite the reason a person put there.
+check("FAULT is not swept", usage_bot.FAULT in usage_bot.STILL_CHECK, False)
+check("finished is not swept", usage_bot.EXPIRED in usage_bot.STILL_CHECK, False)
+check("active still is", usage_bot.ACTIVE in usage_bot.STILL_CHECK, True)
+check("unchecked still is", "" in usage_bot.STILL_CHECK, True)
+
+print("\n-- colour rules address the right column past Z --")
+check("column letters", [usage_bot._a1_col(i) for i in (0, 18, 25, 26, 27)],
+      ["A", "S", "Z", "AA", "AB"])
+
+
 if _fails:
     print(f"{len(_fails)} FAILED: " + ", ".join(_fails))
     sys.exit(1)

@@ -52,7 +52,22 @@ log = logging.getLogger("usage")
 ACTIVE = "פעיל"
 USED_UP = "נוצל"
 EXPIRED = "הסתיים"
-STILL_CHECK = {"", ACTIVE}          # a blank cell means "not checked yet"
+FAULT = "תקלה"                      # only ever written BY HAND, by the owner
+# A blank cell means "not checked yet". FAULT is deliberately absent: when the
+# owner marks a package faulty there is a reason behind it, and a sweep that
+# later found the package merely spent would erase that reason. Leaving FAULT
+# out of this set is what makes the status stick.
+STILL_CHECK = {"", ACTIVE}
+
+# Backgrounds for the status column, installed as CONDITIONAL FORMATTING
+# rather than painted row by row: the colour then follows the text the instant
+# the owner types it, with no bot run in between — which is exactly what was
+# asked for ("if I wrote a fault and it did not go yellow, make it yellow").
+STATUS_COLOURS = (
+    ((ACTIVE,),           (0.78, 0.91, 0.79)),   # green  — still running
+    ((USED_UP, EXPIRED),  (0.79, 0.87, 0.96)),   # blue   — spent or over
+    ((FAULT,),            (1.00, 0.93, 0.66)),   # yellow — needs a person
+)
 
 GRACE_DAYS = 1          # the spare day described above
 UNKNOWN_MAX_DAYS = 90   # cap for rows with no plan length (we sell max 30 days)
@@ -69,6 +84,22 @@ COL_QR = "QR"
 COL_DATE = "תאריך - Date"
 COL_PLAN = "חבילה - Plan"
 COL_WAVEROLE = "Link - waverole"
+COL_ACTIVATED = "הופעל - Activated"
+COL_SALE = "הנחה - Sale"
+COL_SOURCE = "מקור - source"
+COL_SELL = "מכירה - Sell"
+COL_SKU = 'מק"ט - SUK'
+ACTIVATED_YES = "Activated"
+ACTIVATED_NO = "no"
+# The owner's mark for "this customer paid full price". A blank cell is not
+# the same statement: blank means nobody has looked yet, "-" means we looked
+# and there was no discount. Only the first of those is safe to leave.
+NO_DISCOUNT = "-"
+
+# The price sheet's list price, which is what a discount is measured against.
+PRICE_SHEET_ID = "108D3BUV-MNcIuRZuKUgb-E-b1Ra8moxWZZyI5JxnyRo"
+COL_PRICE_SKU = "חבילה (קוד)"
+COL_LIST_PRICE = "מחיר סופי"
 
 
 def fetch_order_link(order_id: str) -> str:
@@ -221,6 +252,157 @@ def push_to_site(items: list[dict]) -> int:
     return done
 
 
+# ── discount, activation, colour ─────────────────────────────────────────────
+
+def _money(text) -> float | None:
+    """'6.33$' / '$6.33' / '0' -> a number. None when the cell holds no figure.
+
+    Zero is a real, meaningful price here (a package given away), so the caller
+    must test for None and never for falsiness.
+    """
+    m = re.search(r"\d+(?:\.\d+)?", str(text or "").replace(",", ""))
+    return float(m.group()) if m else None
+
+
+def list_prices() -> dict:
+    """SKU -> list price, from the price sheet's 'מחיר סופי'.
+
+    A discount is what the customer did NOT pay against the advertised price,
+    so it can only be measured against that sheet — the receipt itself records
+    what was charged and has no memory of the sticker price.
+    """
+    try:
+        ws = sheet_client().open_by_key(PRICE_SHEET_ID).sheet1
+        rows = ws.get_all_values()
+    except Exception as e:
+        log.warning(f"could not read the price sheet for list prices: {_redact(str(e))}")
+        return {}
+    if not rows:
+        return {}
+    hdr = [h.strip() for h in rows[0]]
+    if COL_PRICE_SKU not in hdr or COL_LIST_PRICE not in hdr:
+        log.warning(f"price sheet has no {COL_PRICE_SKU!r}/{COL_LIST_PRICE!r} column")
+        return {}
+    si, pi = hdr.index(COL_PRICE_SKU), hdr.index(COL_LIST_PRICE)
+    out = {}
+    for r in rows[1:]:
+        sku = (r[si] if len(r) > si else "").strip()
+        price = _money(r[pi] if len(r) > pi else "")
+        if sku and price:
+            out[sku] = price
+    return out
+
+
+def discount_text(sku: str, sell, prices: dict) -> str:
+    """What belongs in 'הנחה - Sale' for this row, or '' to leave it alone.
+
+    Owner's format (2026-08-29): "100% ($6.33 הנחה)" — the percentage, and the
+    money the customer actually saved. A price of 0 is always 100% off, which
+    is the one case that needs no list price to state.
+    """
+    paid = _money(sell)
+    if paid is None:
+        return ""
+    listed = prices.get((sku or "").strip())
+    if paid == 0:
+        # Written by hand for a giveaway. Say 100% even when the price sheet
+        # has since dropped the SKU, but only name a figure we actually know.
+        return f"100% (${listed:.2f} הנחה)" if listed else "100%"
+    if listed is None:
+        return ""        # no list price to measure against — say nothing
+    if paid >= listed:
+        # Paid the sticker price (or more, after the scraper marked it down
+        # since): no discount was given, and that is a fact, not a guess.
+        # This is the case the column was mostly missing — every ordinary
+        # full-price sale sat blank, so "-" only ever appeared by hand.
+        return NO_DISCOUNT
+    # UNDER the list price is the one ambiguous case, and it is left alone
+    # deliberately. 'מחיר סופי'
+    # is rewritten by the scraper every day, so measuring a sale from three
+    # weeks ago against today's list price invents discounts that were never
+    # given: a dry run over the real sheet turned eleven rows sold at $6.00
+    # against a $6.49 list into "8% off", which is price drift, not a
+    # discount. A partial discount is only truthfully known at the moment of
+    # sale — it belongs to whatever records the sale, or to the owner's own
+    # hand — never to a sweep guessing backwards.
+    return ""
+
+
+def activation_text(usage: dict | None, current: str,
+                    sheet_usage: dict | None = None) -> str:
+    """'Activated' once the package has moved any data at all, else 'no'.
+
+    Deliberately one-way. An eSIM that has been installed cannot become
+    uninstalled, and the supplier goes quiet on spent packages (see the usage
+    fallback below) — so a reading that has stopped arriving must never be
+    allowed to rewrite a package's history back to 'no'.
+    """
+    if (current or "").strip().lower() == ACTIVATED_YES.lower():
+        return ACTIVATED_YES
+    # The supplier's answer first, then the figure already in the sheet. The
+    # sheet matters because the supplier goes quiet on spent packages: a row
+    # reading "18 / 20" with no live answer was being stamped 'no', which
+    # says a package nobody could have used moved 18GB.
+    for u in (usage, sheet_usage):
+        if u and u.get("used_gb", 0) > 0:
+            return ACTIVATED_YES
+    return ACTIVATED_NO
+
+
+def _a1_col(idx0: int) -> str:
+    """0-based column index -> 'A', 'Z', 'AA'. The owner keeps adding columns,
+    and a formula built with chr(65+i) turns to punctuation past column Z."""
+    out, n = "", idx0 + 1
+    while n:
+        n, rem = divmod(n - 1, 26)
+        out = chr(ord('A') + rem) + out
+    return out
+
+
+def ensure_status_colours(ws, col_index: int) -> None:
+    """Install the status column's background rules, replacing our own.
+
+    Conditional formatting rather than painted cells: the owner types 'תקלה'
+    and the row is yellow immediately, without waiting for this bot to run —
+    and a colour that is a rule cannot drift out of step with the text the way
+    a painted one does.
+    """
+    sheet_id = ws.id
+    rng = {"sheetId": sheet_id, "startRowIndex": 1,
+           "startColumnIndex": col_index, "endColumnIndex": col_index + 1}
+    try:
+        existing = ws.spreadsheet.fetch_sheet_metadata().get("sheets", [])
+        current = next((sh.get("conditionalFormats", []) for sh in existing
+                        if sh["properties"]["sheetId"] == sheet_id), [])
+    except Exception as e:
+        log.warning(f"could not read existing colour rules: {_redact(str(e))}")
+        return
+
+    # Drop only the rules that sit on this column, so anything the owner added
+    # elsewhere in the sheet survives untouched. Deleting back-to-front keeps
+    # the indexes of the not-yet-deleted rules valid.
+    requests = [{"deleteConditionalFormatRule": {"sheetId": sheet_id, "index": i}}
+                for i, rule in reversed(list(enumerate(current)))
+                if any(r.get("startColumnIndex") == col_index for r in rule.get("ranges", []))]
+
+    for i, (labels, (r, g, b)) in enumerate(STATUS_COLOURS):
+        requests.append({"addConditionalFormatRule": {"index": i, "rule": {
+            "ranges": [rng],
+            "booleanRule": {
+                "condition": {"type": "TEXT_EQ" if len(labels) == 1 else "CUSTOM_FORMULA",
+                              "values": [{"userEnteredValue": labels[0]}] if len(labels) == 1
+                              else [{"userEnteredValue":
+                                     "=OR(" + ",".join('$%s2="%s"' % (_a1_col(col_index), l)
+                                                       for l in labels) + ")"}]},
+                "format": {"backgroundColor": {"red": r, "green": g, "blue": b}},
+            }}}})
+    try:
+        ws.spreadsheet.batch_update({"requests": requests})
+        log.info(f"status colours: {len(STATUS_COLOURS)} rule(s) in place")
+    except Exception as e:
+        log.warning(f"could not install status colours: {_redact(str(e))}")
+
+
 def main() -> int:
     ws = sheet_client().open_by_key(RECEIPTS_SHEET_ID).sheet1
     rows = ws.get_all_values()
@@ -236,6 +418,8 @@ def main() -> int:
         return 1
     idx = {c: hdr.index(c) for c in hdr}
     cell = lambda r, c: (r[idx[c]].strip() if c in idx and len(r) > idx[c] else "")
+
+    ensure_status_colours(ws, idx[COL_STATUS])
 
     # ── one-off: send the sheet's figures to the site and stop ──
     # For rows retired before the site was ever told their final reading. They
@@ -269,6 +453,7 @@ def main() -> int:
             "bought_at": _row_time(cell(r, COL_DATE)),
             "plan_days": _plan_days(cell(r, COL_PLAN)),
             "waverole": cell(r, COL_WAVEROLE),
+            "activated": cell(r, COL_ACTIVATED),
         })
     log.info(f"{len(todo)} package(s) still being checked "
              f"(out of {len(rows) - 1} row(s) in the sheet)")
@@ -334,21 +519,66 @@ def main() -> int:
             cells.append(gspread.Cell(t["row"], idx[COL_PLAN] + 1, t["new_plan"]))
         if t.get("new_waverole"):
             cells.append(gspread.Cell(t["row"], idx[COL_WAVEROLE] + 1, t["new_waverole"]))
+        sheet_u = _parse_usage_cell(t["usage_cell"])
         if u:
             text = f"{u['used_gb']:g} / {u['total_gb']:g}"
             if text != t["usage_cell"]:
                 cells.append(gspread.Cell(t["row"], idx[COL_USAGE] + 1, text))
             site_items.append({"order_id": t["order_id"], "used_gb": u["used_gb"],
                                "total_gb": u["total_gb"], "expires": u["expires"]})
-        elif (sheet_u := _parse_usage_cell(t["usage_cell"])):
+        elif sheet_u:
             # The supplier went quiet — which it does precisely when a package
             # is spent, the moment the customer most wants to see where they
             # stand. Send what the sheet already knows rather than nothing:
             # the customer's meter showed BLANK for every finished package
             # because this push only ever ran when the supplier answered.
             site_items.append({"order_id": t["order_id"], **sheet_u})
+        if COL_ACTIVATED in idx:
+            was = t.get("activated", "")
+            now_txt = activation_text(u, was, sheet_u)
+            if now_txt != was:
+                cells.append(gspread.Cell(t["row"], idx[COL_ACTIVATED] + 1, now_txt))
+
         if status != t["status"]:
             cells.append(gspread.Cell(t["row"], idx[COL_STATUS] + 1, status))
+
+    # ── discounts: every row, including the retired ones ──
+    # The sweep above only visits packages still worth checking, but the owner
+    # settles a price by hand whenever it suits — often on a package that
+    # finished weeks ago. Reading the whole sheet here is what lets "I typed 0
+    # in the price column" turn into "100%" without anything else happening.
+    if COL_SALE in idx and COL_SELL in idx:
+        prices = list_prices()
+        n_sale = 0
+        for n, r in enumerate(rows[1:], start=2):
+            if not cell(r, COL_ORDER):
+                continue
+            want = discount_text(cell(r, COL_SKU), cell(r, COL_SELL), prices)
+            # BLANK cells only. The owner keeps this column by hand, and the
+            # same rule that protects a hand-written 'תקלה' from the sweep
+            # protects a hand-written discount: a person had a reason, and a
+            # sweep that overwrites it erases the reason. Filling in a blank
+            # states something nobody had stated yet; rewriting a filled cell
+            # contradicts someone. To have the bot redo a row, clear it.
+            if want and not cell(r, COL_SALE):
+                cells.append(gspread.Cell(n, idx[COL_SALE] + 1, want))
+                n_sale += 1
+        if n_sale:
+            log.info(f"discount column: {n_sale} row(s) corrected")
+
+    # ── source: the one column no bot can honestly fill ──
+    # It records how WE paid the supplier. The purchase bot stamps the rows it
+    # creates; a package bought by hand never reaches that code, so the owner
+    # fills those. Guessing here would invent a payment method, so this only
+    # names the rows waiting on a person — deliberately a log line and not an
+    # alert, because a blank the owner has chosen to leave must not nag.
+    if COL_SOURCE in idx:
+        blank = [cell(r, COL_ORDER) for r in rows[1:]
+                 if cell(r, COL_ORDER) and not cell(r, COL_SOURCE)]
+        if blank:
+            log.info(f"source column: {len(blank)} row(s) still blank, for the "
+                     f"owner to fill — {', '.join(blank[:10])}"
+                     + (" ..." if len(blank) > 10 else ""))
 
     if cells:
         ws.update_cells(cells, value_input_option="USER_ENTERED")
