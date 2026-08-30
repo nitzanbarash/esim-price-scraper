@@ -21,10 +21,18 @@ jobs:
         with:
           python-version: "3.13"
 
+      # The scraper module imports playwright and the Google client at module
+      # level, so the route-policy test needs them present to import it. Only
+      # the LIBRARIES are installed — no browser download, nothing is launched.
       - name: Install dependencies
-        run: pip install -q gspread requests
+        run: pip install -q gspread requests playwright google-auth google-api-python-client
 
       # No secrets: every test is offline, with the supplier's real payload
       # shapes faked in. Nothing here touches the sheet, the site or a customer.
       - name: Usage bot
         run: python test_usage_bot.py
+
+      # Which route goes in the sheet is which route the purchase bot buys, so
+      # a regression here is sold to a customer before anyone sees it.
+      - name: Route policy
+        run: python test_route_policy.py

@@ -7,7 +7,12 @@ Reads links from the Google Sheet, scrapes esim.dog, and auto-fills:
 plus tracking: previous price, last updated, changed?, last change date,
 Networks, Breakout IP.
 
-Route selection: cheapest first, ties broken by quality (Blue>Pink>Black>Yellow>Green).
+Route selection: QUALITY first, cheapness only when it earns the drop.
+  Tiers (Blue,Black) > (Pink) > (Yellow,Green); cheapest within a tier, Blue
+  wins ties. Take Pink only if Blue/Black costs >10% above it; take
+  Yellow/Green only if it is >=20% below Pink. Amber is never sold — it is
+  1 Mbps with no hotspot — and any route whose own info box declares a speed
+  cap or 'No hotspot' is refused the same way, whatever it is called.
 Stock detection: if the page shows different GB/validity than the URL requested.
 Minimum size: packages under 1GB are not sold — flagged out-of-stock, not scraped.
 Profitability: 1GB packages allow up to -20% loss; all others require >=20% profit.
@@ -21,7 +26,7 @@ import sys
 import re
 import time as _time
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from playwright.async_api import async_playwright, Page
 from google.oauth2.service_account import Credentials
@@ -59,7 +64,36 @@ HEADER_KEYS = {
     'my_price':    "מחיר שלי",
 }
 
-ROUTE_QUALITY = ['Blue', 'Pink', 'Black', 'Yellow', 'Green']
+# esim.dog grades every route in its own info box, and that wording — not the
+# colour — is the real hierarchy. Read off the live site (GB + TH, 2026-08-29):
+#   BEST COVERAGE & RELIABILITY   Blue    full-speed, hotspot, LTE+5G, named carriers
+#   GREAT COVERAGE & RELIABILITY  Black   full-speed, hotspot, LTE+5G, named carriers
+#   GOOD RELIABILITY              Pink    full-speed, hotspot, LTE+5G, local network
+#   GOOD RELIABILITY              Yellow  full-speed, hotspot, LTE only
+#   ESSENTIAL COVERAGE            Amber   1 Mbps max, NO hotspot        ← never sell
+# The old order put Pink above Black; the site's own labels say otherwise.
+ROUTE_QUALITY = ['Blue', 'Black', 'Pink', 'Yellow', 'Green']
+TIER_RANK = {'BEST': 0, 'GREAT': 1, 'GOOD': 2}
+
+# Owner's buying policy (2026-08-29). Cheapest-first was never what he wanted:
+# it trades a customer's 5G for pennies. Quality is the default and a downgrade
+# has to EARN its way in, so each tier is taken only when it undercuts the tier
+# above it by enough to be worth the drop.
+ROUTE_TIERS = (
+    ('Blue', 'Black'),      # BEST / GREAT — full-speed, LTE+5G, named carriers
+    ('Pink',),              # GOOD — full-speed, LTE+5G, local network
+    ('Yellow', 'Green'),    # GOOD — full-speed, LTE only, no 5G
+)
+# The two gates, stated against the bases the owner named and deliberately NOT
+# normalised into one formula — these are commercial numbers, not arithmetic:
+#   drop to Pink         only if Blue/Black costs MORE than 10% above Pink
+#   drop to Yellow/Green only if it costs AT LEAST 20% below Pink
+TIER_GATE = (1.10, 0.80)
+
+# Refused by name whatever it costs. Amber appeared 2026-08-29 and was instantly
+# the cheapest route on every page, so a price-first choice picked it for every
+# package — a 1 Mbps, hotspot-less line sold at full-speed prices.
+BLOCKED_ROUTES = {'Amber'}
 
 # Smallest package we still sell. Owner's decision (2026-07-22): sub-1GB plans
 # are pennies below the 1GB ones, and esim.dog's own 500MB row is unsellable
@@ -77,13 +111,82 @@ BELOW_MIN_LABEL = 'מתחת ל-1GB'
 # 17-26 minutes, so this only fires when something is genuinely wrong.
 SCRAPE_BUDGET_MIN = float(os.environ.get('SCRAPE_BUDGET_MIN', 45))
 
-def route_quality_rank(name: str) -> int:
-    """Lower = better. Strips emoji prefixes like '🎁'."""
-    clean = re.sub(r'[^\w]', '', name).capitalize()
+def route_name_key(name: str) -> str:
+    """'🎁 Amber' -> 'Amber'. Strips emoji and spacing the site decorates with."""
+    return re.sub(r'[^\w]', '', name).capitalize()
+
+
+def route_quality_rank(name: str, tier: str = "") -> int:
+    """Lower = better. The site's own tier word wins; colour is the fallback."""
+    if tier:
+        t = TIER_RANK.get(tier.upper())
+        if t is not None:
+            return t
+    clean = route_name_key(name)
     for i, r in enumerate(ROUTE_QUALITY):
         if clean == r:
-            return i
-    return len(ROUTE_QUALITY)
+            return len(TIER_RANK) + i
+    return len(TIER_RANK) + len(ROUTE_QUALITY)
+
+
+def choose_route(priced: Dict[str, float]) -> Optional[str]:
+    """The owner's route policy. `priced` holds ALLOWED routes only.
+
+    Quality first, and a cheaper tier is taken only when it clears its gate
+    against the tier above it. Within a tier the cheaper route wins, ties
+    going to the one listed first (Blue over Black).
+
+    A tier missing from the page is skipped, and the gate is then measured
+    against the best tier that IS there — the alternative, refusing to
+    compare, would strand every country that does not offer Pink.
+    """
+    best = []
+    for tier in ROUTE_TIERS:
+        cands = [(priced[n], rank, n) for rank, n in enumerate(tier) if n in priced]
+        best.append(min(cands) if cands else None)
+
+    chosen = None
+    for i, cand in enumerate(best):
+        if cand is None:
+            continue
+        if chosen is None:
+            chosen = cand
+            continue
+        # The gate is measured against the tier DIRECTLY ABOVE this one, not
+        # against whatever is winning so far. Those differ whenever a middle
+        # tier is present and lost its own gate, and measuring against the
+        # winner then inverts the policy: the dearer the premium route, the
+        # EASIER it became to sell the LTE-only one. Blue $10 / Pink $9.50 /
+        # Yellow $7.80 kept Blue (Pink not 10% cheaper) and then handed the
+        # customer Yellow, because $7.80 clears 20% off *Blue* while missing
+        # 20% off Pink, which is the number the policy actually names.
+        ref = next(best[j][0] for j in range(i - 1, -1, -1) if best[j] is not None)
+        price = cand[0]
+        # i == 1 is the drop to Pink, i == 2 the drop to Yellow/Green.
+        good_enough = (ref > price * TIER_GATE[0]) if i == 1 else (price <= ref * TIER_GATE[1])
+        if good_enough:
+            chosen = cand
+
+    return chosen[2] if chosen else None
+
+
+def route_disqualified(info: str) -> str:
+    """Why this route must not be sold, or '' if it is fine.
+
+    Judged on what the info box CLAIMS, not on the colour, so the next route
+    esim.dog invents is caught the same way Amber was — by declaring a speed
+    cap or no hotspot. An unrecognised colour that claims neither is still
+    allowed, ranked last: refusing every unknown would empty the sheet the
+    first time the wording changes.
+    """
+    m = re.search(r'(\d+(?:\.\d+)?)\s*Mbps\s*max', info, re.IGNORECASE)
+    if m:
+        return f"capped at {m.group(1)} Mbps"
+    if re.search(r'\bNo\s+hotspot\b', info, re.IGNORECASE):
+        return "no hotspot"
+    if re.search(r'\bESSENTIAL\s+COVERAGE\b', info, re.IGNORECASE):
+        return "Essential Coverage tier"
+    return ""
 
 
 def col_letter(idx: int) -> str:
@@ -267,24 +370,47 @@ class ESIMScraper:
                     return False
         return False
 
-    async def get_all_routes(self, page: Page) -> Dict[str, Dict]:
-        """Click every route option and record price + network info."""
-        routes = {}
+    async def get_all_routes(self, page: Page) -> Tuple[Dict[str, Dict], List[str]]:
+        """Click every route option and record price, tier and network info.
+
+        Returns (allowed, refused). The refusals are returned rather than only
+        printed because "this page offers nothing we may sell" and "this page
+        has no route selector" have to be told apart by the caller — they lead
+        to opposite outcomes for the row.
+
+        A blocked route is never clicked. That keeps it out of the running by
+        construction rather than by out-scoring it later — and skipping one
+        button per package buys back most of the runtime Amber cost us, since
+        every extra route also forces the hidden row to be re-expanded.
+        """
+        routes: Dict[str, Dict] = {}
+        refused: List[str] = []
         container = await self.find_route_container(page)
         if not container:
-            return routes
+            return routes, refused
         for name in await self.list_route_names(page, container):
+            if route_name_key(name) in BLOCKED_ROUTES:
+                print(f"    {name}: skipped — blocked route")
+                refused.append(f"{name} (blocked)")
+                continue
             if await self.select_route(page, container, name):
                 price = await self.extract_price(page)
                 net_info = await self.extract_network_info(page)
+                why = net_info['blocked']
+                if why:
+                    print(f"    {name}: {price} — REFUSED ({why})")
+                    refused.append(f"{name} ({why})")
+                    continue
                 if price:
                     routes[name] = {
                         'price': price,
                         'network': net_info['network'],
                         'breakout_ip': net_info['breakout_ip'],
+                        'tier': net_info['tier'],
                     }
-                    print(f"    {name}: {price}  |  {net_info['network'][:50]}")
-        return routes
+                    print(f"    {name}: {price}  [{net_info['tier'] or '?'}]"
+                          f"  |  {net_info['network'][:50]}")
+        return routes, refused
 
     async def extract_network_info(self, page: Page) -> Dict[str, str]:
         """
@@ -294,23 +420,48 @@ class ESIMScraper:
         try:
             page_text = await page.inner_text("body")
         except Exception:
-            return {'network': '', 'breakout_ip': ''}
+            return {'network': '', 'breakout_ip': '', 'tier': '', 'blocked': ''}
+
+        # The box always ends at "Breakout IP:", so the 400 characters before it
+        # are the box and nothing else. Anchoring the speed-cap and hotspot
+        # checks here keeps them away from the page's own marketing copy and
+        # from the FAQ line "Is there a speed limit on these plans?".
+        box = ""
+        m0 = re.search(r'Breakout IP:', page_text, re.IGNORECASE)
+        if m0:
+            box = page_text[max(0, m0.start() - 400):m0.start()]
+
+        tier = ""
+        mt = re.search(r'\b(BEST|GREAT|GOOD|ESSENTIAL)\b[^\n]*?\b(?:COVERAGE|RELIABILITY)\b',
+                       box, re.IGNORECASE)
+        if mt:
+            tier = mt.group(1).upper()
 
         # The header line varies ("LTE + 5G China Mobile" / "LTE\nLocal network" / ...),
         # so capture everything up to the next blank line / "Breakout" and normalize.
+        # Inside the box the bullet is optional — Amber's line is a bare
+        # "NETWORKS", which is why its Networks cell came back empty on
+        # 2026-08-29 — but the page-wide fallback still demands the bullet, or
+        # it would match the "premium networks in ..." marketing paragraph.
         network = ""
-        m = re.search(r'Networks?\s*•\s*(.+?)(?:\n\s*\n|\nBreakout|\Z)',
-                       page_text, re.IGNORECASE | re.DOTALL)
-        if m:
-            content = re.sub(r'\s+', ' ', m.group(1)).strip()
-            network = f"Networks • {content}"
+        for hay, pat in ((box, r'NETWORKS?\s*(?:•\s*)?(.+?)(?:\n\s*\n|\Z)'),
+                         (page_text, r'Networks?\s*•\s*(.+?)(?:\n\s*\n|\nBreakout|\Z)')):
+            if not hay:
+                continue
+            m = re.search(pat, hay, re.IGNORECASE | re.DOTALL)
+            if m:
+                content = re.sub(r'\s+', ' ', m.group(1)).strip()
+                if content:
+                    network = f"Networks • {content}"
+                    break
 
         breakout_ip = ""
         m2 = re.search(r'Breakout IP:\s*(.+)', page_text, re.IGNORECASE)
         if m2:
             breakout_ip = m2.group(1).strip()
 
-        return {'network': network, 'breakout_ip': breakout_ip}
+        return {'network': network, 'breakout_ip': breakout_ip,
+                'tier': tier, 'blocked': route_disqualified(box)}
 
     async def read_page_package_info(self, page: Page) -> Dict[str, str]:
         """Read the actual GB and validity shown on the page (for stock detection)."""
@@ -350,35 +501,50 @@ class ESIMScraper:
         candidates = []
         default_price = await self.extract_price(page)
 
-        routes = await self.get_all_routes(page)
+        routes, refused = await self.get_all_routes(page)
         if routes:
             print(f"  📌 Routes found (default {default_price}): {len(routes)}")
             for name, rdata in routes.items():
                 try:
                     candidates.append((
                         float(rdata['price'].replace('$', '')),
-                        route_quality_rank(name),
+                        route_quality_rank(name, rdata.get('tier', '')),
                         name,
                         rdata,
                     ))
                 except Exception:
                     pass
         elif default_price:
+            # No route selector on this page — the page default is all there is.
+            # It still has to clear the same bar: a page that offers only a
+            # capped line is a package we do not sell, not a cheap one.
             net_info = await self.extract_network_info(page)
-            candidates.append((
-                float(default_price.replace('$', '')),
-                999,
-                None,
-                {'price': default_price, 'network': net_info['network'],
-                 'breakout_ip': net_info['breakout_ip']},
-            ))
+            if net_info['blocked']:
+                print(f"  ⛔ Default route refused ({net_info['blocked']})")
+                refused.append(net_info['blocked'])
+            else:
+                candidates.append((
+                    float(default_price.replace('$', '')),
+                    999,
+                    None,
+                    {'price': default_price, 'network': net_info['network'],
+                     'breakout_ip': net_info['breakout_ip']},
+                ))
 
         network = ""
         breakout_ip = ""
         route_name = ""
         if candidates:
-            # Sort by price first, then by route quality rank for ties
-            best = min(candidates, key=lambda c: (c[0], c[1]))
+            # Quality first, cheapness only when it clears the owner's gates.
+            # This used to be min(price, quality) — pure cheapest-first — which
+            # is how a $1.99 route beat a $2.99 one on every package regardless
+            # of what the customer actually got.
+            priced = {c[2]: c[0] for c in candidates if c[2]}
+            pick = choose_route(priced) if priced else None
+            if pick:
+                best = next(c for c in candidates if c[2] == pick)
+            else:
+                best = min(candidates, key=lambda c: (c[0], c[1]))
             price_val, _, route_name, rdata = best
             price = f"${price_val:.2f}"
             route_display = route_name or ""
@@ -402,8 +568,18 @@ class ESIMScraper:
         actual_gb = page_info.get('page_gb', gb)
         actual_validity = page_info.get('page_validity', info['validity'])
 
+        # Every route the page offered was refused. That is NOT "could not read
+        # the price" — we read them all and would sell none. Reported as a read
+        # failure the row simply keeps yesterday's price and yesterday's Route,
+        # and the purchase bot keeps buying that route: a package we just judged
+        # unsellable stays on sale, silently. So the row is pulled from sale
+        # instead, the same as any other package we cannot supply today.
+        unsellable = bool(refused) and not candidates
+        if unsellable:
+            print(f"  ⛔ Nothing sellable here — refused: {', '.join(refused)}")
+
         # Stock detection: page shows different package than requested
-        out_of_stock = False
+        out_of_stock = unsellable
         if info['gb'] and actual_gb and str(info['gb']) != str(actual_gb):
             print(f"  ⚠️ Stock mismatch: requested {info['gb']}GB but page shows {actual_gb}GB")
             out_of_stock = True
@@ -421,7 +597,8 @@ class ESIMScraper:
             'breakout_ip': breakout_ip,
             'route': route_display if route_name else "",
             'out_of_stock': out_of_stock,
-            'note': "" if price else "Could not read price",
+            'note': ("לא נמכר — כל המסלולים נפסלו: " + ", ".join(refused)) if unsellable
+                    else ("" if price else "Could not read price"),
         }
 
     async def scrape_region(self, page: Page, info: Dict, variant: str) -> Dict:
@@ -459,6 +636,12 @@ class ESIMScraper:
             print(f"  ⚠️  Could not open plan, using listed price: {e}")
 
         net_info = await self.extract_network_info(page)
+        if net_info['blocked']:
+            print(f"  ⛔ Region route refused ({net_info['blocked']})")
+            return {'price': None, 'countries': '', 'gb': '', 'validity': '',
+                    'code': '', 'network': '', 'breakout_ip': '', 'route': '',
+                    'out_of_stock': True,
+                    'note': f"לא נמכר — המסלול נפסל: {net_info['blocked']}"}
 
         gb = (info['gb'] or chosen['gb'].replace('GB', '')).lower().replace('gb', '')
         print(f"  ✓ Region plan: {chosen['countries']} מדינות = {price}")
@@ -696,6 +879,16 @@ class ESIMScraper:
             if new_price is None:
                 put(r, 'updated', ts)
                 put(r, 'changed', res['note'] or 'Check failed')
+                # A refused row has NO price precisely because we refused it,
+                # so it lands here and never reaches the stock handling below.
+                # Without this the stock cell stays empty, the row still reads
+                # as on sale, and the purchase bot goes on buying yesterday's
+                # route — which is the exact silence this whole change exists
+                # to end. A missing price on its own is still just a bad read:
+                # that row keeps its old value and is retried next run.
+                if res.get('out_of_stock'):
+                    put(r, 'stock', 'לא במלאי')
+                    print(f"  ⛔ Row {r}: pulled from sale — {res['note']}")
                 continue
 
             new_val = to_val(new_price)
@@ -710,7 +903,8 @@ class ESIMScraper:
             if res.get('out_of_stock'):
                 put(r, 'updated', ts)
                 put(r, 'stock', 'לא במלאי')
-                put(r, 'changed', f"לא במלאי — הדף הציג {res['gb']}/{res['validity']}")
+                put(r, 'changed', res.get('note')
+                    or f"לא במלאי — הדף הציג {res['gb']}/{res['validity']}")
                 print(f"  ❌ Row {r}: out of stock")
                 continue
 
