@@ -1,0 +1,48 @@
+name: Finance (books)
+
+# Bot #6: rebuilds the books once a day. Nothing about selling depends on it,
+# so it runs on a slow schedule and a failure here never blocks an order.
+#
+# It writes to the "Waverole — כספים" spreadsheet, which is created by the
+# owner's Apps Script (setup()) and shared with this service account. Until
+# that has happened the job finishes green and simply reports that there is
+# nothing to write to yet.
+on:
+  schedule:
+    - cron: "0 2 * * *"      # 02:00 UTC = 05:00 Israel — after the day is done
+  workflow_dispatch: {}
+
+concurrency:
+  group: finance
+  cancel-in-progress: false
+
+jobs:
+  books:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -q gspread requests
+
+      - name: Run the tests first
+        # The money logic is pure and the tests are fast. If they fail, the
+        # numbers cannot be trusted, so do not write them to the books.
+        run: python -m unittest test_finance_core -v
+
+      - name: Build the books
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          # Optional: only needed if the main mailbox should also be read
+          # over IMAP. Normally the Apps Script covers it natively.
+          MAIN_GMAIL_APP_PASSWORD: ${{ secrets.MAIN_GMAIL_APP_PASSWORD }}
+          # Customers pay by Bit today, which costs nothing to receive.
+          # Set to payme / paypal / card when that changes.
+          PAYMENT_PROVIDER: bit
+        run: python finance_bot.py

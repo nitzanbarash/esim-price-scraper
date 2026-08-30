@@ -1,0 +1,1053 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="כספים">
+<title>Waverole — כספים</title>
+<style>
+:root{
+  --bg:#eef1f7; --card:#fff; --ink:#0f172a; --dim:#64748b; --faint:#94a3b8;
+  --line:#e6eaf2; --line2:#f1f4f9;
+  --brand:#4f46e5; --brand2:#818cf8; --brandsoft:#eef0fe;
+  --pos:#059669; --possoft:#e7f6f0;
+  --neg:#dc2626; --negsoft:#fdeaea;
+  --warn:#d97706; --warnsoft:#fdf1e3;
+  --info:#0891b2; --infosoft:#e4f5f9;
+  --violet:#7c3aed; --violetsoft:#f1ebfe;
+  --shadow:0 1px 2px rgba(15,23,42,.05),0 8px 24px -12px rgba(15,23,42,.12);
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0b0e14; --card:#141922; --ink:#e8edf5; --dim:#94a3b8; --faint:#64748b;
+    --line:#212936; --line2:#1a212c;
+    --brand:#818cf8; --brand2:#a5b4fc; --brandsoft:#1e2440;
+    --pos:#34d399; --possoft:#10281f;
+    --neg:#f87171; --negsoft:#2c1618;
+    --warn:#fbbf24; --warnsoft:#2a2011;
+    --info:#22d3ee; --infosoft:#0e2830;
+    --violet:#a78bfa; --violetsoft:#221a3a;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 24px -12px rgba(0,0,0,.6);
+  }
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"SF Hebrew","Segoe UI",Rubik,
+              "Helvetica Neue",Arial,sans-serif;
+  background:var(--bg);color:var(--ink);font-size:15px;line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+}
+h1,h2,h3{margin:0;font-weight:800;letter-spacing:-.01em}
+button{font:inherit;color:inherit;cursor:pointer}
+table{width:100%;border-collapse:collapse}
+th,td{padding:9px 6px;text-align:right;border-bottom:1px solid var(--line2)}
+th{font-size:11px;font-weight:700;color:var(--faint);text-transform:uppercase;
+   letter-spacing:.04em;white-space:nowrap;border-bottom:1px solid var(--line)}
+tr:last-child td{border-bottom:0}
+/* Numbers are LTR runs. Under the page's RTL direction a leading minus is
+   reordered to the far side and "-$57.47" renders as "$57.47-". */
+td.num{text-align:left;direction:ltr;unicode-bidi:isolate;
+       font-variant-numeric:tabular-nums;white-space:nowrap}
+
+/* ---------- shell: sidebar on desktop, pills on phone ---------- */
+.app{display:flex;min-height:100vh}
+.side{display:none}
+.main{flex:1;min-width:0;padding:16px 16px 110px}
+@media(min-width:900px){
+  .side{
+    display:flex;flex-direction:column;gap:4px;width:236px;flex:none;
+    padding:20px 12px;background:var(--card);
+    border-inline-start:1px solid var(--line);
+    position:sticky;top:0;height:100vh;
+  }
+  .main{padding:26px 30px 60px;max-width:1320px}
+}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 10px 20px}
+.brand .logo{width:34px;height:34px;border-radius:10px;flex:none;
+  background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;
+  display:flex;align-items:center;justify-content:center;font-weight:800}
+.brand b{font-size:16px}
+.brand span{display:block;font-size:11px;color:var(--faint);font-weight:500}
+.side button{
+  display:flex;align-items:center;gap:10px;width:100%;text-align:right;
+  padding:10px 12px;border:0;background:none;border-radius:11px;
+  font-weight:600;font-size:14px;color:var(--dim);
+}
+.side button:hover{background:var(--line2);color:var(--ink)}
+.side button[aria-current="page"]{background:var(--brandsoft);color:var(--brand)}
+.side .ico{width:20px;text-align:center}
+.side .sep{font-size:10px;color:var(--faint);font-weight:700;
+  padding:16px 12px 6px;text-transform:uppercase;letter-spacing:.06em}
+
+.top{display:flex;align-items:flex-start;gap:12px;margin-bottom:16px}
+.top h1{font-size:21px}
+.top .sub{font-size:12px;color:var(--faint);margin-top:2px}
+.top .right{margin-inline-start:auto;display:flex;gap:8px;align-items:center}
+.pills{display:flex;gap:7px;overflow-x:auto;padding:0 0 14px;
+       scrollbar-width:none;-webkit-overflow-scrolling:touch}
+.pills::-webkit-scrollbar{display:none}
+.pills button{padding:8px 15px;border-radius:999px;border:1px solid var(--line);
+  background:var(--card);font-weight:600;font-size:13px;white-space:nowrap;
+  color:var(--dim)}
+.pills button[aria-current="page"]{background:var(--brand);
+  border-color:var(--brand);color:#fff}
+@media(min-width:900px){.pills{display:none}}
+
+/* ---------- cards & grid ---------- */
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;
+      padding:16px;box-shadow:var(--shadow);margin-bottom:14px}
+.card>h2{font-size:14px;margin-bottom:2px}
+.card>.hint,.hint{font-size:11.5px;color:var(--faint)}
+.card>.hint{margin-bottom:12px}
+.grid{display:grid;gap:14px;grid-template-columns:1fr;margin-bottom:14px}
+@media(min-width:640px){.grid.c2{grid-template-columns:1fr 1fr}}
+@media(min-width:980px){
+  .grid.w{grid-template-columns:1.7fr 1fr}
+  .grid.w2{grid-template-columns:1fr 1.4fr}
+}
+.grid>.card{margin-bottom:0}
+
+/* ---------- KPI tiles ---------- */
+.kpis{display:grid;gap:12px;grid-template-columns:1fr 1fr;margin-bottom:14px}
+@media(min-width:700px){.kpis{grid-template-columns:repeat(3,1fr)}}
+@media(min-width:1140px){.kpis.six{grid-template-columns:repeat(6,1fr)}}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:15px;
+     padding:13px 14px;box-shadow:var(--shadow);position:relative;
+     overflow:hidden}
+.kpi .ico{width:30px;height:30px;border-radius:9px;display:flex;
+  align-items:center;justify-content:center;font-size:14px;margin-bottom:9px}
+.kpi .lab{font-size:11.5px;color:var(--dim);font-weight:600}
+.kpi .val{font-size:23px;font-weight:800;margin:1px 0 3px;letter-spacing:-.02em;
+          direction:ltr;text-align:right;unicode-bidi:isolate;
+          overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kpi .foot{font-size:11px;color:var(--faint);display:flex;align-items:center;
+           gap:5px;flex-wrap:wrap;position:relative;z-index:1}
+.kpi .spark{position:absolute;inset-inline-start:0;bottom:0;width:100%;
+            height:26px;opacity:.45;pointer-events:none}
+.d{display:inline-flex;align-items:center;gap:2px;font-size:10.5px;
+   font-weight:700;padding:2px 7px;border-radius:999px;direction:ltr}
+.d.up{background:var(--possoft);color:var(--pos)}
+.d.down{background:var(--negsoft);color:var(--neg)}
+.d.flat{background:var(--line2);color:var(--dim)}
+
+/* ---------- charts ---------- */
+/* height:auto so the drawing fills its box exactly instead of being
+   letterboxed inside a fixed height; max-height stops a wide desktop card
+   from stretching a five-bar chart to fill the screen. */
+svg.chart{display:block;width:100%;height:auto;max-height:250px;
+          overflow:visible}
+svg.wf{max-height:290px}
+.legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:10px;font-size:11.5px;
+        color:var(--dim)}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:3px;
+          margin-inline-end:5px;vertical-align:middle}
+.donutwrap{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.donutwrap svg{width:150px;height:150px;flex:none}
+.dleg{flex:1;min-width:160px;font-size:12.5px}
+.dleg .r{display:flex;align-items:center;gap:8px;padding:5px 0;
+         border-bottom:1px solid var(--line2)}
+.dleg .r:last-child{border-bottom:0}
+.dleg i{width:10px;height:10px;border-radius:3px;flex:none}
+.dleg b{margin-inline-start:auto;direction:ltr;
+        font-variant-numeric:tabular-nums}
+.dleg s{text-decoration:none;color:var(--faint);font-size:11px;min-width:34px;
+        text-align:left;direction:ltr}
+
+/* ---------- bars & misc ---------- */
+.hb{margin:10px 0}
+.hb .t{display:flex;justify-content:space-between;font-size:12.5px;
+       margin-bottom:5px;gap:8px}
+.hb .t b{direction:ltr;font-variant-numeric:tabular-nums;font-weight:700}
+.track{height:7px;border-radius:99px;background:var(--line2);overflow:hidden}
+.track i{display:block;height:100%;border-radius:99px}
+.badge{font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;
+       white-space:nowrap;display:inline-block}
+.badge.g{background:var(--possoft);color:var(--pos)}
+.badge.y{background:var(--warnsoft);color:var(--warn)}
+.badge.r{background:var(--negsoft);color:var(--neg)}
+.badge.b{background:var(--brandsoft);color:var(--brand)}
+.pos{color:var(--pos)}.neg{color:var(--neg)}
+.note{border-radius:12px;padding:11px 13px;font-size:12.5px;line-height:1.55}
+.note.warn{background:var(--warnsoft);color:var(--warn)}
+.note.info{background:var(--brandsoft);color:var(--brand)}
+.note.bad{background:var(--negsoft);color:var(--neg)}
+.empty{color:var(--faint);font-size:13px;padding:18px 0;text-align:center}
+.btn{border:1px solid var(--line);background:var(--card);border-radius:11px;
+     padding:9px 14px;font-weight:600;font-size:13px;display:inline-block}
+.btn.p{background:var(--brand);border-color:var(--brand);color:#fff}
+.fab{position:fixed;bottom:22px;inset-inline-start:18px;z-index:40;display:flex;
+     gap:10px}
+@media(min-width:900px){.fab{inset-inline-start:auto;inset-inline-end:26px}}
+.fab button{border:0;border-radius:999px;padding:14px 20px;font-weight:700;
+  font-size:14px;box-shadow:0 8px 24px -6px rgba(79,70,229,.5);
+  background:var(--brand);color:#fff}
+.fab button.g{background:var(--card);color:var(--ink);
+  border:1px solid var(--line);box-shadow:var(--shadow);padding:14px 16px}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+dialog{border:0;border-radius:18px;padding:0;max-width:440px;
+       width:calc(100% - 28px);background:var(--card);color:var(--ink);
+       box-shadow:var(--shadow)}
+dialog::backdrop{background:rgba(15,23,42,.5)}
+.dlg{padding:18px}
+.dlg h2{font-size:16px;margin-bottom:14px}
+label{display:block;font-size:12px;color:var(--dim);font-weight:600;
+      margin:10px 0 4px}
+input,select{width:100%;padding:10px 12px;border-radius:11px;
+  border:1px solid var(--line);background:var(--bg);color:var(--ink);
+  font:inherit;font-size:15px}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.toast{position:fixed;bottom:88px;inset-inline:16px;z-index:60;
+  background:var(--ink);color:var(--bg);padding:12px 16px;border-radius:12px;
+  font-size:13.5px;text-align:center;opacity:0;transition:opacity .25s;
+  pointer-events:none}
+.toast.on{opacity:1}
+</style>
+</head>
+<body>
+<script>
+window.DEMO = {
+  ok: true,
+  updated: "13/08/2026 21:40",
+  sheet: "https://docs.google.com/spreadsheets/d/1bWH_Zef0aNwZjLOR07hjJRZRXkrY73mX0aMLGPH6uao",
+  rate: 3.70,
+  categories: ["עלות מכר","סליקה","תשתית","כלים","שיווק","עמלות","הקמה","אחר"],
+
+  sales: {
+    header: ["תאריך","מס׳ הזמנה",'מק"ט',"אזור","GB","לקוח","סטטוס","מכירה $","קנייה $","אמצעי תשלום","סליקה $","מקור סליקה","רווח $","שולי רווח %","מחירון $","הנחה %","ניתנה הנחה","פנימי"],
+    rows: [
+      ["2026-07-02 09:14","WV-1031","GLOBAL-5GB","גלובלי","5","דנה כ.","נמסר","8.10","5.35","Bit","0.00","מאומת","2.75","33.9","8.10","0.0","",""],
+      ["2026-07-04 18:02","WV-1032","GLOBAL-5GB","גלובלי","5","יוסי ל.","נמסר","8.10","5.35","Bit","0.00","מאומת","2.75","33.9","8.10","0.0","",""],
+      ["2026-07-06 11:47","WV-1033","GLOBAL-5GB","גלובלי","5","מאיה ש.","נמסר","8.10","5.35","Bit","0.00","מאומת","2.75","33.9","9.99","18.9","כן",""],
+      ["2026-07-09 20:31","WV-1034","GLOBAL-5GB","גלובלי","5","עידן ר.","נמסר","8.10","5.35","Bit","0.00","מאומת","2.75","33.9","8.10","0.0","",""],
+      ["2026-07-12 08:03","WV-1035","EU-10GB","אירופה","10","נועה פ.","נמסר","4.50","3.90","Bit","0.00","מאומת","0.60","13.3","4.50","0.0","",""],
+      ["2026-07-15 14:22","WV-1036","GLOBAL-5GB","גלובלי","5","דנה כ.","נמסר","8.10","5.35","Bit","0.00","מאומת","2.75","33.9","8.10","0.0","",""],
+      ["2026-07-18 19:55","WV-1037","US-3GB",'ארה"ב',"3","אורי ב.","נמסר","3.25","3.02","Bit","0.00","מאומת","0.23","7.1","3.25","0.0","",""],
+      ["2026-07-21 10:10","WV-1038","GLOBAL-5GB","גלובלי","5","שירה מ.","נמסר","8.10","5.35","Bit","0.00","מאומת","2.75","33.9","8.10","0.0","",""],
+      ["2026-07-24 16:40","WV-1039","TR-2GB","טורקיה","2","תומר א.","נמסר","1.60","0.42","Bit","0.00","מאומת","1.18","73.8","1.60","0.0","",""],
+      ["2026-07-27 21:05","WV-1040","GLOBAL-5GB","גלובלי","5","ליאור ק.","נמסר","8.10","5.35","Bit","0.00","מאומת","2.75","33.9","8.10","0.0","",""],
+      ["2026-07-30 12:18","WV-1041","EU-10GB","אירופה","10","רונן ט.","נמסר","4.50","3.90","Bit","0.00","מאומת","0.60","13.3","4.50","0.0","",""],
+      ["2026-08-02 09:47","WV-1042","GLOBAL-5GB","גלובלי","5","נועה פ.","נמסר","8.10","5.35","Bit","0.00","מאומת","2.75","33.9","8.10","0.0","",""],
+      ["2026-08-05 17:29","WV-1043","US-3GB",'ארה"ב',"3","אורי ב.","נמסר","3.25","3.02","Bit","0.00","מאומת","0.23","7.1","3.25","0.0","",""],
+      ["2026-08-08 13:03","WV-1044","TR-2GB","טורקיה","2","גיא ה.","נמסר","1.60","0.41","Bit","0.00","מאומת","1.19","74.4","1.60","0.0","",""],
+      ["2026-07-10 07:00","WV-1045","1.972.01","ישראל","0.5","","נבדק","0.00","1.99","Bit","0.00","מאומת","-1.99","","0.00","0.0","","כן"],
+      ["2026-07-11 07:05","WV-1046","1.972.01","ישראל","0.5","","נבדק","0.00","1.99","Bit","0.00","מאומת","-1.99","","0.00","0.0","","כן"],
+      ["2026-07-11 09:12","WV-1047","1.972.01","ישראל","0.5","","נבדק","0.00","1.99","Bit","0.00","מאומת","-1.99","","0.00","0.0","","כן"],
+      ["2026-07-11 09:40","WV-1048","1.972.01","ישראל","0.5","","נבדק","0.00","1.99","Bit","0.00","מאומת","-1.99","","0.00","0.0","","כן"],
+      ["2026-08-01 10:00","WV-1049","2.30.20","ישראל","20","בעל העסק","נמסר","0.00","1.75","Bit","0.00","מאומת","-1.75","","0.00","0.0","","כן"]
+    ]
+  },
+
+  expenses: {
+    header: ["מזהה","תאריך","ספק","תיאור","קטגוריה","סכום","מטבע","סכום ש\"ח","מקור","סטטוס","קבלה","מזהה מייל","הזמנה","הערות","סכום $"],
+    rows: [
+      ["exp-001","2026-07-15 09:00","Anthropic","Claude Pro — מנוי חודשי","כלים","20.00","USD","74.00","מייל","לבדיקה","","","","","20.00"],
+      ["exp-002","2026-08-01 09:00","Anthropic","Claude Pro — מנוי חודשי","כלים","20.00","USD","74.00","מייל","לבדיקה","","","","","20.00"],
+      ["exp-003","2026-07-20 12:30","OpenAI","שימוש API","כלים","5.00","USD","18.50","מייל","לבדיקה","","","","","5.00"],
+      ["exp-004","2026-07-01 08:00","Vercel","מסלול Pro","תשתית","19.99","USD","73.96","מייל","לבדיקה","","","","","19.99"],
+      ["exp-005","2026-07-03 10:15","Namecheap","חידוש דומיין waverole.com","תשתית","11.98","USD","44.33","מייל","לבדיקה","","","","","11.98"],
+      ["exp-006","2026-06-18 16:00","לא זוהה","דמי הקמה","הקמה","100.00","ILS","100.00","מייל","לבדיקה","","","","","27.03"],
+      ["exp-007","2026-06-22 11:40","לא זוהה","קבלה כללית","אחר","60.00","ILS","60.00","מייל","לבדיקה","","","","","16.22"]
+    ]
+  },
+
+  monthly: {
+    header: ["חודש","הזמנות","הכנסות $","עלות מכר $","סליקה $","הוצאות אחרות $","הזמנות פנימיות $","רווח נקי $","שולי רווח %"],
+    rows: [
+      ["2026-07","11","70.55","48.69","0.00","0.00","7.96","13.90","19.7"],
+      ["2026-08","3","12.95","8.78","0.00","0.00","1.75","2.42","18.7"]
+    ]
+  },
+
+  packages: {
+    header: ['מק"ט',"אזור","GB","הזמנות","הכנסות $","עלות מכר $","סליקה $","רווח $","שולי רווח %","כמה קיבלו הנחה","הנחה ממוצעת %"],
+    rows: [
+      ["GLOBAL-5GB","גלובלי","5","8","64.80","42.80","0.00","22.00","33.9","1","18.9"],
+      ["EU-10GB","אירופה","10","2","9.00","7.80","0.00","1.20","13.3","0","0.0"],
+      ["US-3GB",'ארה"ב',"3","2","6.50","6.04","0.00","0.46","7.1","0","0.0"],
+      ["TR-2GB","טורקיה","2","2","3.20","0.83","0.00","2.37","74.1","0","0.0"]
+    ]
+  },
+
+  recon: {
+    header: ["תאריך","סכום $","תוצאה","מס׳ הזמנה","הערה"],
+    rows: [
+      ["2026-07-02 09:14","5.35","התאמה","WV-1031",""],
+      ["2026-07-04 18:02","5.35","התאמה","WV-1032",""],
+      ["2026-07-06 11:47","5.35","התאמה","WV-1033",""],
+      ["2026-07-09 20:31","5.35","התאמה","WV-1034",""],
+      ["2026-07-12 08:03","3.90","התאמה","WV-1035",""],
+      ["2026-07-15 14:22","5.35","התאמה","WV-1036",""],
+      ["2026-07-18 19:55","3.02","התאמה","WV-1037",""],
+      ["2026-07-21 10:10","5.35","התאמה","WV-1038",""],
+      ["2026-07-24 16:40","0.42","התאמה","WV-1039",""],
+      ["2026-07-27 21:05","5.35","התאמה","WV-1040",""],
+      ["2026-07-30 12:18","3.90","התאמה","WV-1041",""],
+      ["2026-08-02 09:47","5.35","התאמה","WV-1042",""],
+      ["2026-08-05 17:29","3.02","התאמה","WV-1043",""],
+      ["2026-08-08 13:03","0.41","התאמה","WV-1044",""],
+      ["2026-07-10 07:00","1.99","התאמה","WV-1045",""],
+      ["2026-07-11 07:05","1.99","התאמה","WV-1046",""],
+      ["2026-07-11 09:12","1.99","התאמה","WV-1047",""],
+      ["2026-07-11 09:40","1.99","התאמה","WV-1048",""],
+      ["2026-08-01 10:00","1.75","התאמה","WV-1049",""],
+      ["2026-07-09 21:10","0.99","חיוב ללא מכירה","","לפני הבוט — כנראה רכישה ידנית"]
+    ]
+  }
+};
+
+</script>
+
+
+<div class="app">
+  <nav class="side" id="side"></nav>
+  <main class="main">
+    <div class="top">
+      <div>
+        <h1 id="ttl">סקירה</h1>
+        <div class="sub" id="sub">טוען…</div>
+      </div>
+      <div class="right">
+        <button class="btn" id="refresh" title="רענון">↻</button>
+      </div>
+    </div>
+    <div class="pills" id="pills"></div>
+    <div id="view"><div class="empty">טוען נתונים…</div></div>
+  </main>
+</div>
+
+<div class="fab">
+  <button id="addBtn">+ הוצאה</button>
+  <button class="g" id="camBtn" title="צילום קבלה">📷</button>
+</div>
+<input type="file" id="camIn" accept="image/*" capture="environment" hidden>
+<div class="toast" id="toast"></div>
+
+<dialog id="dlg"><form method="dialog" class="dlg" id="frm">
+  <h2>הוצאה חדשה</h2>
+  <div class="row2">
+    <div><label for="f_amt">סכום</label>
+      <input id="f_amt" type="number" step="0.01" required></div>
+    <div><label for="f_cur">מטבע</label>
+      <select id="f_cur"><option>USD</option><option>ILS</option></select></div>
+  </div>
+  <label for="f_ven">ספק</label><input id="f_ven" required>
+  <label for="f_cat">קטגוריה</label><select id="f_cat"></select>
+  <label for="f_date">תאריך</label><input id="f_date" type="date" required>
+  <label for="f_note">הערה</label><input id="f_note">
+  <div style="display:flex;gap:8px;margin-top:18px">
+    <button class="btn p" value="ok" style="flex:1">שמירה</button>
+    <button class="btn" value="cancel" formnovalidate>ביטול</button>
+  </div>
+</form></dialog>
+
+<script>
+/* =====================================================================
+   Waverole — the books. Every figure on screen is derived here from the
+   ledger the spreadsheet hands over; nothing is hard-coded.
+   ===================================================================== */
+var DATA = null, TAB = 'overview', BUSY = false;
+
+var TABS = [
+  { id:'overview', ico:'◈', name:'סקירה',    grp:'' },
+  { id:'months',   ico:'▤', name:'לפי חודש', grp:'' },
+  { id:'packages', ico:'▧', name:'חבילות',   grp:'פילוח' },
+  { id:'regions',  ico:'◉', name:'אזורים',   grp:'' },
+  { id:'sales',    ico:'≡', name:'מכירות',   grp:'ספרים' },
+  { id:'expenses', ico:'▣', name:'הוצאות',   grp:'' },
+  { id:'control',  ico:'⚙', name:'בקרה',     grp:'' }
+];
+
+/* ---------------- table helpers ---------------- */
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+/* api_data() names this key "header"; the fallback keeps a hand-built
+   fixture working too. Columns are always found by NAME — the owner
+   reorders them in the sheet. */
+function col(t,frag){
+  var hd=t&&(t.header||t.head);
+  if(!hd) return -1;
+  for(var i=0;i<hd.length;i++)
+    if(String(hd[i]).indexOf(frag)>=0) return i;
+  return -1;}
+function cell(r,i){return (i<0||r==null)?'':(r[i]==null?'':r[i]);}
+function num(v){
+  if(typeof v==='number') return v;
+  var n=parseFloat(String(v).replace(/[^0-9.\-]/g,''));
+  return isNaN(n)?0:n;}
+function money(v,dp){
+  var n=Number(v)||0;
+  return (n<0?'-':'')+'$'+Math.abs(n).toFixed(dp==null?2:dp);}
+function pct(v,dp){return (Number(v)||0).toFixed(dp==null?1:dp)+'%';}
+function rows(t){return (t&&t.rows)?t.rows:[];}
+
+/* ---------------- the ledger, read once ---------------- */
+function ledger(){
+  var s=DATA.sales;
+  var c={date:col(s,'תאריך'),sku:col(s,'מק'),region:col(s,'אזור'),
+    cust:col(s,'לקוח'),sell:col(s,'מכירה'),buy:col(s,'קנייה'),
+    pay:col(s,'אמצעי תשלום'),fee:col(s,'סליקה $'),list:col(s,'מחירון'),
+    disc:col(s,'ניתנה הנחה'),intern:col(s,'פנימי')};
+  var out=[];
+  rows(s).forEach(function(r){
+    var sell=num(cell(r,c.sell)), buy=num(cell(r,c.buy));
+    /* No money on either side: something that happened, not something
+       that was traded. Neither revenue nor cost. */
+    if(!sell&&!buy) return;
+    out.push({
+      date:String(cell(r,c.date)||''), sku:String(cell(r,c.sku)||'—'),
+      region:String(cell(r,c.region)||'').trim()||'—',
+      cust:String(cell(r,c.cust)||'').trim(),
+      pay:String(cell(r,c.pay)||'').trim()||'—',
+      sell:sell, buy:buy, fee:num(cell(r,c.fee)),
+      list:num(cell(r,c.list)),
+      disc:!!String(cell(r,c.disc)).trim(),
+      internal:!!String(cell(r,c.intern)).trim()});});
+  return out;}
+
+function totals(){
+  var L=ledger(), t={rev:0,cogs:0,fee:0,over:0,internal:0,internalN:0,
+    orders:0,disc:0,discSum:0,custs:{},repeat:0,pending:0};
+  L.forEach(function(o){
+    /* Bought on the company account and never sold: a cost, not a sale.
+       Leaving it among the sales reports a package as loss-making. */
+    if(o.internal){t.internalN++; t.internal+=o.buy+o.fee; return;}
+    t.orders++; t.rev+=o.sell; t.cogs+=o.buy; t.fee+=o.fee;
+    if(o.disc){t.disc++; t.discSum+=Math.max(0,o.list-o.sell);}
+    if(o.cust) t.custs[o.cust]=(t.custs[o.cust]||0)+1;});
+
+  var e=DATA.expenses, cAmt=col(e,'סכום $'), cSt=col(e,'סטטוס');
+  rows(e).forEach(function(r){
+    /* Scanned but unconfirmed. Not booked until the owner says so. */
+    if(String(cell(r,cSt)).indexOf('לבדיקה')>=0){t.pending++; return;}
+    t.over+=num(cell(r,cAmt));});
+
+  t.customers=Object.keys(t.custs).length;
+  Object.keys(t.custs).forEach(function(k){if(t.custs[k]>1) t.repeat++;});
+  t.gross=t.rev-t.cogs-t.fee;
+  t.profit=t.gross-t.over-t.internal;
+  t.margin=t.rev?t.profit/t.rev*100:0;
+  t.grossMargin=t.rev?t.gross/t.rev*100:0;
+  t.aov=t.orders?t.rev/t.orders:0;
+  t.acost=t.orders?t.cogs/t.orders:0;
+  t.agross=t.orders?t.gross/t.orders:0;
+  t.aprofit=t.orders?t.profit/t.orders:0;
+  return t;}
+
+function monthsAsc(){
+  var m=DATA.monthly,c=col(m,'חודש');
+  return rows(m).filter(function(r){return String(cell(r,c)).trim();})
+    .slice().sort(function(a,b){
+      return String(cell(a,c))<String(cell(b,c))?-1:1;});}
+
+function mcols(){
+  var m=DATA.monthly;
+  return {m:col(m,'חודש'),ord:col(m,'הזמנות'),rev:col(m,'הכנסות'),
+    cogs:col(m,'עלות מכר'),fee:col(m,'סליקה'),over:col(m,'הוצאות אחרות'),
+    intern:col(m,'פנימיות'),net:col(m,'רווח נקי'),mar:col(m,'שולי רווח')};}
+
+/* Past a doubling this switches to a multiplier. The first partial month
+   of trading turns into "+1656%", a number that is arithmetically true and
+   says only that the business used to be tiny. "x18" says that honestly
+   and is not mistaken for a trend. */
+function delta(now,before){
+  if(!before) return '';
+  if(before>0&&now/before>=2){
+    var r=now/before;
+    return '<span class="d up">x'+(r>=10?r.toFixed(0):r.toFixed(1))+'</span>';}
+  var p=(now-before)/Math.abs(before)*100;
+  if(Math.abs(p)<0.5) return '<span class="d flat">→</span>';
+  return '<span class="d '+(p>0?'up':'down')+'">'+(p>0?'↑':'↓')+' '+
+         Math.abs(p).toFixed(0)+'%</span>';}
+
+/* ---------------- charts ---------------- */
+function spark(vals,colour){
+  if(vals.length<2) return '';
+  var w=100,h=26,mx=Math.max.apply(null,vals),
+      mn=Math.min.apply(null,vals.concat([0]));
+  var rg=(mx-mn)||1,st=w/(vals.length-1);
+  var d=vals.map(function(v,i){return (i?'L':'M')+(i*st).toFixed(1)+' '+
+    (h-((v-mn)/rg)*(h-3)-1.5).toFixed(1);}).join(' ');
+  return '<svg class="spark" viewBox="0 0 '+w+' '+h+'" preserveAspectRatio="none">'+
+    '<path d="'+d+' L'+w+' '+h+' L0 '+h+' Z" fill="'+colour+'" opacity=".18"/>'+
+    '<path d="'+d+'" fill="none" stroke="'+colour+'" stroke-width="1.6"/></svg>';}
+
+/* The P&L bridge: revenue on one side, every cost knocking it down, profit
+   left standing. Finance reads this shape before it reads any table. */
+function waterfall(t){
+  var steps=[
+    {l:'הכנסות',   v:t.rev,       k:'start'},
+    {l:'עלות מכר', v:-t.cogs,     k:'down'},
+    {l:'עמלות',    v:-t.fee,      k:'down'},
+    {l:'הוצאות',   v:-t.over,     k:'down'},
+    {l:'פנימיות',  v:-t.internal, k:'down'},
+    {l:'רווח נקי', v:t.profit,    k:'end'}
+  ].filter(function(s){return s.k!=='down'||Math.abs(s.v)>0.005;});
+
+  var run=0,mx=0;
+  steps.forEach(function(s){
+    if(s.k==='start'){s.a=0;s.b=s.v;run=s.v;}
+    else if(s.k==='end'){s.a=0;s.b=s.v;}
+    else {s.a=run;s.b=run+s.v;run=s.b;}
+    mx=Math.max(mx,s.a,s.b);});
+  mx=(mx*1.18)||1;
+
+  /* Kept deliberately landscape: at a near-square ratio the chart grows
+     taller than the card it sits in. */
+  var W=Math.max(560,steps.length*112),H=250,base=H-42,top=20;
+  var slot=(W-20)/steps.length,bw=Math.min(50,slot*0.55);
+  var y=function(v){return base-(v/mx)*(base-top);};
+  var s='<svg class="chart wf" viewBox="0 0 '+W+' '+H+
+        '" preserveAspectRatio="xMidYMid meet" role="img" '+
+        'aria-label="מפל רווח והפסד">';
+  s+='<line x1="10" y1="'+base+'" x2="'+(W-10)+'" y2="'+base+
+     '" stroke="var(--line)"/>';
+  steps.forEach(function(st,i){
+    var cx=10+slot*i+slot/2,
+        hi=Math.max(y(st.b),y(st.a)), lo=Math.min(y(st.b),y(st.a));
+    var fill=st.k==='start'?'var(--brand)':
+             st.k==='end'?(st.v>=0?'var(--pos)':'var(--neg)'):'var(--neg)';
+    if(i>0&&steps[i-1].k!=='end'&&st.k!=='end'){
+      s+='<line x1="'+(10+slot*(i-1)+slot/2+bw/2)+'" y1="'+y(steps[i-1].b)+
+         '" x2="'+(cx-bw/2)+'" y2="'+y(steps[i-1].b)+
+         '" stroke="var(--faint)" stroke-dasharray="2 3"/>';}
+    s+='<rect x="'+(cx-bw/2)+'" y="'+lo+'" width="'+bw+'" height="'+
+       Math.max(2,hi-lo)+'" rx="4" fill="'+fill+'" opacity="'+
+       (st.k==='down'?'.8':'1')+'"/>';
+    s+='<text x="'+cx+'" y="'+(lo-7)+'" text-anchor="middle" font-size="11.5" '+
+       'font-weight="700" fill="var(--ink)" direction="ltr">'+
+       money(st.k==='down'?st.v:Math.abs(st.v))+'</text>';
+    s+='<text x="'+cx+'" y="'+(base+18)+'" text-anchor="middle" font-size="11" '+
+       'fill="var(--dim)">'+esc(st.l)+'</text>';});
+  return s+'</svg>';}
+
+/* Money as bars, efficiency as a line: composition and margin in one read. */
+function monthChart(){
+  var ms=monthsAsc(),c=mcols();
+  if(!ms.length) return '<div class="empty">אין עדיין נתונים חודשיים.</div>';
+  var mx=0;
+  ms.forEach(function(r){
+    mx=Math.max(mx,num(cell(r,c.rev)),
+      num(cell(r,c.cogs))+num(cell(r,c.fee))+num(cell(r,c.over))+
+      num(cell(r,c.intern)));});
+  mx=(mx*1.2)||1;
+  var W=Math.max(520,ms.length*104),H=220,base=H-38,top=18;
+  var slot=(W-20)/ms.length,bw=Math.min(26,slot*0.3);
+  var y=function(v){return base-(v/mx)*(base-top);};
+  var s='<svg class="chart" viewBox="0 0 '+W+' '+H+
+        '" preserveAspectRatio="xMidYMid meet" role="img" '+
+        'aria-label="הכנסות מול עלויות לפי חודש">';
+  [0.25,0.5,0.75,1].forEach(function(f){
+    s+='<line x1="10" y1="'+y(mx*f)+'" x2="'+(W-10)+'" y2="'+y(mx*f)+
+       '" stroke="var(--line2)"/>';});
+  s+='<line x1="10" y1="'+base+'" x2="'+(W-10)+'" y2="'+base+
+     '" stroke="var(--line)"/>';
+  var pts=[];
+  ms.forEach(function(r,i){
+    var cx=10+slot*i+slot/2, rev=num(cell(r,c.rev));
+    var cost=num(cell(r,c.cogs))+num(cell(r,c.fee))+num(cell(r,c.over))+
+             num(cell(r,c.intern));
+    s+='<rect x="'+(cx-bw-2)+'" y="'+y(rev)+'" width="'+bw+'" height="'+
+       Math.max(1,base-y(rev))+'" rx="4" fill="var(--brand)"/>';
+    s+='<rect x="'+(cx+2)+'" y="'+y(cost)+'" width="'+bw+'" height="'+
+       Math.max(1,base-y(cost))+'" rx="4" fill="var(--neg)" opacity=".72"/>';
+    s+='<text x="'+cx+'" y="'+(base+16)+'" text-anchor="middle" font-size="11" '+
+       'fill="var(--dim)">'+esc(cell(r,c.m))+'</text>';
+    /* Margin rides a fixed -40%..+60% band so the line stays comparable
+       between months instead of rescaling itself every render. */
+    var mar=Math.max(-40,Math.min(60,num(cell(r,c.mar))));
+    pts.push([cx,base-((mar+40)/100)*(base-top)]);});
+  if(pts.length>1)
+    s+='<path d="'+pts.map(function(p,i){
+      return (i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1);}).join(' ')+
+      '" fill="none" stroke="var(--warn)" stroke-width="2" '+
+      'stroke-linejoin="round"/>';
+  pts.forEach(function(p){
+    s+='<circle cx="'+p[0]+'" cy="'+p[1]+'" r="3.4" fill="var(--warn)"/>';});
+  return s+'</svg><div class="legend">'+
+    '<span><i style="background:var(--brand)"></i>הכנסות</span>'+
+    '<span><i style="background:var(--neg)"></i>עלויות</span>'+
+    '<span><i style="background:var(--warn)"></i>שולי רווח</span></div>';}
+
+function donut(segs){
+  var total=0; segs.forEach(function(x){total+=Math.max(0,x.v);});
+  if(!total) return '<div class="empty">אין נתונים.</div>';
+  var r=54,C=2*Math.PI*r,off=0;
+  var s='<svg viewBox="0 0 150 150" role="img" aria-label="פילוח">'+
+        '<circle cx="75" cy="75" r="'+r+'" fill="none" stroke="var(--line2)" '+
+        'stroke-width="19"/>';
+  segs.forEach(function(x){
+    var v=Math.max(0,x.v); if(!v) return;
+    var len=v/total*C;
+    s+='<circle cx="75" cy="75" r="'+r+'" fill="none" stroke="'+x.c+
+       '" stroke-width="19" stroke-dasharray="'+len+' '+(C-len)+
+       '" stroke-dashoffset="'+(-off)+'" transform="rotate(-90 75 75)"/>';
+    off+=len;});
+  s+='</svg><div class="dleg">';
+  segs.forEach(function(x){
+    if(Math.max(0,x.v)<=0) return;
+    s+='<div class="r"><i style="background:'+x.c+'"></i>'+esc(x.l)+
+       '<s>'+(x.v/total*100).toFixed(0)+'%</s><b>'+money(x.v)+'</b></div>';});
+  return '<div class="donutwrap">'+s+'</div></div>';}
+
+function hbars(map,colour,fmt){
+  var ks=Object.keys(map).sort(function(a,b){return map[b]-map[a];});
+  if(!ks.length) return '<div class="empty">אין נתונים.</div>';
+  var mx=Math.max(map[ks[0]],0.0001),h='';
+  ks.slice(0,10).forEach(function(k){
+    h+='<div class="hb"><div class="t"><span>'+esc(k)+'</span><b>'+
+      (fmt?fmt(map[k]):money(map[k]))+'</b></div><div class="track">'+
+      '<i style="width:'+Math.max(2,Math.max(0,map[k])/mx*100)+
+      '%;background:'+colour+'"></i></div></div>';});
+  return h;}
+
+function kpi(o){
+  return '<div class="kpi"><div class="ico" style="background:'+o.bg+'">'+
+    o.ico+'</div><div class="lab">'+esc(o.lab)+'</div><div class="val'+
+    (o.cls?' '+o.cls:'')+'">'+o.val+'</div><div class="foot">'+(o.chip||'')+
+    '<span>'+esc(o.foot||'')+'</span></div>'+(o.spark||'')+'</div>';}
+
+/* ---------------- views ---------------- */
+function viewOverview(){
+  var t=totals(),ms=monthsAsc(),c=mcols();
+  var last=ms.length?ms[ms.length-1]:null, prev=ms.length>1?ms[ms.length-2]:null;
+  var ser=function(i){return ms.map(function(r){return num(cell(r,i));});};
+  var ch=function(i){
+    return (last&&prev)?delta(num(cell(last,i)),num(cell(prev,i))):'';};
+  var vs=(last&&prev)?'מול '+cell(prev,c.m):'מצטבר';
+
+  var h='<div class="kpis six">';
+  h+=kpi({ico:'\u{1F4B5}',bg:'var(--brandsoft)',lab:'הכנסות',val:money(t.rev),
+    foot:vs,chip:ch(c.rev),spark:spark(ser(c.rev),'var(--brand)')});
+  h+=kpi({ico:'\u{1F4C8}',bg:'var(--possoft)',lab:'רווח נקי',val:money(t.profit),
+    cls:t.profit>=0?'pos':'neg',foot:vs,chip:ch(c.net),
+    spark:spark(ser(c.net),'var(--pos)')});
+  h+=kpi({ico:'%',bg:'var(--warnsoft)',lab:'שולי רווח',val:pct(t.margin),
+    cls:t.margin>=0?'':'neg',foot:'גולמי '+pct(t.grossMargin)});
+  h+=kpi({ico:'\u{1F9FE}',bg:'var(--infosoft)',lab:'הזמנות',
+    val:String(t.orders),foot:vs,chip:ch(c.ord),
+    spark:spark(ser(c.ord),'var(--info)')});
+  h+=kpi({ico:'\u{1F465}',bg:'var(--violetsoft)',lab:'לקוחות',
+    val:String(t.customers),foot:t.repeat?t.repeat+' חוזרים':'אין חוזרים'});
+  h+=kpi({ico:'\u{1F3AF}',bg:'var(--brandsoft)',lab:'רווח להזמנה',
+    val:money(t.aprofit),cls:t.aprofit>=0?'pos':'neg',
+    foot:'ממכירה של '+money(t.aov)});
+  h+='</div>';
+
+  /* A waterfall is read approximately, so it sits next to the exact
+     figures rather than replacing them. */
+  h+='<div class="grid w"><div class="card"><h2>מאיפה הרווח מגיע</h2>'+
+     '<div class="hint">כל ההכנסות, פחות כל עלות, עד לרווח הנקי.</div>'+
+     waterfall(t)+'</div>'+pnlTable(t)+'</div>';
+
+  h+='<div class="grid w"><div class="card"><h2>הכנסות מול עלויות</h2>'+
+     '<div class="hint">העמודות הן כסף; הקו הכתום הוא שולי הרווח באחוזים.</div>'+
+     monthChart()+'</div><div class="card"><h2>מבנה העלויות</h2>'+
+     '<div class="hint">לאן הולך כל דולר שנכנס.</div>'+donut([
+       {l:'עלות מכר (ספק)',v:t.cogs,c:'var(--brand)'},
+       {l:'עמלות סליקה',v:t.fee,c:'var(--violet)'},
+       {l:'הוצאות תפעול',v:t.over,c:'var(--warn)'},
+       {l:'הזמנות פנימיות',v:t.internal,c:'var(--neg)'},
+       {l:'רווח נקי',v:Math.max(0,t.profit),c:'var(--pos)'}
+     ])+'</div></div>';
+
+  h+='<div class="grid c2">'+unitCard(t)+breakEven(t)+'</div>';
+  return h;}
+
+function pnlTable(t){
+  var r=[['הכנסות',t.rev,'',1],
+    ['עלות מכר (ספק)',-t.cogs,'neg',0],
+    ['עמלות סליקה',-t.fee,t.fee?'neg':'',0],
+    ['רווח גולמי',t.gross,'pos',1],
+    ['הוצאות תפעול',-t.over,t.over?'neg':'',0],
+    ['הזמנות פנימיות',-t.internal,t.internal?'neg':'',0],
+    ['רווח נקי',t.profit,t.profit>=0?'pos':'neg',1]];
+  var h='<div class="card"><h2>רווח והפסד</h2><div class="hint">'+
+    'הערכים המדויקים מאחורי המפל.</div><table>';
+  r.forEach(function(x){
+    h+='<tr><td'+(x[3]?' style="font-weight:800"':'')+'>'+x[0]+
+      '</td><td class="num '+x[2]+'"'+(x[3]?' style="font-weight:800"':'')+'>'+
+      money(x[1])+'</td></tr>';});
+  h+='</table><div class="track" style="margin-top:14px">'+
+    '<i style="width:'+Math.max(0,Math.min(100,t.margin))+
+    '%;background:var(--pos)"></i></div><div class="hint" '+
+    'style="margin-top:6px">כל דולר הכנסה מותיר '+money(t.rev?t.profit/t.rev:0)+
+    ' רווח נקי.</div></div>';
+  return h;}
+
+function unitCard(t){
+  var r=[['מחיר מכירה ממוצע',money(t.aov),''],
+    ['עלות ספק ממוצעת','-'+money(t.acost),'neg'],
+    ['עמלת סליקה ממוצעת',(t.fee?'-':'')+money(t.orders?t.fee/t.orders:0),
+      t.fee?'neg':''],
+    ['רווח גולמי להזמנה',money(t.agross),'pos'],
+    ['רווח נקי להזמנה',money(t.aprofit),t.aprofit>=0?'pos':'neg']];
+  var h='<div class="card"><h2>כלכלת הזמנה בודדת</h2><div class="hint">'+
+    'ממוצע על פני '+t.orders+' מכירות.</div><table>';
+  r.forEach(function(x){
+    h+='<tr><td>'+x[0]+'</td><td class="num '+x[2]+'">'+x[1]+'</td></tr>';});
+  return h+'</table></div>';}
+
+function breakEven(t){
+  var h='<div class="card"><h2>נקודת איזון</h2>';
+  if(t.over<=0){
+    h+='<div class="hint">כמה הזמנות צריך כדי לכסות את ההוצאות הקבועות.</div>'+
+      '<div class="note warn"><b>לא נרשמו הוצאות תפעול.</b><br>'+
+      'הרווח הנקי כאן הוא <b>לפני</b> עלויות כלים, שרתים ותשתית. כל עוד '+
+      'הקבלות מהתיבה הראשית לא נכנסו, המספר אופטימי.</div>';
+    if(t.pending)
+      h+='<div class="note info" style="margin-top:8px">'+t.pending+
+        ' הוצאות ממתינות לאישור ולכן לא נספרו.</div>';
+    return h+'</div>';}
+  var need=t.agross>0?Math.ceil(t.over/t.agross):null;
+  h+='<div class="hint">בהינתן רווח גולמי של '+money(t.agross)+' להזמנה.</div>'+
+    '<table><tr><td>הוצאות תפעול</td><td class="num neg">-'+money(t.over)+
+    '</td></tr><tr><td>הזמנות לכיסוי</td><td class="num"><b>'+
+    (need===null?'—':need)+'</b></td></tr><tr><td>בפועל בוצעו</td>'+
+    '<td class="num">'+t.orders+'</td></tr></table>';
+  if(need!==null){
+    h+='<div class="track" style="margin-top:12px"><i style="width:'+
+      Math.min(100,t.orders/need*100)+'%;background:'+
+      (t.orders>=need?'var(--pos)':'var(--warn)')+'"></i></div>'+
+      '<div class="hint" style="margin-top:6px">'+
+      (t.orders>=need?'מעל נקודת האיזון.':'חסרות '+(need-t.orders)+
+        ' הזמנות לכיסוי.')+'</div>';}
+  return h+'</div>';}
+
+function viewMonths(){
+  var ms=monthsAsc(),c=mcols();
+  if(!ms.length)
+    return '<div class="card"><div class="empty">אין נתונים.</div></div>';
+  var h='<div class="card"><h2>הכנסות, עלויות ושולי רווח</h2>'+monthChart()+
+    '</div><div class="card"><h2>פירוט חודשי</h2><div class="scroll">'+
+    '<table><tr><th>חודש</th><th>הזמנות</th><th>הכנסות</th><th>עלות מכר</th>'+
+    '<th>סליקה</th><th>הוצאות</th><th>פנימיות</th><th>רווח נקי</th>'+
+    '<th>%</th></tr>';
+  ms.slice().reverse().forEach(function(r){
+    var net=num(cell(r,c.net));
+    h+='<tr><td><b>'+esc(cell(r,c.m))+'</b></td><td class="num">'+
+      esc(cell(r,c.ord))+'</td><td class="num">'+money(num(cell(r,c.rev)))+
+      '</td><td class="num">'+money(num(cell(r,c.cogs)))+'</td><td class="num">'+
+      money(num(cell(r,c.fee)))+'</td><td class="num">'+
+      money(num(cell(r,c.over)))+'</td><td class="num">'+
+      money(num(cell(r,c.intern)))+'</td><td class="num '+
+      (net>=0?'pos':'neg')+'"><b>'+money(net)+'</b></td><td class="num">'+
+      pct(num(cell(r,c.mar)))+'</td></tr>';});
+  return h+'</table></div></div>';}
+
+function viewPackages(){
+  var p=DATA.packages;
+  var c={sku:col(p,'מק'),reg:col(p,'אזור'),ord:col(p,'הזמנות'),
+    rev:col(p,'הכנסות'),prof:col(p,'רווח'),mar:col(p,'שולי'),
+    dn:col(p,'הנחות')};
+  var rs=rows(p).filter(function(r){return num(cell(r,c.ord))>0;});
+  if(!rs.length)
+    return '<div class="card"><div class="empty">אין נתוני חבילות.</div></div>';
+  rs.sort(function(a,b){return num(cell(b,c.prof))-num(cell(a,c.prof));});
+  var best=rs[0];
+  /* Thinnest margin, not smallest profit. A package that sold once is not
+     "the weakest" — it is the newest, and ranking it by total profit would
+     put a healthy 28% package on the warning tile. */
+  var thin=rs.slice().sort(function(a,b){
+    return num(cell(a,c.mar))-num(cell(b,c.mar));})[0];
+  var thinM=num(cell(thin,c.mar));
+
+  var revMap={},totRev=0,topRev=0;
+  rs.forEach(function(r){
+    var v=num(cell(r,c.rev));totRev+=v;topRev=Math.max(topRev,v);
+    revMap[String(cell(r,c.sku))+(cell(r,c.reg)?' · '+cell(r,c.reg):'')]=v;});
+  var share=totRev?topRev/totRev*100:0;
+
+  var h='<div class="kpis">';
+  h+=kpi({ico:'\u{1F3C6}',bg:'var(--possoft)',lab:'הרווחית ביותר',
+    val:esc(cell(best,c.sku)),foot:money(num(cell(best,c.prof)))+' · '+
+    pct(num(cell(best,c.mar)))});
+  h+=kpi({ico:thinM<15?'⚠️':'\u{1F4CA}',
+    bg:thinM<15?'var(--warnsoft)':'var(--infosoft)',
+    lab:'השוליים הדקים ביותר',val:esc(cell(thin,c.sku)),
+    cls:thinM<0?'neg':'',
+    foot:pct(thinM)+' · '+money(num(cell(thin,c.prof)))});
+  h+=kpi({ico:'\u{1F4E6}',bg:'var(--infosoft)',lab:'חבילות פעילות',
+    val:String(rs.length),foot:'עם מכירה אחת לפחות'});
+  h+='</div>';
+  h+='<div class="note '+(share>50?'warn':'info')+'" style="margin-bottom:14px">'+
+    'החבילה הגדולה מהווה <b>'+share.toFixed(0)+'%</b> מההכנסות'+
+    (share>50?' — ריכוז גבוה. ירידה בביקוש שלה תורגש מיד.':'.')+'</div>';
+
+  h+='<div class="grid w2"><div class="card"><h2>הכנסות לפי חבילה</h2>'+
+    hbars(revMap,'var(--brand)')+'</div><div class="card"><h2>כל החבילות</h2>'+
+    '<div class="scroll"><table><tr><th>מק"ט</th><th>אזור</th><th>הזמנות</th>'+
+    '<th>הכנסות</th><th>רווח</th><th>שוליים</th><th>הנחות</th></tr>';
+  rs.forEach(function(r){
+    var m=num(cell(r,c.mar)),pr=num(cell(r,c.prof));
+    var cls=m>=25?'g':(m>=10?'b':(m>=0?'y':'r'));
+    h+='<tr><td><b>'+esc(cell(r,c.sku))+'</b></td><td>'+esc(cell(r,c.reg))+
+      '</td><td class="num">'+esc(cell(r,c.ord))+'</td><td class="num">'+
+      money(num(cell(r,c.rev)))+'</td><td class="num '+(pr>=0?'pos':'neg')+'">'+
+      money(pr)+'</td><td class="num"><span class="badge '+cls+'">'+pct(m)+
+      '</span></td><td class="num">'+(num(cell(r,c.dn))||'—')+'</td></tr>';});
+  return h+'</table></div></div></div>';}
+
+function viewRegions(){
+  var L=ledger(),rev={},prof={},cnt={};
+  L.forEach(function(o){
+    if(o.internal) return;
+    rev[o.region]=(rev[o.region]||0)+o.sell;
+    prof[o.region]=(prof[o.region]||0)+(o.sell-o.buy-o.fee);
+    cnt[o.region]=(cnt[o.region]||0)+1;});
+  if(!Object.keys(rev).length)
+    return '<div class="card"><div class="empty">אין נתוני אזור.</div></div>';
+  var h='<div class="grid c2"><div class="card"><h2>הכנסות לפי אזור</h2>'+
+    hbars(rev,'var(--brand)')+'</div><div class="card"><h2>רווח לפי אזור</h2>'+
+    hbars(prof,'var(--pos)')+'</div></div>';
+  h+='<div class="card"><h2>פירוט</h2><table><tr><th>אזור</th><th>הזמנות</th>'+
+    '<th>הכנסות</th><th>רווח</th><th>שוליים</th></tr>';
+  Object.keys(rev).sort(function(a,b){return rev[b]-rev[a];}).forEach(function(k){
+    h+='<tr><td><b>'+esc(k)+'</b></td><td class="num">'+cnt[k]+
+      '</td><td class="num">'+money(rev[k])+'</td><td class="num '+
+      (prof[k]>=0?'pos':'neg')+'">'+money(prof[k])+'</td><td class="num">'+
+      pct(rev[k]?prof[k]/rev[k]*100:0)+'</td></tr>';});
+  return h+'</table></div>';}
+
+function viewSales(){
+  var L=ledger().slice().reverse(),t=totals(),pay={};
+  L.forEach(function(o){if(!o.internal) pay[o.pay]=(pay[o.pay]||0)+o.sell;});
+  var only=Object.keys(pay);
+  var h='<div class="grid c2"><div class="card"><h2>אמצעי תשלום</h2>'+
+    hbars(pay,'var(--violet)')+
+    (only.length===1&&only[0].indexOf('Bit')>=0
+      ?'<div class="note info" style="margin-top:10px">Bit לא גובה עמלת קבלה, '+
+       'ולכן עמלות הסליקה בספרים הן אפס אמיתי ולא הערכה.</div>':'')+
+    '</div><div class="card"><h2>הנחות</h2>'+
+    (t.disc?'<table><tr><td>הזמנות בהנחה</td><td class="num">'+t.disc+
+      ' מתוך '+t.orders+'</td></tr><tr><td>שווי ההנחות</td>'+
+      '<td class="num neg">-'+money(t.discSum)+'</td></tr>'+
+      '<tr><td>הנחה ממוצעת</td><td class="num">'+money(t.discSum/t.disc)+
+      '</td></tr><tr><td>נתח מהרווח הגולמי הפוטנציאלי</td><td class="num">'+
+      pct(t.discSum/((t.gross+t.discSum)||1)*100,0)+'</td></tr></table>'
+     :'<div class="empty">כל ההזמנות נמכרו במחיר מלא.</div>')+'</div></div>';
+
+  h+='<div class="card"><h2>ספר המכירות</h2><div class="hint">'+L.length+
+    ' שורות, החדשה למעלה.</div><div class="scroll"><table><tr><th>תאריך</th>'+
+    '<th>מק"ט</th><th>אזור</th><th>מכירה</th><th>קנייה</th><th>רווח</th>'+
+    '<th></th></tr>';
+  L.forEach(function(o){
+    var pr=o.sell-o.buy-o.fee;
+    h+='<tr><td style="white-space:nowrap;font-size:12px">'+esc(o.date)+
+      '</td><td><b>'+esc(o.sku)+'</b></td><td>'+esc(o.region)+
+      '</td><td class="num">'+money(o.sell)+'</td><td class="num">'+
+      money(o.buy)+'</td><td class="num '+
+      (o.internal?'':(pr>=0?'pos':'neg'))+'">'+
+      (o.internal?'—':money(pr))+'</td><td>'+
+      (o.internal?'<span class="badge y">פנימי</span>':
+       (o.disc?'<span class="badge b">הנחה</span>':''))+'</td></tr>';});
+  return h+'</table></div></div>';}
+
+function viewExpenses(){
+  var e=DATA.expenses;
+  var c={date:col(e,'תאריך'),ven:col(e,'ספק'),cat:col(e,'קטגוריה'),
+    amt:col(e,'סכום $'),orig:col(e,'מקור'),st:col(e,'סטטוס'),
+    key:col(e,'מזהה')};
+  var rs=rows(e);
+  if(!rs.length)
+    return '<div class="card"><h2>הוצאות</h2><div class="note warn">'+
+      '<b>לא נרשמה אף הוצאה.</b><br>הסריקה היומית קוראת את התיבה הראשית. '+
+      'אם יש שם קבלות שלא הופיעו — הרץ סריקה ידנית מלשונית <b>בקרה</b>, '+
+      'או הוסף הוצאה בכפתור למטה.</div></div>';
+
+  var cat={},ven={},total=0,pending=[];
+  rs.forEach(function(r){
+    var a=num(cell(r,c.amt));
+    if(String(cell(r,c.st)).indexOf('לבדיקה')>=0){pending.push(r);return;}
+    total+=a;
+    var k=String(cell(r,c.cat)||'אחר'), v=String(cell(r,c.ven)||'—');
+    cat[k]=(cat[k]||0)+a; ven[v]=(ven[v]||0)+a;});
+
+  var h='';
+  if(pending.length){
+    h+='<div class="card"><h2>ממתין לאישור ('+pending.length+')</h2>'+
+      '<div class="hint">נסרקו מהמייל. לא נספרים בספרים עד שתאשר.</div><table>';
+    pending.forEach(function(r){
+      var k=esc(cell(r,c.key));
+      h+='<tr><td><b>'+esc(cell(r,c.ven))+'</b><div class="hint">'+
+        esc(cell(r,c.date))+' · '+esc(cell(r,c.cat))+'</div></td>'+
+        '<td class="num">'+money(num(cell(r,c.amt)))+'</td>'+
+        '<td style="width:1px"><button class="btn p" onclick="review(\''+k+
+        '\',\'ok\')">אישור</button></td><td style="width:1px">'+
+        '<button class="btn" onclick="review(\''+k+
+        '\',\'no\')">מחיקה</button></td></tr>';});
+    h+='</table></div>';}
+
+  var pal=['var(--brand)','var(--violet)','var(--warn)','var(--info)',
+           'var(--pos)','var(--neg)'];
+  h+='<div class="grid c2"><div class="card"><h2>לפי קטגוריה</h2>'+
+    donut(Object.keys(cat).sort(function(a,b){return cat[b]-cat[a];})
+      .map(function(k,i){return {l:k,v:cat[k],c:pal[i%pal.length]};}))+
+    '</div><div class="card"><h2>לפי ספק</h2>'+hbars(ven,'var(--warn)')+
+    '</div></div>';
+
+  h+='<div class="card"><h2>כל ההוצאות — '+money(total)+'</h2>'+
+    '<div class="scroll"><table><tr><th>תאריך</th><th>ספק</th>'+
+    '<th>קטגוריה</th><th>סכום</th><th>מקור</th></tr>';
+  rs.slice().reverse().forEach(function(r){
+    h+='<tr><td style="white-space:nowrap;font-size:12px">'+
+      esc(cell(r,c.date))+'</td><td><b>'+esc(cell(r,c.ven))+'</b></td><td>'+
+      esc(cell(r,c.cat))+'</td><td class="num">'+money(num(cell(r,c.amt)))+
+      '</td><td><span class="badge b">'+esc(cell(r,c.orig)||'—')+
+      '</span></td></tr>';});
+  return h+'</table></div></div>';}
+
+function viewControl(){
+  var rc=DATA.recon;
+  /* The recon sheet has no SKU column — only an order number — and its
+     verdict header is "תוצאה", not "ממצא". Matching the wrong header name
+     silently made col() return -1 for every row, which made every charge
+     look unmatched regardless of whether it actually was. */
+  var c={date:col(rc,'תאריך'),amt:col(rc,'סכום'),ord:col(rc,'הזמנה'),
+    ver:col(rc,'תוצאה')};
+  var rs=rows(rc);
+  var bad=rs.filter(function(r){
+    return String(cell(r,c.ver)).indexOf('התאמה')<0;});
+  var h='<div class="card"><h2>התאמת חיובי ספק</h2><div class="hint">'+
+    'כל חיוב Stripe מול המכירה שלו. חיוב ללא מכירה = כסף שיצא בלי הכנסה.'+
+    '</div><div class="kpis" style="grid-template-columns:1fr 1fr">'+
+    kpi({ico:'✓',bg:'var(--possoft)',lab:'הותאמו',
+      val:String(rs.length-bad.length),foot:'מתוך '+rs.length})+
+    kpi({ico:'!',bg:bad.length?'var(--negsoft)':'var(--line2)',
+      lab:'חריגים',val:String(bad.length),cls:bad.length?'neg':'',
+      foot:'דורש בדיקה'})+'</div>';
+  if(bad.length){
+    h+='<table style="margin-top:6px"><tr><th>תאריך</th><th>הזמנה</th>'+
+      '<th>סכום</th><th>ממצא</th></tr>';
+    bad.forEach(function(r){
+      h+='<tr><td>'+esc(cell(r,c.date))+'</td><td>'+esc(cell(r,c.ord))+
+        '</td><td class="num">'+money(num(cell(r,c.amt)))+
+        '</td><td><span class="badge r">'+esc(cell(r,c.ver))+
+        '</span></td></tr>';});
+    h+='</table>';}
+  h+='</div>';
+
+  h+='<div class="card"><h2>פעולות</h2><div style="display:flex;gap:9px;'+
+    'flex-wrap:wrap;margin-top:12px">'+
+    '<button class="btn p" onclick="scanNow()">סריקת מייל עכשיו</button>'+
+    '<button class="btn" onclick="doExport()">ייצוא לאקסל</button>'+
+    (DATA.sheet?'<a class="btn" style="text-decoration:none" target="_blank" '+
+      'rel="noopener" href="'+esc(DATA.sheet)+'">פתיחת הגיליון</a>':'')+
+    '</div></div>';
+
+  h+='<div class="card"><h2>מקורות הנתונים</h2><table>'+
+    '<tr><td>שער דולר/שקל</td><td class="num">'+esc(DATA.rate||'—')+
+    '</td></tr><tr><td>שורות מכירה</td><td class="num">'+
+    rows(DATA.sales).length+'</td></tr><tr><td>שורות הוצאה</td>'+
+    '<td class="num">'+rows(DATA.expenses).length+'</td></tr></table></div>';
+  return h;}
+
+var VIEWS={overview:viewOverview,months:viewMonths,packages:viewPackages,
+  regions:viewRegions,sales:viewSales,expenses:viewExpenses,
+  control:viewControl};
+
+/* ---------------- shell ---------------- */
+function nav(){
+  var s='<div class="brand"><div class="logo">W</div><div><b>כספים</b>'+
+    '<span>Waverole</span></div></div>',p='',grp=null;
+  TABS.forEach(function(t){
+    if(t.grp&&t.grp!==grp){grp=t.grp;s+='<div class="sep">'+t.grp+'</div>';}
+    var cur=t.id===TAB?' aria-current="page"':'';
+    s+='<button'+cur+' onclick="go(\''+t.id+'\')"><span class="ico">'+
+      t.ico+'</span>'+t.name+'</button>';
+    p+='<button'+cur+' onclick="go(\''+t.id+'\')">'+t.name+'</button>';});
+  document.getElementById('side').innerHTML=s;
+  document.getElementById('pills').innerHTML=p;}
+
+function go(id){TAB=id;render();window.scrollTo(0,0);}
+
+function render(){
+  nav();
+  var t=TABS.filter(function(x){return x.id===TAB;})[0];
+  document.getElementById('ttl').textContent=t?t.name:'';
+  var v=document.getElementById('view');
+  if(!DATA){v.innerHTML='<div class="empty">טוען…</div>';return;}
+  document.getElementById('sub').textContent='עודכן '+(DATA.updated||'—');
+  try{v.innerHTML=VIEWS[TAB]();}
+  catch(err){v.innerHTML='<div class="card"><div class="note bad">'+
+    'שגיאה בהצגת המסך: '+esc(err&&err.message)+'</div></div>';}}
+
+function toast(m){
+  var el=document.getElementById('toast');
+  el.textContent=m;el.classList.add('on');
+  setTimeout(function(){el.classList.remove('on');},2600);}
+
+function fillCats(){
+  var list=(DATA&&DATA.categories&&DATA.categories.length)?DATA.categories
+    :['תשתית','כלים','שיווק','עמלות','אחר'];
+  document.getElementById('f_cat').innerHTML=list.map(function(c){
+    return '<option>'+esc(c)+'</option>';}).join('');}
+
+function boot(d){DATA=d;fillCats();render();}
+
+function call(fn,arg,ok){
+  if(BUSY) return; BUSY=true;
+  if(typeof google==='undefined'||!google.script){
+    BUSY=false;toast('מצב הדגמה — הפעולה לא נשלחה.');return;}
+  google.script.run
+    .withSuccessHandler(function(r){BUSY=false;if(ok) ok(r);})
+    .withFailureHandler(function(e){
+      BUSY=false;toast('שגיאה: '+(e&&e.message));})[fn](arg);}
+
+function review(key,decision){
+  call('api_reviewExpense',{key:key,decision:decision},function(r){
+    toast(decision==='ok'?'אושר':'נמחק'); if(r) boot(r);});}
+function scanNow(){
+  toast('סורק את המייל…');
+  call('api_scanNow',null,function(r){
+    toast('הסריקה הסתיימה'); if(r) boot(r);});}
+function doExport(){
+  toast('מייצא…');
+  call('api_export',null,function(r){
+    toast(r&&r.url?'הקובץ מוכן ב-Drive':'בוצע');
+    if(r&&r.url) window.open(r.url,'_blank');});}
+
+document.getElementById('refresh').onclick=function(){
+  toast('מרענן…'); call('api_data',null,boot);};
+document.getElementById('addBtn').onclick=function(){
+  document.getElementById('f_date').value=
+    new Date().toISOString().slice(0,10);
+  document.getElementById('dlg').showModal();};
+document.getElementById('camBtn').onclick=function(){
+  document.getElementById('camIn').click();};
+document.getElementById('camIn').onchange=function(ev){
+  var f=ev.target.files&&ev.target.files[0]; if(!f) return;
+  toast('מעלה קבלה…');
+  var rd=new FileReader();
+  rd.onload=function(){
+    call('api_uploadReceipt',{name:f.name,type:f.type,
+      data:String(rd.result).split(',')[1]},function(r){
+      toast('הקבלה נסרקה — אשר אותה בלשונית הוצאות');
+      if(r) boot(r);});};
+  rd.readAsDataURL(f);
+  ev.target.value='';};
+document.getElementById('frm').onsubmit=function(ev){
+  if(ev.submitter&&ev.submitter.value!=='ok') return;
+  call('api_addExpense',{
+    amount:document.getElementById('f_amt').value,
+    currency:document.getElementById('f_cur').value,
+    vendor:document.getElementById('f_ven').value,
+    category:document.getElementById('f_cat').value,
+    date:document.getElementById('f_date').value,
+    note:document.getElementById('f_note').value},function(r){
+    toast('ההוצאה נשמרה'); if(r) boot(r);});
+  document.getElementById('frm').reset();};
+
+render();
+if(window.DEMO){boot(window.DEMO);}
+else if(typeof google!=='undefined'&&google.script){
+  google.script.run.withSuccessHandler(boot)
+    .withFailureHandler(function(e){
+      document.getElementById('view').innerHTML='<div class="card">'+
+        '<div class="note bad">לא ניתן לטעון נתונים: '+esc(e&&e.message)+
+        '<br>ודא שהרצת <b>setup()</b> בעורך הסקריפט.</div></div>';})
+    .api_data();}
+</script>
+</body>
+</html>

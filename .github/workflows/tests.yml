@@ -36,3 +36,9 @@ jobs:
       # a regression here is sold to a customer before anyone sees it.
       - name: Route policy
         run: python test_route_policy.py
+
+      # The books decide what the business believes it earned. The money logic
+      # is pure, so there is no excuse for finding out it is wrong from a
+      # nightly run that already wrote the numbers down.
+      - name: Finance core
+        run: python -m unittest test_finance_core -v
