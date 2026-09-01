@@ -16,6 +16,14 @@ Route selection: QUALITY first, cheapness only when it earns the drop.
 Stock detection: if the page shows different GB/validity than the URL requested.
 Minimum size: packages under 1GB are not sold — flagged out-of-stock, not scraped.
 Profitability: 1GB packages allow up to -20% loss; all others require >=20% profit.
+Alternative validity: esim.dog sells each (GB x days) pair separately and drops
+  pairs without notice — ask for Italy 10GB/30d and it hands back 9GB. So a
+  10GB+ row that is out of stock or has stopped paying is retried at the other
+  days in its band, SAME GB, preferring 30d then 31d then downwards (21d floor
+  for 10-19GB, 25d for 20GB and up, never past 31d). A row that fell back
+  returns to 30d as soon as 30d is sellable again. What is adopted is written
+  into the LINK as well as the days column — the purchase bot buys from the
+  link and refuses an order when the two disagree.
 Regional codes: A=mini, B=grande (e.g. 1.0A.10, 1.0B.5).
 """
 
@@ -103,6 +111,35 @@ BLOCKED_ROUTES = {'Amber'}
 MIN_SELLABLE_GB = 1.0
 BELOW_MIN_LABEL = 'מתחת ל-1GB'
 
+# ── Alternative-validity fallback (owner's policy, 2026-09-01) ───────────────
+# esim.dog prices every (GB × days) pair on its own and does not offer them
+# all. Italy 10GB exists at 31d, 25d and 21d but NOT at 30d — ask for 30d and
+# the site quietly hands back 9GB instead. Finding the day that still carries
+# the size was the owner's manual job (Greece 10GB sits at 25d, Italy 10GB at
+# 31d, Greece 30GB at 21d, all set by hand); this automates that hunt.
+#
+# His rules, in his words:
+#   * the GB never moves. Only the days do. A size the site no longer sells is
+#     out of stock and stays out of stock — no number of days brings it back.
+#   * 30 days is the product on everything 10GB and up. The alternatives keep
+#     a package on sale when 30d cannot; they do not replace it, so a row that
+#     fell back returns to 30d the moment 30d is in stock and pays again.
+#   * order of preference 30, then 31, then downwards.
+#   * a floor per size, because a three-week plan sold as a monthly one is a
+#     different product: 21 days for 10-19GB, 25 days for 20GB and up.
+#   * nothing above 31 days is even looked at. 45/60/90d are dearer by
+#     construction and we would never sell them at a monthly price.
+# Inside that band esim.dog's own validity chips are exactly 21, 25, 30 and 31
+# (read off the live page, 2026-09-01), so the whole search is ≤3 extra reads.
+FALLBACK_MIN_GB = 10.0
+FALLBACK_DAYS = (30, 31, 25, 21)          # already in preference order
+FALLBACK_DAY_FLOORS = ((20.0, 25), (10.0, 21))   # (from this size, this floor)
+
+# The owner's profitability bar, lifted out of run() so the fallback judges a
+# candidate by exactly the same rule that judges the package it would replace.
+PROFIT_MIN_PCT = 20.0
+PROFIT_MIN_PCT_1GB = -20.0   # 1GB plans are a loss leader; a 20% loss is allowed
+
 # How long the scrape may run before it stops itself and saves what it has.
 # The workflow allows more than this, deliberately: a run killed from OUTSIDE
 # dies at an arbitrary point with nothing able to report what it skipped,
@@ -187,6 +224,88 @@ def route_disqualified(info: str) -> str:
     if re.search(r'\bESSENTIAL\s+COVERAGE\b', info, re.IGNORECASE):
         return "Essential Coverage tier"
     return ""
+
+
+def profit_floor_pct(gb: Optional[float]) -> float:
+    """The profit percentage a package of this size has to clear."""
+    return PROFIT_MIN_PCT_1GB if (gb is not None and gb <= 1) else PROFIT_MIN_PCT
+
+
+def is_profitable(my_price: Optional[float], buy: Optional[float],
+                  gb: Optional[float]) -> bool:
+    """Does this buy price still pay at our sell price?
+
+    A row with no sell price of its own is not judged — the owner has not
+    priced it yet, and calling that 'unprofitable' would pull rows off sale
+    for the crime of being new.
+    """
+    if not my_price or not buy:
+        return True
+    return ((my_price - buy) / buy) * 100.0 >= profit_floor_pct(gb)
+
+
+def fallback_day_floor(gb: float) -> int:
+    """Shortest validity we will sell this size as a monthly package."""
+    for min_gb, floor in FALLBACK_DAY_FLOORS:
+        if gb >= min_gb:
+            return floor
+    return FALLBACK_DAYS[0]
+
+
+def fallback_days(gb: Optional[float], current: Optional[int] = None) -> List[int]:
+    """Validities to try for a `gb` package, best first. [] = leave it alone.
+
+    Below FALLBACK_MIN_GB the answer is always [] — the short-trip packages
+    (1GB/1d, 3GB/15d) are chosen for a trip length, and swapping their days
+    would sell a different product, not the same one at a better price.
+
+    `current` is included even when it sits under its own floor: the owner
+    hand-picked 21 days for the 30GB Greece row, and a policy that refuses to
+    keep what he chose would pull a working package off sale to enforce a
+    rule about what to SEARCH.
+    """
+    if gb is None or gb < FALLBACK_MIN_GB:
+        return []
+    floor = fallback_day_floor(gb)
+    days = [d for d in FALLBACK_DAYS if d >= floor]
+    if current and current not in days and current <= FALLBACK_DAYS[1]:
+        days.append(current)
+    return days
+
+
+def with_validity(url: str, days: int) -> str:
+    """The same link, asking for a different number of days.
+
+    Only the one parameter moves. Everything else the owner put in the link —
+    the route pin in the fragment (#route=black), the region, a stray param —
+    is carried through untouched, because this URL is written back into the
+    sheet and the purchase bot buys from exactly it.
+    """
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query)
+    query['validity'] = [str(days)]
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
+def force_fixed_gb_tab(url: str) -> str:
+    """Pin country links to the fixed-GB tab.
+
+    esim.dog reads `data`/`validity` only while tab=fixedgb is set. Without it
+    the page swings to the Unlimited tab, ignores the size entirely and prices
+    a completely different product — Greece 30d read $57.05 that way against
+    $3.41 for the package we actually sell. Every link in the sheet already
+    carries the tab today; this is here so the day a new one does not, the
+    scraper refuses to read the wrong product instead of believing it.
+    """
+    parsed = urlparse(url)
+    path = parsed.path.strip('/')
+    if not (len(path) == 2 and path.isalpha()):
+        return url                      # /regions and friends have no such tab
+    query = parse_qs(parsed.query)
+    if not query.get('data'):
+        return url                      # a partial link selects nothing anyway
+    query['tab'] = ['fixedgb']
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
 
 def col_letter(idx: int) -> str:
@@ -660,9 +779,9 @@ class ESIMScraper:
 
     async def scrape(self, url: str, variant: str = "") -> Dict:
         print(f"\n🔗 {url}")
-        clean_url = force_vpn_false(url)
+        clean_url = force_vpn_false(force_fixed_gb_tab(url))
         if clean_url != url:
-            print("  🔐 Forced vpn=false")
+            print(f"  🔐 Normalised link: {clean_url}")
         info = parse_url(clean_url)
 
         async with async_playwright() as p:
@@ -742,6 +861,103 @@ class ESIMScraper:
         r['note'] = (r.get('note', '') + f' ⚠️ קריאה לא יציבה ({v1}/{v2}/{v3})').strip()
         print(f"  ⚠️  Unstable ({v1}/{v2}/{v3}) — took lowest {v}")
         return r
+
+    # ── alternative validity ─────────────────────────────────────
+    async def find_alternative(self, it: Dict, primary: Dict,
+                               deadline: float) -> Optional[Dict]:
+        """Look for the same package sold over a different number of days.
+
+        Called for every 10GB+ row, not only the broken ones, because the
+        policy runs both ways: it moves a row off 30 days when 30 days stops
+        working, and moves it back the moment 30 days works again. A row that
+        is already on its best day and paying costs nothing here — the primary
+        read has answered the question and no page is opened.
+
+        Returns the winning read plus the link that produces it, or None to
+        keep whatever the primary read found.
+        """
+        def val(x):
+            try:
+                return float(str(x).replace('$', '').replace(',', ''))
+            except Exception:
+                return None
+
+        req = parse_url(it['link'])
+        req_gb = val(req.get('gb'))
+        current = int(req['validity']) if str(req.get('validity') or '').isdigit() else None
+        days = fallback_days(req_gb, current)
+        if not days:
+            return None
+
+        my_price = val(it['my_price'])
+
+        def sellable(res: Dict) -> bool:
+            return bool(res.get('price')) and not res.get('out_of_stock') \
+                and is_profitable(my_price, val(res['price']), req_gb)
+
+        primary_ok = sellable(primary)
+        if primary_ok and current == days[0]:
+            return None                       # already on 30d and it pays
+
+        # No price AND nothing wrong that we can name is a failed read, not a
+        # verdict. Searching on it would move a package on the strength of a
+        # page that did not load, so the row keeps its value and is retried
+        # next run, exactly as before.
+        #
+        # No price WITH out_of_stock set is a verdict, and it must be searched:
+        # Italy's 10GB/30d link lands on a 9GB page whose only route is capped
+        # at 1 Mbps, so it reads no price at all — while 10GB/31d, one probe
+        # away, is a full-speed package we sell. Treating that silence as a
+        # read failure is how the search would have been switched off on the
+        # very rows it was written for.
+        if not primary.get('price') and not primary.get('out_of_stock'):
+            return None
+
+        # A page that answers with a different GB is NOT evidence that the size
+        # is gone, however much it looks like it, and skipping the search on it
+        # turns this whole thing off exactly where it is needed: Italy answers
+        # the 10GB/30d link with 9GB while still selling 10GB at 31d, 25d and
+        # 21d. What the site withdraws is a (size × days) PAIR. So the
+        # substitution is a reason to search, never a reason not to.
+        why = ("not on 30d" if primary_ok else
+               "out of stock" if primary.get('out_of_stock') else "unprofitable")
+        print(f"  🔎 {req_gb:g}GB {current}d is {why} — trying "
+              f"{', '.join(str(d) + 'd' for d in days if d != current)}")
+
+        for d in days:
+            if d == current:
+                # Reached the day we already hold. Everything ranked above it
+                # was tried and lost, so if today's read is fine it wins.
+                if primary_ok:
+                    return None
+                continue
+            if _time.time() > deadline:
+                print("  ⏳ out of time — stopping the search")
+                break
+
+            url = with_validity(it['link'], d)
+            cand = await self.scrape(url, it['variant'])
+            if not sellable(cand):
+                reason = ("out of stock" if cand.get('out_of_stock')
+                          else "no price" if not cand.get('price') else "unprofitable")
+                print(f"    {d}d: {cand.get('price') or '—'} — {reason}")
+                continue
+
+            # One confirming read before this goes in the sheet. The probe is
+            # a single read where the main path takes two or three, and this
+            # link is what the purchase bot will buy from tomorrow: a flicker
+            # is not a reason to move a package.
+            again = await self.scrape(url, it['variant'])
+            if not (again.get('price') and abs((val(again['price']) or -1)
+                                               - (val(cand['price']) or -2)) < 0.001):
+                print(f"    {d}d: {cand['price']} did not repeat "
+                      f"({again.get('price')}) — not taken")
+                continue
+
+            print(f"  ✅ {d}d at {cand['price']} — switching from {current}d")
+            return {'res': cand, 'link': url, 'days': d, 'from_days': current}
+
+        return None
 
     # ── sheet I/O ────────────────────────────────────────────────
     def read_rows(self):
@@ -874,6 +1090,14 @@ class ESIMScraper:
             dt = _time.time() - t_pkg
             if dt > 60:
                 print(f"  🐌 Row {r} took {dt:.0f}s")
+
+            # Same GB, different days. Runs before the out-of-stock and
+            # profitability handling below, because its whole purpose is to
+            # answer those two verdicts with a package we CAN sell instead of
+            # taking the row off the site.
+            alt = await self.find_alternative(it, res, deadline)
+            if alt:
+                res = alt['res']
             new_price = res['price']
 
             if new_price is None:
@@ -951,6 +1175,18 @@ class ESIMScraper:
                 if oc and not is_real:
                     put(r, 'changed', "")
 
+            # The link is the package's identity to the purchase bot — it
+            # parses data/validity straight out of it and refuses to buy when
+            # they disagree with the GB/days columns. Writing the days without
+            # the link would leave the two describing different packages and
+            # stop every order on this row.
+            if alt:
+                put(r, 'link', alt['link'])
+                put(r, 'changed',
+                    f"↔ {alt['from_days']}d → {alt['days']}d ({new_price})")
+                put(r, 'last_change', datetime.now().strftime("%Y-%m-%d"))
+                print(f"  🔗 Row {r}: link now {alt['link']}")
+
             # ── Profitability check ──
             my_price_val = to_val(it['my_price'])
             if my_price_val and new_val:
@@ -964,22 +1200,12 @@ class ESIMScraper:
                     f"{emoji} {sign}${abs(profit_abs):.2f} ({sign}{abs(profit_pct):.1f}%)")
 
                 gb_num = to_val(res['gb'].replace('gb', '')) if res['gb'] else None
-                is_1gb = gb_num is not None and gb_num <= 1
-
-                if is_1gb:
-                    # 1GB: flag if loss exceeds 20%
-                    if profit_pct < -20:
-                        put(r, 'stock', 'לא רווחי')
-                        print(f"  💸 Row {r}: 1GB unprofitable ({profit_pct:+.1f}%)")
-                    else:
-                        put(r, 'stock', '')
+                if is_profitable(my_price_val, new_val, gb_num):
+                    put(r, 'stock', '')
                 else:
-                    # All others: flag if profit below 20%
-                    if profit_pct < 20:
-                        put(r, 'stock', 'לא רווחי')
-                        print(f"  💸 Row {r}: unprofitable ({profit_pct:+.1f}%)")
-                    else:
-                        put(r, 'stock', '')
+                    put(r, 'stock', 'לא רווחי')
+                    print(f"  💸 Row {r}: unprofitable ({profit_pct:+.1f}%, "
+                          f"needs {profit_floor_pct(gb_num):+.0f}%)")
             else:
                 put(r, 'stock', '')
 
