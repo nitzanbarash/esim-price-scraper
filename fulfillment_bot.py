@@ -76,6 +76,14 @@ LOOKBACK_DAYS = 7          # only consider emails from the last week
 IMAP_TIMEOUT = 60
 HEADER_BATCH = 200         # message headers per IMAP round-trip (see _headers)
 TZ = ZoneInfo("Asia/Jerusalem")
+ALERT_PREFIX = "[fulfillment bot] "
+# How hard we try to tell the site an eSIM email went out. An unconfirmed send
+# leaves the ledger entry open, and an open entry is mailed AGAIN next sweep —
+# so this POST failing once is what sends a buyer a second copy of their eSIM.
+LEDGER_CONFIRM_ATTEMPTS = 3
+# Order ids and addresses go into an IMAP SEARCH command verbatim. Anything
+# that could close the quoting is not searched for at all.
+SAFE_IMAP_ATOM = re.compile(r"^[A-Za-z0-9._%+@-]+$")
 
 # Both live formats seen in real delivery emails: ?session_id=cs_live_... and
 # ?payment_intent=pi_... (older orders).
@@ -132,7 +140,7 @@ def alert(subject: str, body: str):
         msg = MIMEText(body, "plain", "utf-8")
         msg["From"] = GMAIL_USER
         msg["To"] = ALERTS_EMAIL
-        msg["Subject"] = f"[fulfillment bot] {subject}"
+        msg["Subject"] = f"{ALERT_PREFIX}{subject}"
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
             s.starttls()
             s.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
@@ -255,6 +263,7 @@ class Inbox:
         log.info(f"searching folder: {folder}")
         # imaplib needs the mailbox name quoted when it contains spaces.
         self.box.select(f'"{folder}"' if " " in folder else folder)
+        self._mailed: dict[tuple[str, str], bool] = {}   # see already_mailed_to
 
     def _headers(self, uids: list[str]) -> dict:
         """SUBJECT+FROM for many messages, one round-trip per HEADER_BATCH.
@@ -325,6 +334,46 @@ class Inbox:
             if d := parse_delivery(uid, msg):
                 out.append(d)
         return out
+
+    def already_mailed_to(self, order_id: str, to: str) -> bool:
+        """True if this buyer's 'your eSIM is ready' email is already in Sent.
+
+        The delivery ledger is meant to answer this, but it only knows what the
+        confirming POST managed to tell it: when that POST is lost the entry
+        stays open even though the buyer already has their eSIM, and the next
+        sweep mails them a second copy. The mailbox has no such blind spot —
+        what went out is in Sent whatever the site believes. The folder
+        selected in __init__ is All Mail, so Sent is already in scope.
+        """
+        key = (order_id, to.lower())
+        if key in self._mailed:
+            return self._mailed[key]
+        found = False
+        if SAFE_IMAP_ATOM.match(order_id) and SAFE_IMAP_ATOM.match(to):
+            try:
+                typ, data = self.box.uid(
+                    "search", None,
+                    f'(FROM "{GMAIL_USER}" TO "{to}" HEADER SUBJECT "{order_id}")')
+                uids = ([b.decode() for b in (data[0] or b"").split()]
+                        if typ == "OK" else [])
+                # An ALERT about this order is also from us and also names it in
+                # the subject. It is addressed to the owner, so TO normally
+                # separates the two — but when the owner is the buyer (internal
+                # orders) it does not, and mistaking an alert for the customer's
+                # copy would withhold the eSIM. The prefix always separates them.
+                for head in self._headers(uids).values():
+                    if not _decode(head.get("Subject")).startswith(ALERT_PREFIX):
+                        found = True
+                        break
+            except Exception as e:
+                # "Unknown", answered as "not yet". Withholding on a failed
+                # lookup would break the one promise this bot makes — every
+                # buyer gets their eSIM — to avoid a duplicate that only
+                # happens when the ledger confirmation ALSO failed.
+                log.warning(f"order {order_id}: cannot read Sent ({_redact(str(e))}) "
+                            f"— treating as not yet mailed")
+        self._mailed[key] = found
+        return found
 
     def flag(self, uid: str):
         self.box.uid("store", uid, "+FLAGS", "(\\Flagged)")
@@ -857,19 +906,33 @@ def check_stale_pending():
     _mark_alerted(marks)
 
 
-def report_email_sent(order_id: str, ok: bool, error: str = "", address: str = ""):
-    """Close (or keep open) this order's ledger entry."""
+def report_email_sent(order_id: str, ok: bool, error: str = "", address: str = "") -> bool:
+    """Close (or keep open) this order's ledger entry. True if the site took it.
+
+    Retried, because this POST is not bookkeeping — it is what stops the buyer
+    being mailed again. A single lost confirmation used to be the whole story
+    behind a duplicate eSIM email: the send succeeded, the site never heard so,
+    and the next sweep dutifully sent a second copy.
+    """
     payload = {"order_id": order_id, "email_sent": bool(ok)}
     if error:
         payload["error"] = error[:300]
     if ok and address:
         payload["customer_email"] = address
-    try:
-        r = requests.post(ORDERS_URL, json=payload, timeout=20,
-                          headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
-        r.raise_for_status()
-    except Exception as e:
-        log.warning(f"order {order_id}: ledger update failed: {_redact(str(e))}")
+    last = None
+    for attempt in range(1, LEDGER_CONFIRM_ATTEMPTS + 1):
+        try:
+            r = requests.post(ORDERS_URL, json=payload, timeout=20,
+                              headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+            r.raise_for_status()
+            return True
+        except Exception as e:
+            last = e
+            if attempt < LEDGER_CONFIRM_ATTEMPTS:
+                time.sleep(2 * attempt)
+    log.warning(f"order {order_id}: ledger update failed after "
+                f"{LEDGER_CONFIRM_ATTEMPTS} tries: {_redact(str(last))}")
+    return False
 
 
 def _delivery_from_record(o: dict) -> dict:
@@ -892,6 +955,12 @@ def deliver_pending_emails(ws):
     SMTP refused, address missing at the time) is retried here until it
     succeeds. When the site has no address on file we look it up in the
     receipts sheet, so filling the Mail column by hand is a complete repair.
+
+    "Owed" is the site's opinion, and it is wrong in one direction: an order
+    whose email went out but whose confirmation was lost still looks owed, and
+    retrying THAT sends the buyer a second eSIM. So before every send we ask
+    the mailbox — which cannot be wrong about what it sent — and close the
+    entry instead of mailing again.
     """
     owed = awaiting_email_orders()
     if not owed:
@@ -912,24 +981,48 @@ def deliver_pending_emails(ws):
     except Exception as e:
         log.warning(f"could not read addresses from the sheet: {e}")
 
-    for o in owed:
-        oid = str(o.get("order_id", ""))
-        to = str(o.get("customer_email", "")).strip() or by_order.get(oid, "")
-        if not to:
-            # Nothing to send to. Keep the entry open and let the site escalate
-            # to the owner — filling the sheet's Mail column repairs it.
-            report_email_sent(oid, False, "no customer address on file")
-            log.warning(f"order {oid}: still no customer address — email deferred")
-            continue
-        try:
-            send_customer_email(to, oid, str(o.get("order_url", "")),
-                                _delivery_from_record(o), esim=o.get("esim") or {},
-                                lang=str(o.get("lang", "")), total=o.get("paid_usd"))
-            report_email_sent(oid, True, address=to)
-            log.info(f"order {oid}: eSIM email delivered (ledger closed)")
-        except Exception as e:
-            report_email_sent(oid, False, str(e))
-            log.warning(f"order {oid}: eSIM email failed, will retry: {_redact(str(e))}")
+    # Worth a mailbox connection only now that there is something to resend.
+    # main() has already closed its own by the time the sweep runs, and the
+    # sweep must keep working when that one could not be opened at all.
+    inbox = None
+    try:
+        inbox = _open_inbox(attempts=1)
+    except Exception as e:
+        log.warning(f"cannot open the mailbox to check for earlier sends "
+                    f"({_redact(str(e))}) — sending on the ledger's word alone")
+
+    try:
+        for o in owed:
+            oid = str(o.get("order_id", ""))
+            to = str(o.get("customer_email", "")).strip() or by_order.get(oid, "")
+            if not to:
+                # Nothing to send to. Keep the entry open and let the site escalate
+                # to the owner — filling the sheet's Mail column repairs it.
+                report_email_sent(oid, False, "no customer address on file")
+                log.warning(f"order {oid}: still no customer address — email deferred")
+                continue
+            if inbox is not None and inbox.already_mailed_to(oid, to):
+                # The buyer has it; only the bookkeeping is behind. Close the
+                # entry — and if even that will not go through, still do not
+                # send: a stale ledger row is cheaper than a second eSIM.
+                if report_email_sent(oid, True, address=to):
+                    log.info(f"order {oid}: already in Sent — ledger closed, not resent")
+                else:
+                    log.warning(f"order {oid}: already in Sent but the ledger would "
+                                f"not close — still not resending")
+                continue
+            try:
+                send_customer_email(to, oid, str(o.get("order_url", "")),
+                                    _delivery_from_record(o), esim=o.get("esim") or {},
+                                    lang=str(o.get("lang", "")), total=o.get("paid_usd"))
+                report_email_sent(oid, True, address=to)
+                log.info(f"order {oid}: eSIM email delivered (ledger closed)")
+            except Exception as e:
+                report_email_sent(oid, False, str(e))
+                log.warning(f"order {oid}: eSIM email failed, will retry: {_redact(str(e))}")
+    finally:
+        if inbox is not None:
+            inbox.close()
 
 
 def report_fulfilled(order_id: str, delivery: dict, details: dict):
