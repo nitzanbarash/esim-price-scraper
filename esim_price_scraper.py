@@ -111,29 +111,46 @@ BLOCKED_ROUTES = {'Amber'}
 MIN_SELLABLE_GB = 1.0
 BELOW_MIN_LABEL = 'מתחת ל-1GB'
 
-# ── Alternative-validity fallback (owner's policy, 2026-09-01) ───────────────
-# esim.dog prices every (GB × days) pair on its own and does not offer them
-# all. Italy 10GB exists at 31d, 25d and 21d but NOT at 30d — ask for 30d and
-# the site quietly hands back 9GB instead. Finding the day that still carries
-# the size was the owner's manual job (Greece 10GB sits at 25d, Italy 10GB at
-# 31d, Greece 30GB at 21d, all set by hand); this automates that hunt.
+# ── Cheapest-validity search (owner's policy, 2026-09-07) ─────────────────
+# Supersedes the 2026-09-01 "keep it on 30 days" rule. That one asked which
+# validity still WORKS and stopped at the first one that did; this one asks
+# which validity is CHEAPEST, and has to price them all to answer.
 #
-# His rules, in his words:
-#   * the GB never moves. Only the days do. A size the site no longer sells is
-#     out of stock and stays out of stock — no number of days brings it back.
-#   * 30 days is the product on everything 10GB and up. The alternatives keep
-#     a package on sale when 30d cannot; they do not replace it, so a row that
-#     fell back returns to 30d the moment 30d is in stock and pays again.
-#   * order of preference 30, then 31, then downwards.
-#   * a floor per size, because a three-week plan sold as a monthly one is a
-#     different product: 21 days for 10-19GB, 25 days for 20GB and up.
-#   * nothing above 31 days is even looked at. 45/60/90d are dearer by
-#     construction and we would never sell them at a monthly price.
-# Inside that band esim.dog's own validity chips are exactly 21, 25, 30 and 31
-# (read off the live page, 2026-09-01), so the whole search is ≤3 extra reads.
-FALLBACK_MIN_GB = 10.0
-FALLBACK_DAYS = (30, 31, 25, 21)          # already in preference order
-FALLBACK_DAY_FLOORS = ((20.0, 25), (10.0, 21))   # (from this size, this floor)
+# The reason it has to is that esim.dog's prices do not rise with days. Germany
+# 1GB, read off the live page 2026-09-07:
+#
+#       1d $1.99      7d $0.65      15d $1.07      30d $2.99
+#
+# The cheapest is neither the shortest nor the longest, and 30d — the day the
+# old rule would have preferred and stopped at — costs 4.6x the 7d price for
+# exactly the same gigabyte. Stopping early on a curve shaped like that buys
+# the dearest option in the band.
+#
+# The owner's bands (his numbers). A larger package needs more days to be a
+# credible product, so the floor climbs with size:
+#
+#       1-2GB  → from  1 day        ≤10GB  → from 14 days       21GB+ → from 25 days
+#       ≤5GB   → from  7 days        ≤20GB  → from 21 days
+#
+# The ceiling is 31 everywhere: 45/60/90d are dearer by construction and we
+# would never sell them at a monthly price.
+DAY_BANDS = ((2.0, 1), (5.0, 7), (10.0, 14), (20.0, 21))
+DAY_FLOOR_ABOVE_BANDS = 25          # 21GB and up
+DAY_CEILING = 31
+
+# Which days are worth asking for. esim.dog's visible validity chips are only
+# 1/7/15/30/90, but the URL accepts any number and a package exists at whatever
+# (GB x days) pairs it was priced at — 21d, 25d and 31d are real and unchipped
+# (Greece 10GB sits at 25d, Italy 10GB at 31d). Probing all 31 integers would
+# cost ~1,600 extra page reads a run across 82 rows; this ladder costs ~600,
+# and every rung on it is a day the site has actually been seen to sell.
+DAY_LADDER = (1, 3, 5, 7, 10, 14, 15, 20, 21, 25, 30, 31)
+
+# The ladder for one row is a set of independent reads, and scrape() launches
+# its own browser per call and shares nothing, so they go out together. The
+# outer loop stays sequential — this is what keeps a 12-rung scan costing about
+# two reads instead of twelve, and the 45-minute budget survivable.
+DAY_SCAN_CONCURRENCY = int(os.environ.get('DAY_SCAN_CONCURRENCY', 4))
 
 # The owner's profitability bar, lifted out of run() so the fallback judges a
 # candidate by exactly the same rule that judges the package it would replace.
@@ -245,32 +262,31 @@ def is_profitable(my_price: Optional[float], buy: Optional[float],
 
 
 def fallback_day_floor(gb: float) -> int:
-    """Shortest validity we will sell this size as a monthly package."""
-    for min_gb, floor in FALLBACK_DAY_FLOORS:
-        if gb >= min_gb:
+    """Shortest validity the owner is willing to sell this size as."""
+    for max_gb, floor in DAY_BANDS:
+        if gb <= max_gb:
             return floor
-    return FALLBACK_DAYS[0]
+    return DAY_FLOOR_ABOVE_BANDS
 
 
 def fallback_days(gb: Optional[float], current: Optional[int] = None) -> List[int]:
-    """Validities to try for a `gb` package, best first. [] = leave it alone.
+    """Every validity worth pricing for a `gb` package. [] = leave it alone.
 
-    Below FALLBACK_MIN_GB the answer is always [] — the short-trip packages
-    (1GB/1d, 3GB/15d) are chosen for a trip length, and swapping their days
-    would sell a different product, not the same one at a better price.
+    The order carries no preference any more — the caller reads all of them and
+    keeps the cheapest — so this returns them in plain ascending order.
 
-    `current` is included even when it sits under its own floor: the owner
-    hand-picked 21 days for the 30GB Greece row, and a policy that refuses to
-    keep what he chose would pull a working package off sale to enforce a
-    rule about what to SEARCH.
+    `current` is always included, even when it sits below its own floor: the
+    owner hand-picked 21 days for the 30GB Greece row, and the day we already
+    hold has to be in the comparison or a "cheapest" verdict is being reached
+    without pricing the incumbent.
     """
-    if gb is None or gb < FALLBACK_MIN_GB:
+    if gb is None:
         return []
     floor = fallback_day_floor(gb)
-    days = [d for d in FALLBACK_DAYS if d >= floor]
-    if current and current not in days and current <= FALLBACK_DAYS[1]:
+    days = [d for d in DAY_LADDER if floor <= d <= DAY_CEILING]
+    if current and current not in days and current <= DAY_CEILING:
         days.append(current)
-    return days
+    return sorted(days)
 
 
 def with_validity(url: str, days: int) -> str:
@@ -865,16 +881,27 @@ class ESIMScraper:
     # ── alternative validity ─────────────────────────────────────
     async def find_alternative(self, it: Dict, primary: Dict,
                                deadline: float) -> Optional[Dict]:
-        """Look for the same package sold over a different number of days.
+        """Price the same package over every validity in its band; keep the cheapest.
 
-        Called for every 10GB+ row, not only the broken ones, because the
-        policy runs both ways: it moves a row off 30 days when 30 days stops
-        working, and moves it back the moment 30 days works again. A row that
-        is already on its best day and paying costs nothing here — the primary
-        read has answered the question and no page is opened.
+        Called for every row, not only the broken ones, because the policy runs
+        both ways: it moves a row onto a cheaper day, and moves it back the
+        moment the day it left becomes the cheaper one again.
 
-        Returns the winning read plus the link that produces it, or None to
-        keep whatever the primary read found.
+        Two things changed here on 2026-09-07, and they are the same change:
+        the search no longer stops at the first day that works, so it can no
+        longer be fooled by a price curve that dips in the middle (Germany 1GB:
+        $1.99/1d, $0.65/7d, $1.07/15d, $2.99/30d). Reading the whole ladder is
+        what makes "cheapest" mean anything — and the reads go out together,
+        because twelve sequential page loads per row would cost more than the
+        whole run has.
+
+        Only the winner is confirmed. The old code confirmed every candidate it
+        liked, which across a twelve-rung ladder would have doubled the run for
+        nothing: one repeat read of the single link about to be written into the
+        sheet is what actually protects the purchase bot from a flicker.
+
+        Returns the winning read plus the link that produces it, or None to keep
+        whatever the primary read found.
         """
         def val(x):
             try:
@@ -896,13 +923,11 @@ class ESIMScraper:
                 and is_profitable(my_price, val(res['price']), req_gb)
 
         primary_ok = sellable(primary)
-        if primary_ok and current == days[0]:
-            return None                       # already on 30d and it pays
 
         # No price AND nothing wrong that we can name is a failed read, not a
         # verdict. Searching on it would move a package on the strength of a
         # page that did not load, so the row keeps its value and is retried
-        # next run, exactly as before.
+        # next run.
         #
         # No price WITH out_of_stock set is a verdict, and it must be searched:
         # Italy's 10GB/30d link lands on a 9GB page whose only route is capped
@@ -913,49 +938,66 @@ class ESIMScraper:
         if not primary.get('price') and not primary.get('out_of_stock'):
             return None
 
-        # A page that answers with a different GB is NOT evidence that the size
-        # is gone, however much it looks like it, and skipping the search on it
-        # turns this whole thing off exactly where it is needed: Italy answers
-        # the 10GB/30d link with 9GB while still selling 10GB at 31d, 25d and
-        # 21d. What the site withdraws is a (size × days) PAIR. So the
-        # substitution is a reason to search, never a reason not to.
-        why = ("not on 30d" if primary_ok else
-               "out of stock" if primary.get('out_of_stock') else "unprofitable")
-        print(f"  🔎 {req_gb:g}GB {current}d is {why} — trying "
-              f"{', '.join(str(d) + 'd' for d in days if d != current)}")
+        # The day we already hold is the incumbent — but only if today's read of
+        # it is something we could actually sell.
+        best = ({'days': current, 'price': val(primary.get('price')),
+                 'res': primary, 'link': it['link']} if primary_ok else None)
 
-        for d in days:
-            if d == current:
-                # Reached the day we already hold. Everything ranked above it
-                # was tried and lost, so if today's read is fine it wins.
-                if primary_ok:
-                    return None
+        probe = [d for d in days if d != current]
+        if not probe:
+            return None
+        print(f"  🔎 {req_gb:g}GB — pricing {', '.join(str(d) + 'd' for d in probe)}"
+              f" against {current}d"
+              + ("" if primary_ok else " (which we cannot sell today)"))
+
+        sem = asyncio.Semaphore(DAY_SCAN_CONCURRENCY)
+
+        async def price_day(d: int) -> Tuple[int, Optional[Dict]]:
+            async with sem:
+                if _time.time() > deadline:
+                    return d, None
+                return d, await self.scrape(with_validity(it['link'], d), it['variant'])
+
+        found: List[Dict] = []
+        for d, cand in await asyncio.gather(*(price_day(d) for d in probe)):
+            if cand is None:
+                print(f"    {d}d: skipped — out of time")
                 continue
-            if _time.time() > deadline:
-                print("  ⏳ out of time — stopping the search")
-                break
-
-            url = with_validity(it['link'], d)
-            cand = await self.scrape(url, it['variant'])
             if not sellable(cand):
                 reason = ("out of stock" if cand.get('out_of_stock')
                           else "no price" if not cand.get('price') else "unprofitable")
                 print(f"    {d}d: {cand.get('price') or '—'} — {reason}")
                 continue
+            found.append({'days': d, 'price': val(cand['price']), 'res': cand,
+                          'link': with_validity(it['link'], d)})
+            print(f"    {d}d: {cand['price']}")
 
-            # One confirming read before this goes in the sheet. The probe is
-            # a single read where the main path takes two or three, and this
-            # link is what the purchase bot will buy from tomorrow: a flicker
-            # is not a reason to move a package.
-            again = await self.scrape(url, it['variant'])
-            if not (again.get('price') and abs((val(again['price']) or -1)
-                                               - (val(cand['price']) or -2)) < 0.001):
-                print(f"    {d}d: {cand['price']} did not repeat "
-                      f"({again.get('price')}) — not taken")
+        # Cheapest first. The day we already hold is the floor: once the list
+        # reaches a price that does not beat it, nothing further down can.
+        floor = best['price'] if best else None
+        for cand in sorted(found, key=lambda c: c['price']):
+            if floor is not None and cand['price'] >= floor - 0.001:
+                break
+            if _time.time() > deadline:
+                print("  ⏳ out of time — keeping the day we hold")
+                break
+
+            # One confirming read, on the candidate we are about to adopt. This
+            # link is what the purchase bot buys from tomorrow, so a price that
+            # will not repeat is a flicker, not a saving. A flicker drops us to
+            # the next-cheapest rather than ending the search — the whole ladder
+            # has already been paid for by this point.
+            again = await self.scrape(cand['link'], it['variant'])
+            if not (again.get('price')
+                    and abs((val(again['price']) or -1) - cand['price']) < 0.001):
+                print(f"    ✋ {cand['days']}d at {cand['res']['price']} did not "
+                      f"repeat ({again.get('price')}) — not taken")
                 continue
 
-            print(f"  ✅ {d}d at {cand['price']} — switching from {current}d")
-            return {'res': cand, 'link': url, 'days': d, 'from_days': current}
+            print(f"  ✅ {cand['days']}d at {cand['res']['price']} — "
+                  f"switching from {current}d")
+            return {'res': cand['res'], 'link': cand['link'],
+                    'days': cand['days'], 'from_days': current}
 
         return None
 
@@ -984,6 +1026,18 @@ class ESIMScraper:
         items = []
         for idx, row in enumerate(rows[1:], start=2):
             row = row + [""] * (width - len(row))
+            # A row names its supplier in 'מקור', and this scraper reads
+            # esim.dog and nothing else. The sheet now carries a second row
+            # per SKU for Germany — the same package as Stellar sells it,
+            # stacked under the same code — and those rows are comparison
+            # data, not pages to go and re-read. They are written without a
+            # link, so the check below would skip them anyway; saying it out
+            # loud means a Stellar row that later GAINS a link is still left
+            # alone instead of being scraped as an esim.dog page and stamped
+            # 'esim.dog' by the writer further down.
+            source = (row[col_index['source']] if 'source' in col_index else "").strip()
+            if source and source.lower() != 'esim.dog':
+                continue
             link = row[col_index['link']] if 'link' in col_index else ""
             if link and link.startswith("http"):
                 def _get(key):

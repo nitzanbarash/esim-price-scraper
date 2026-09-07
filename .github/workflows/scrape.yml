@@ -67,10 +67,20 @@ jobs:
       # so this limit is the backstop, deliberately above the budget. A run
       # killed here would die between two saves with nothing to say what it
       # skipped — which is why the budget is the smaller number.
+      # Raised 45 -> 58 on 2026-09-07, when the day search stopped asking "does
+      # 30 days still work?" and started asking "which day is cheapest?". The
+      # second question has to price the whole band: 530 extra page reads a run
+      # across 83 rows, about 13 minutes at DAY_SCAN_CONCURRENCY 5. The step cap
+      # moves with it and both still sit under the job's 70-minute ceiling.
       - name: Run scraper
-        timeout-minutes: 55
+        timeout-minutes: 65
         env:
-          SCRAPE_BUDGET_MIN: "45"
+          SCRAPE_BUDGET_MIN: "58"
+          # How many validities of ONE row are priced at once. Each scrape()
+          # launches its own browser and shares nothing, so these are safe to
+          # overlap; the runner has 2 cores, which is what keeps this at 5 and
+          # not 12.
+          DAY_SCAN_CONCURRENCY: "5"
           # The service-account JSON is stored as a repo secret, never in the code.
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: python esim_price_scraper.py

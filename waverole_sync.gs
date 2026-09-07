@@ -64,6 +64,7 @@ const HEADERS = {
   days:        ['זמן חבילה'],
   networks:    ['Networks'],
   breakout_ip: ['Breakout IP'],
+  source:      ['מקור'],                     // which supplier this row prices
   stock:       ['במלאי/רווחי'],              // empty = in stock
   fee:         ['סליקה'],
   price:       ['מחיר סופי', 'כולל מעמ'],    // FINAL customer price (incl. VAT + fee)
@@ -149,9 +150,26 @@ function num_(v) {
 function rowToPackage_(row, map) {
   const sku = String(row[map.sku] || '').trim();
   if (!sku || sku.indexOf('.') < 0) return null;    // not a package row
-  const pkg = { sku: sku };
+  // A SKU can occupy more than one row: the sheet now stacks the same
+  // package as each supplier sells it — esim.dog's row and Stellar's row,
+  // one above the other, under one code. Only the esim.dog row is what the
+  // site sells today. Without this, BOTH rows would be pushed under the same
+  // sku and the endpoint would keep whichever arrived last, quietly swapping
+  // a live package's price, GB and stock for a supplier we have not bought
+  // a single eSIM from.
+  const src = String(row[map.source] || '').trim();
+  if (src && src.toLowerCase() !== 'esim.dog') return null;
+  // A row with no customer price is a note to ourselves, not a product. Every
+  // one of the 82 live esim.dog rows carries one, so this turns nothing off
+  // today; what it buys is a comparison row that CANNOT become a storefront
+  // entry by accident. Before this, a priceless row was still posted — sku,
+  // GB, days and in_stock=true, just no price — which is how a 50GB Germany
+  // package nobody had priced yet would have appeared on the site the moment
+  // it was written down next to the one we actually sell.
   const price = num_(row[map.price]);
-  if (price !== null) pkg.price = price;
+  if (price === null) return null;
+  const pkg = { sku: sku };
+  pkg.price = price;
   pkg.sale = num_(row[map.sale]) || 0;
   pkg.in_stock = String(row[map.stock] || '').trim() === '';
   const days = num_(row[map.days]); if (days !== null) pkg.days = days;
