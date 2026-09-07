@@ -1027,9 +1027,9 @@ class ESIMScraper:
         for idx, row in enumerate(rows[1:], start=2):
             row = row + [""] * (width - len(row))
             # A row names its supplier in 'מקור', and this scraper reads
-            # esim.dog and nothing else. The sheet now carries a second row
-            # per SKU for Germany — the same package as Stellar sells it,
-            # stacked under the same code — and those rows are comparison
+            # esim.dog and nothing else. Most SKUs now carry a second row —
+            # the same package as Stellar sells it, stacked under the same
+            # code — and those rows are comparison
             # data, not pages to go and re-read. They are written without a
             # link, so the check below would skip them anyway; saying it out
             # loud means a Stellar row that later GAINS a link is still left

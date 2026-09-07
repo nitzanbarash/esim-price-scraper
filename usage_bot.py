@@ -100,6 +100,7 @@ NO_DISCOUNT = "-"
 PRICE_SHEET_ID = "108D3BUV-MNcIuRZuKUgb-E-b1Ra8moxWZZyI5JxnyRo"
 COL_PRICE_SKU = "חבילה (קוד)"
 COL_LIST_PRICE = "מחיר סופי"
+COL_PRICE_SOURCE = "מקור"
 
 
 def fetch_order_link(order_id: str) -> str:
@@ -284,8 +285,19 @@ def list_prices() -> dict:
         log.warning(f"price sheet has no {COL_PRICE_SKU!r}/{COL_LIST_PRICE!r} column")
         return {}
     si, pi = hdr.index(COL_PRICE_SKU), hdr.index(COL_LIST_PRICE)
+    # One SKU now spans more than one row — the sheet stacks the same package
+    # as each supplier sells it, under a single code. This map is keyed by SKU
+    # alone, so the LAST matching row wins: the moment a Stellar row carries a
+    # 'מחיר סופי', every discount on that package would silently be measured
+    # against a supplier we do not sell. Today the Stellar rows are unpriced
+    # and the bug is invisible, which is exactly why it is worth closing now.
+    oi = hdr.index(COL_PRICE_SOURCE) if COL_PRICE_SOURCE in hdr else -1
     out = {}
     for r in rows[1:]:
+        if oi >= 0:
+            src = (r[oi] if len(r) > oi else "").strip().lower()
+            if src and src != "esim.dog":
+                continue
         sku = (r[si] if len(r) > si else "").strip()
         price = _money(r[pi] if len(r) > pi else "")
         if sku and price:
