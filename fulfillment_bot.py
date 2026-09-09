@@ -870,15 +870,43 @@ def check_stale_pending():
         return
 
     due.sort(key=lambda x: -x[0])
-    lines = []
+    lines, suppliers = [], set()
     for age_min, o in due:
+        sup = str(o.get("supplier") or "esim.dog")
+        suppliers.add(sup)
         age = (f"{age_min:.0f} min" if age_min < 90
                else f"{age_min / 60:.1f} hours")
         lines.append(
             f"  {o.get('order_id', '?')}  -  {age} ago  -  "
-            f"${o.get('paid_usd', '?')}  -  SKU {o.get('sku', '?')}"
+            f"${o.get('paid_usd', '?')}  -  SKU {o.get('sku', '?')}  -  buys at {sup}"
         )
     n = len(due)
+    # Each buyer has its own fix. Sending the owner to the PC for a Stellar
+    # order (bought from the cloud, or by nobody yet) wastes the one thing
+    # this alert exists to save: the minutes before the customer writes in.
+    hints = []
+    if "esim.dog" in suppliers:
+        hints.append(
+            "esim.dog orders: either the purchase bot on the PC is down, or its "
+            "ledger holds a stuck claim.\n\n"
+            "OPEN THE BOT PANEL ON THE PC AND PRESS 5 (Orders).\n"
+            "That screen lists these orders, says why each one is stuck, and "
+            "fixes them: release a stuck claim, retry, or close an order you "
+            "have already handled yourself.\n\n"
+            "If the panel will not open:\n"
+            "1. The BOT row must say RUNNING (key 1 starts it; the watchdog "
+            "restarts it within 5 min).\n"
+            "2. In a command window:  venv\\Scripts\\python.exe -m bot.main --stuck\n"
+            "3. Bot running, nothing stuck, order still pending -> read bot.log."
+        )
+    others = sorted(suppliers - {"esim.dog"})
+    if others:
+        hints.append(
+            f"{', '.join(others)} orders: NOT the PC's job. That buyer runs in "
+            "GitHub Actions (or does not exist yet) - check its workflow runs, "
+            "or settle the order by hand. Nothing on the PC can buy or release "
+            "these."
+        )
     alert(
         f"{n} paid order{'s' if n > 1 else ''} waiting - nothing is buying "
         f"{'them' if n > 1 else 'it'}",
@@ -886,18 +914,7 @@ def check_stale_pending():
         f"{'are' if n > 1 else 'is'} still sitting in the site queue:\n\n"
         + "\n".join(lines) +
         (f"\n\n(plus {silent} older one(s) already reported)" if silent else "")
-        + "\n\n"
-        "Either the purchase bot on the PC is down, or its ledger holds a "
-        "stuck claim.\n\n"
-        "OPEN THE BOT PANEL ON THE PC AND PRESS 5 (Orders).\n"
-        "That screen lists these orders, says why each one is stuck, and "
-        "fixes them: release a stuck claim, retry, or close an order you "
-        "have already handled yourself.\n\n"
-        "If the panel will not open:\n"
-        "1. The BOT row must say RUNNING (key 1 starts it; the watchdog "
-        "restarts it within 5 min).\n"
-        "2. In a command window:  venv\\Scripts\\python.exe -m bot.main --stuck\n"
-        "3. Bot running, nothing stuck, order still pending -> read bot.log.\n\n"
+        + "\n\n" + "\n\n".join(hints) + "\n\n"
         f"Reminders for one order stop "
         f"{STALE_ALERT_LADDER_MIN[-1] // 60} hours after payment, fixed or "
         f"not - do not read silence as resolved. The Orders screen always "

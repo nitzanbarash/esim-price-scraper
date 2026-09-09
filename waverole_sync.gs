@@ -76,6 +76,11 @@ const HEADERS = {
 // Fields the sync cannot work without - missing => loud email, not silence.
 const REQUIRED_FIELDS = ['sku', 'price'];
 
+// The colours the owner already paints by hand (read off the live sheet
+// 2026-09-10): green = the row the site sells, grey = the other supplier's row.
+const ROW_CHOSEN_BG   = '#d8efd3';
+const ROW_UNCHOSEN_BG = '#f2f2f2';
+
 function setupTriggers() {
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('onEditPush')
@@ -321,6 +326,46 @@ function post_(packages) {
 // instant, a burst collapses into one push, and nothing piles up.
 const PENDING_ROWS_KEY = 'PENDING_SYNC_ROWS';
 
+// One tick per SKU, and the colours follow the tick.
+//
+// The owner ticks the Stellar row of a pair -> the esim.dog row loses its
+// tick and turns grey, the Stellar row turns green. Runs BEFORE the sync
+// reads the sheet, because pickRow_() resolves a two-tick pair to esim.dog -
+// the opposite of what was just asked for - and would push it before anyone
+// noticed. Programmatic writes do not re-fire onEdit, so this cannot loop.
+// Clearing a tick greys that row and changes nothing else (the site then
+// falls back to esim.dog for the SKU, as it always has).
+// Only a single-cell edit is handled: a pasted block that ticks both halves
+// of a pair has no "the one the owner meant", so it is left exactly as typed
+// and checkColumns will name it.
+function enforceChoice_(sheet, map, e) {
+  if (map.chosen === undefined || map.sku === undefined) return;
+  const col = map.chosen + 1;
+  if (e.range.getColumn() !== col || e.range.getNumRows() !== 1 ||
+      e.range.getNumColumns() !== 1) return;
+  const row = e.range.getRow();
+  if (row < 2) return;
+  const lastCol = Math.max.apply(null, Object.values(map)) + 1;   // paint A..last synced column only
+  const data = sheet.getRange(1, 1, sheet.getLastRow(), lastCol).getValues();
+  const sku = String(data[row - 1][map.sku] || '').trim();
+  if (!sku || sku.indexOf('.') < 0) return;
+  const ticked = String(data[row - 1][map.chosen] || '').trim() !== '';
+  if (!ticked) {
+    sheet.getRange(row, 1, 1, lastCol).setBackground(ROW_UNCHOSEN_BG);
+    SpreadsheetApp.flush();
+    return;
+  }
+  for (let r = 2; r <= data.length; r++) {
+    if (String(data[r - 1][map.sku] || '').trim() !== sku) continue;
+    const mine = r === row;
+    if (!mine && String(data[r - 1][map.chosen] || '').trim() !== '') {
+      sheet.getRange(r, col).clearContent();
+    }
+    sheet.getRange(r, 1, 1, lastCol).setBackground(mine ? ROW_CHOSEN_BG : ROW_UNCHOSEN_BG);
+  }
+  SpreadsheetApp.flush();   // the sync below must read the one-tick state
+}
+
 function onEditPush(e) {
   try {
     if (!e || !e.range) return;
@@ -331,6 +376,7 @@ function onEditPush(e) {
     const watched = Object.values(map).map(i => i + 1);
     const c1 = e.range.getColumn(), c2 = e.range.getLastColumn();
     if (!watched.some(c => c >= c1 && c <= c2)) return;   // not a synced column
+    enforceChoice_(sheet, map, e);
     const rows = [];
     for (let r = Math.max(2, e.range.getRow()); r <= e.range.getLastRow(); r++) rows.push(r);
     if (!rows.length) return;
