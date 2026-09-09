@@ -1,46 +1,47 @@
 /**
- * Waverole ↔ Google Sheet sync — STANDALONE Apps Script project.
+ * Waverole <-> Google Sheet sync - STANDALONE Apps Script project.
  *
  * Why standalone: the spreadsheet sits in shared storage whose security
- * restrictions block creating a container-bound script ("מגבלות אבטחה").
+ * restrictions block creating a container-bound script (Drive refuses it as a
+ * security restriction).
  * A standalone project + installable triggers works around that: it opens
  * the sheet by ID, so no binding is needed. Limitation: standalone scripts
- * cannot add a custom menu inside the sheet — manual actions run from the
- * Apps Script editor (Run ▶) instead.
+ * cannot add a custom menu inside the sheet - manual actions run from the
+ * Apps Script editor (Run >) instead.
  *
  * What it does:
  *  1. INSTANT site update whenever a relevant cell is edited in the sheet
  *     (installable onEdit trigger). NOTE: programmatic writes (the daily
- *     scraper) do NOT fire onEdit — that's what the daily full sync is for.
+ *     scraper) do NOT fire onEdit - that's what the daily full sync is for.
  *  2. Daily 10:00 Israel: starts the GitHub scraper, then a full site sync
  *     45 minutes later (after the scrape finished writing fresh data).
- *  3. Daily 12:00 Israel: WATCHDOG — verifies the live site data is fresh;
+ *  3. Daily 12:00 Israel: WATCHDOG - verifies the live site data is fresh;
  *     emails ALERT_EMAIL if the site wasn't updated in the last 26 hours.
  *  4. Any failure (missing column, HTTP error, exception) emails ALERT_EMAIL
  *     instead of failing silently.
  *
  * One-time setup (in the Apps Script editor, script.google.com):
- *  1. Paste this file over Code.gs → Save (Cmd+S).
- *  2. Project Settings (⚙) → Script properties → add:
+ *  1. Paste this file over Code.gs -> Save (Cmd+S).
+ *  2. Project Settings ((settings)) -> Script properties -> add:
  *       UPDATE_PACKAGES_TOKEN = the site's UPDATE_PACKAGES_TOKEN
  *                      (was called SITE_TOKEN here; both names still work)
  *       GH_TOKEN     = GitHub PAT (repo+workflow) for esim-price-scraper
- *       ORDERS_TOKEN = the site's ORDERS_TOKEN — the SAME value the PC bot
+ *       ORDERS_TOKEN = the site's ORDERS_TOKEN - the SAME value the PC bot
  *                      and GitHub Actions already use. There is only ever
  *                      ONE of these: the site checks one string, so every
  *                      client presents that same string. Never mint a second
- *                      one — it is also the HMAC key that signs the payment
+ *                      one - it is also the HMAC key that signs the payment
  *                      callback, so a mismatch silently rejects real orders.
  *                      Optional here; without it the 1-min fulfillment tick
  *                      cannot see a paid order until the PC bot reports it.
- *  3. In the editor pick `setupTriggers` in the function dropdown → Run ▶
- *     → authorize when prompted. Done.
+ *  3. In the editor pick `setupTriggers` in the function dropdown -> Run >
+ *     -> authorize when prompted. Done.
  *
- * Manual actions (function dropdown → Run ▶):
- *   previewLog     — log the exact JSON that would be sent (dry run)
- *   fullSync       — push all packages to the site now
- *   runScrapeNow   — trigger the GitHub scraper now
- *   checkSiteFresh — run the freshness watchdog now
+ * Manual actions (function dropdown -> Run >):
+ *   previewLog     - log the exact JSON that would be sent (dry run)
+ *   fullSync       - push all packages to the site now
+ *   runScrapeNow   - trigger the GitHub scraper now
+ *   checkSiteFresh - run the freshness watchdog now
  */
 
 const ENDPOINT = 'https://www.waverole.com/api/update-packages';
@@ -54,24 +55,25 @@ const MAX_STALE_HOURS = 26;   // watchdog: alert if site data older than this
 const BACKUP_FOLDER = 'Waverole Backups';   // Drive folder for weekly copies
 const BACKUP_KEEP = 8;                      // copies kept per spreadsheet
 
-// Row-1 header text (trimmed) → API field.
+// Row-1 header text (trimmed) -> API field.
 // Each field lists EVERY name the column has ever had, so renaming a header
-// doesn't silently break the sync again (2026-07-09: 'כולל מעמ' → 'מחיר סופי'
-// went unnoticed and price updates stopped reaching the site).
+// doesn't silently break the sync again (2026-07-09: the incl.-VAT header was
+// renamed to the final-price one and it went unnoticed, so price updates
+// stopped reaching the site).
 const HEADERS = {
-  sku:         ['חבילה (קוד)'],
+  sku:         ['\u05d7\u05d1\u05d9\u05dc\u05d4 (\u05e7\u05d5\u05d3)'],
   gb:          ['GB'],
-  days:        ['זמן חבילה'],
+  days:        ['\u05d6\u05de\u05df \u05d7\u05d1\u05d9\u05dc\u05d4'],
   networks:    ['Networks'],
   breakout_ip: ['Breakout IP'],
-  source:      ['מקור'],                     // which supplier this row prices
-  chosen:      ['נבחר'],                     // ✓ = the row of the pair the site sells
-  stock:       ['במלאי/רווחי'],              // empty = in stock
-  fee:         ['סליקה'],
-  price:       ['מחיר סופי', 'כולל מעמ'],    // FINAL customer price (incl. VAT + fee)
-  sale:        ['מבעצעים (אחוזים)'],         // empty/0 cancels the sale
+  source:      ['\u05de\u05e7\u05d5\u05e8'],                     // which supplier this row prices
+  chosen:      ['\u05e0\u05d1\u05d7\u05e8'],                     // (tick) = the row of the pair the site sells
+  stock:       ['\u05d1\u05de\u05dc\u05d0\u05d9/\u05e8\u05d5\u05d5\u05d7\u05d9'],              // empty = in stock
+  fee:         ['\u05e1\u05dc\u05d9\u05e7\u05d4'],
+  price:       ['\u05de\u05d7\u05d9\u05e8 \u05e1\u05d5\u05e4\u05d9', '\u05db\u05d5\u05dc\u05dc \u05de\u05e2\u05de'],    // FINAL customer price (incl. VAT + fee)
+  sale:        ['\u05de\u05d1\u05e2\u05e6\u05e2\u05d9\u05dd (\u05d0\u05d7\u05d5\u05d6\u05d9\u05dd)'],         // empty/0 cancels the sale
 };
-// Fields the sync cannot work without — missing => loud email, not silence.
+// Fields the sync cannot work without - missing => loud email, not silence.
 const REQUIRED_FIELDS = ['sku', 'price'];
 
 function setupTriggers() {
@@ -88,11 +90,11 @@ function setupTriggers() {
     .atHour(12).everyDays(1).inTimezone('Asia/Jerusalem').create();
   // GitHub throttles */5 cron on public repos to ~1/hour in practice, so the
   // fulfillment bot is dispatched from here instead. Fires every minute; the
-  // handler itself decides whether to dispatch — every minute while an order
+  // handler itself decides whether to dispatch - every minute while an order
   // waits for its eSIM, every 5th minute otherwise. Needs GH_TOKEN (skips
   // without it).
   ScriptApp.newTrigger('fulfillmentTick').timeBased().everyMinutes(1).create();
-  // Weekly Drive copies of both spreadsheets — the sheets ARE the business
+  // Weekly Drive copies of both spreadsheets - the sheets ARE the business
   // (prices, receipts, eSIM codes); an accidental mass-delete or a broken
   // formula paste would otherwise be unrecoverable beyond version history.
   ScriptApp.newTrigger('weeklyBackup').timeBased()
@@ -100,20 +102,20 @@ function setupTriggers() {
   Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape + 12:00 watchdog + 1-min fulfillment tick + weekly backup');
 }
 
-// ── helpers ─────────────────────────────────────────────────────────
+// -- helpers ---------------------------------------------------------
 function alert_(subject, body) {
   try {
-    MailApp.sendEmail(ALERT_EMAIL, '⚠️ Waverole sync: ' + subject,
-      body + '\n\n(הודעה אוטומטית מסקריפט הסנכרון של טבלת המחירים)');
+    MailApp.sendEmail(ALERT_EMAIL, '\u26a0\ufe0f Waverole sync: ' + subject,
+      body + '\n\n(\u05d4\u05d5\u05d3\u05e2\u05d4 \u05d0\u05d5\u05d8\u05d5\u05de\u05d8\u05d9\u05ea \u05de\u05e1\u05e7\u05e8\u05d9\u05e4\u05d8 \u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05e9\u05dc \u05d8\u05d1\u05dc\u05ea \u05d4\u05de\u05d7\u05d9\u05e8\u05d9\u05dd)');
   } catch (e) { Logger.log('alert email failed: ' + e); }
 }
 
-// Positive daily confirmation — sent when the morning check passed, so a
+// Positive daily confirmation - sent when the morning check passed, so a
 // silent inbox never leaves you guessing whether the check ran at all.
 function report_(subject, body) {
   try {
-    MailApp.sendEmail(ALERT_EMAIL, '✅ Waverole sync: ' + subject,
-      body + '\n\n(הודעה אוטומטית מסקריפט הסנכרון של טבלת המחירים)');
+    MailApp.sendEmail(ALERT_EMAIL, '\u2705 Waverole sync: ' + subject,
+      body + '\n\n(\u05d4\u05d5\u05d3\u05e2\u05d4 \u05d0\u05d5\u05d8\u05d5\u05de\u05d8\u05d9\u05ea \u05de\u05e1\u05e7\u05e8\u05d9\u05e4\u05d8 \u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05e9\u05dc \u05d8\u05d1\u05dc\u05ea \u05d4\u05de\u05d7\u05d9\u05e8\u05d9\u05dd)');
   } catch (e) { Logger.log('report email failed: ' + e); }
 }
 
@@ -133,11 +135,11 @@ function colMap_(sheet) {
   }
   const missing = REQUIRED_FIELDS.filter(f => map[f] === undefined);
   if (missing.length) {
-    const msg = 'עמודות חסרות בטבלת המחירים: ' + missing.join(', ') +
-      '\nכנראה שונה שם של כותרת. שמות שהסקריפט מכיר: ' +
+    const msg = '\u05e2\u05de\u05d5\u05d3\u05d5\u05ea \u05d7\u05e1\u05e8\u05d5\u05ea \u05d1\u05d8\u05d1\u05dc\u05ea \u05d4\u05de\u05d7\u05d9\u05e8\u05d9\u05dd: ' + missing.join(', ') +
+      '\n\u05db\u05e0\u05e8\u05d0\u05d4 \u05e9\u05d5\u05e0\u05d4 \u05e9\u05dd \u05e9\u05dc \u05db\u05d5\u05ea\u05e8\u05ea. \u05e9\u05de\u05d5\u05ea \u05e9\u05d4\u05e1\u05e7\u05e8\u05d9\u05e4\u05d8 \u05de\u05db\u05d9\u05e8: ' +
       missing.map(f => HEADERS[f].join(' / ')).join(' | ') +
-      '\nיש לעדכן את HEADERS בקוד או להחזיר את שם העמודה.';
-    alert_('עמודה חסרה — הסנכרון נעצר', msg);
+      '\n\u05d9\u05e9 \u05dc\u05e2\u05d3\u05db\u05df \u05d0\u05ea HEADERS \u05d1\u05e7\u05d5\u05d3 \u05d0\u05d5 \u05dc\u05d4\u05d7\u05d6\u05d9\u05e8 \u05d0\u05ea \u05e9\u05dd \u05d4\u05e2\u05de\u05d5\u05d3\u05d4.';
+    alert_('\u05e2\u05de\u05d5\u05d3\u05d4 \u05d7\u05e1\u05e8\u05d4 \u2014 \u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05e0\u05e2\u05e6\u05e8', msg);
     throw new Error(msg);
   }
   return map;
@@ -146,9 +148,9 @@ function colMap_(sheet) {
 // Did the Hebrew column names survive the trip into the editor?
 //
 // The Apps Script editor lays RTL text out inside LTR code, so every Hebrew
-// header in HEADERS above renders scrambled — cosmetic, but it makes "did my
+// header in HEADERS above renders scrambled - cosmetic, but it makes "did my
 // paste arrive intact?" unanswerable by eye. Worse, only 'sku' and 'price' are
-// REQUIRED: a mangled 'מקור' or 'נבחר' does not throw, it silently reads as
+// REQUIRED: a mangled source or chosen header does not throw, it silently reads as
 // absent, and pickRow_() then falls back to esim.dog for every SKU. Safe, but
 // indistinguishable from working.
 //
@@ -197,16 +199,16 @@ function rowToPackage_(row, map) {
   const sku = String(row[map.sku] || '').trim();
   if (!sku || sku.indexOf('.') < 0) return null;    // not a package row
   // A SKU can occupy more than one row: the sheet stacks the same package
-  // as each supplier sells it — esim.dog's row and Stellar's row, one above
+  // as each supplier sells it - esim.dog's row and Stellar's row, one above
   // the other, under one code. Which of them the site sells is decided in
-  // pickRow_(), by the ✓ in 'נבחר'; here every priced row is a candidate.
-  // Blank 'מקור' means esim.dog, as it does for the scraper and the bot.
+  // pickRow_(), by the tick in the chosen column; here every priced row is a candidate.
+  // A blank source column means esim.dog, as it does for the scraper and the bot.
   const src = String(row[map.source] || '').trim().toLowerCase() || 'esim.dog';
   // A row with no customer price is a note to ourselves, not a product. Every
   // one of the 82 live esim.dog rows carries one, so this turns nothing off
   // today; what it buys is a comparison row that CANNOT become a storefront
-  // entry by accident. Before this, a priceless row was still posted — sku,
-  // GB, days and in_stock=true, just no price — which is how a 50GB Germany
+  // entry by accident. Before this, a priceless row was still posted - sku,
+  // GB, days and in_stock=true, just no price - which is how a 50GB Germany
   // package nobody had priced yet would have appeared on the site the moment
   // it was written down next to the one we actually sell.
   const price = num_(row[map.price]);
@@ -218,7 +220,7 @@ function rowToPackage_(row, map) {
   pkg.in_stock = String(row[map.stock] || '').trim() === '';
   const days = num_(row[map.days]); if (days !== null) pkg.days = days;
   const gb   = num_(row[map.gb]);   if (gb   !== null) pkg.gb = gb;
-  const net = String(row[map.networks] || '').replace(/^Networks\s*•\s*/i, '').trim();
+  const net = String(row[map.networks] || '').replace(/^Networks\s*\u2022\s*/i, '').trim();
   if (net) pkg.networks = net;
   const bip = String(row[map.breakout_ip] || '').trim();
   if (bip) pkg.breakout_ip = bip;
@@ -226,11 +228,11 @@ function rowToPackage_(row, map) {
   return pkg;
 }
 
-// The one row of a SKU's pair the site sells. The ✓ wins when exactly one
+// The one row of a SKU's pair the site sells. The (tick) wins when exactly one
 // row carries it; otherwise esim.dog's row, the supplier we have always
 // bought from. A ticked Stellar row with no customer price never gets here
 // (rowToPackage_ dropped it), so the tick alone cannot empty a SKU. The site
-// still refuses checkout on a supplier its bot cannot buy from — the tick
+// still refuses checkout on a supplier its bot cannot buy from - the tick
 // moves the PRICE, LIVE_SUPPLIERS on the site moves the money.
 function pickRow_(cands) {
   const ticked = cands.filter(p => p._chosen);
@@ -272,7 +274,7 @@ function post_(packages) {
   // keep reading the old one so the existing property keeps working.
   const props = PropertiesService.getScriptProperties();
   const token = props.getProperty('UPDATE_PACKAGES_TOKEN') || props.getProperty('SITE_TOKEN');
-  if (!token) throw new Error('חסר UPDATE_PACKAGES_TOKEN ב-Script Properties (הגדרות הפרויקט)');
+  if (!token) throw new Error('\u05d7\u05e1\u05e8 UPDATE_PACKAGES_TOKEN \u05d1-Script Properties (\u05d4\u05d2\u05d3\u05e8\u05d5\u05ea \u05d4\u05e4\u05e8\u05d5\u05d9\u05e7\u05d8)');
   const res = UrlFetchApp.fetch(ENDPOINT, {
     method: 'post',
     contentType: 'application/json',
@@ -284,21 +286,21 @@ function post_(packages) {
   const body = res.getContentText();
   Logger.log(code + ' ' + body);
   if (code >= 300) {
-    alert_('שליחת עדכון לאתר נכשלה (HTTP ' + code + ')',
-      'הקריאה ל-' + ENDPOINT + ' החזירה ' + code + ':\n' + body.slice(0, 500));
+    alert_('\u05e9\u05dc\u05d9\u05d7\u05ea \u05e2\u05d3\u05db\u05d5\u05df \u05dc\u05d0\u05ea\u05e8 \u05e0\u05db\u05e9\u05dc\u05d4 (HTTP ' + code + ')',
+      '\u05d4\u05e7\u05e8\u05d9\u05d0\u05d4 \u05dc-' + ENDPOINT + ' \u05d4\u05d7\u05d6\u05d9\u05e8\u05d4 ' + code + ':\n' + body.slice(0, 500));
     throw new Error('update-packages HTTP ' + code);
   }
   let msg = 'HTTP ' + code;
   try {
     const j = JSON.parse(body);
-    msg = 'עודכנו ' + (j.updated || []).length +
-      ((j.not_found || []).length ? ' | לא נמצאו: ' + j.not_found.join(', ') : '') +
-      ((j.warnings || []).length ? ' | ⚠️ ' + j.warnings.length + ' אזהרות' : '');
+    msg = '\u05e2\u05d5\u05d3\u05db\u05e0\u05d5 ' + (j.updated || []).length +
+      ((j.not_found || []).length ? ' | \u05dc\u05d0 \u05e0\u05de\u05e6\u05d0\u05d5: ' + j.not_found.join(', ') : '') +
+      ((j.warnings || []).length ? ' | \u26a0\ufe0f ' + j.warnings.length + ' \u05d0\u05d6\u05d4\u05e8\u05d5\u05ea' : '');
   } catch (err) {}
   Logger.log(msg);
   // Freshness signal for the watchdog: a successful POST means the site HAS
   // today's prices even when nothing changed (the endpoint then skips the
-  // commit, so the overlay's `updated` timestamp does NOT move — that false
+  // commit, so the overlay's `updated` timestamp does NOT move - that false
   // alarm is exactly what fired on 2026-07-16).
   PropertiesService.getScriptProperties()
     .setProperty('LAST_SYNC_OK', new Date().toISOString());
@@ -306,10 +308,10 @@ function post_(packages) {
   return body;
 }
 
-// ── actions ─────────────────────────────────────────────────────────
+// -- actions ---------------------------------------------------------
 // Editing a run of cells used to fire one full site push PER EDIT. A few
 // minutes of ordinary work on the sheet produced 28 overlapping runs, one of
-// which hung for 175 seconds — and because Apps Script caps how much runs at
+// which hung for 175 seconds - and because Apps Script caps how much runs at
 // once, that flood starved the every-minute fulfilment dispatcher, which is
 // what makes a customer's eSIM late.
 //
@@ -374,17 +376,17 @@ function flushPendingRows_() {
   }
 }
 
-// ── receipts sheet → customer's usage meter, instantly ──────────────
+// -- receipts sheet -> customer's usage meter, instantly --------------
 // The daily usage bot refreshes every live package once a day. This closes
 // the gap in between: edit the consumption cell in the receipts sheet and the
-// customer's order page shows the new figure within seconds — the same
+// customer's order page shows the new figure within seconds - the same
 // arrangement the price sheet has with the shop.
 //
 // Only MANUAL edits reach here; Apps Script does not fire onEdit for writes
 // made by a script, so the daily bot is not double-counted (it pushes to the
 // site directly anyway).
-const RCPT_USAGE_COL = 'GB (0/X) - ניצול';
-const RCPT_ORDER_COL = 'מס׳ הזמנה';
+const RCPT_USAGE_COL = 'GB (0/X) - \u05e0\u05d9\u05e6\u05d5\u05dc';
+const RCPT_ORDER_COL = '\u05de\u05e1\u05f3 \u05d4\u05d6\u05de\u05e0\u05d4';
 
 function onReceiptsEdit(e) {
   try {
@@ -399,19 +401,19 @@ function onReceiptsEdit(e) {
     const tok = PropertiesService.getScriptProperties().getProperty('ORDERS_TOKEN');
     if (!tok) {
       // Do NOT fail silently. Without the token this whole feature does
-      // nothing, looks exactly like a broken sheet, and gives no clue why —
+      // nothing, looks exactly like a broken sheet, and gives no clue why -
       // which is how it sat unnoticed. One email, at most once a day, then
       // back to quiet.
       const props = PropertiesService.getScriptProperties();
       const today = Utilities.formatDate(new Date(), 'Asia/Jerusalem', 'yyyy-MM-dd');
       if (props.getProperty('TOKEN_WARNED_ON') !== today) {
         props.setProperty('TOKEN_WARNED_ON', today);
-        alert_('חסר ORDERS_TOKEN — מד הניצול לא מתעדכן',
-          'ערכת את עמודת הניצול בטבלת הקבלות, אבל הסנכרון המיידי לאתר לא רץ ' +
-          'כי אין ORDERS_TOKEN במאפייני הסקריפט.\n\n' +
-          'תיקון: עורך הסקריפט → ⚙️ הגדרות הפרויקט → מאפייני סקריפט → ' +
-          'הוספת מאפיין → שם: ORDERS_TOKEN → הדבק את הערך → שמירה.\n' +
-          'אחר כך הרץ checkReceiptsSync כדי לוודא שהכול עובד.');
+        alert_('\u05d7\u05e1\u05e8 ORDERS_TOKEN \u2014 \u05de\u05d3 \u05d4\u05e0\u05d9\u05e6\u05d5\u05dc \u05dc\u05d0 \u05de\u05ea\u05e2\u05d3\u05db\u05df',
+          '\u05e2\u05e8\u05db\u05ea \u05d0\u05ea \u05e2\u05de\u05d5\u05d3\u05ea \u05d4\u05e0\u05d9\u05e6\u05d5\u05dc \u05d1\u05d8\u05d1\u05dc\u05ea \u05d4\u05e7\u05d1\u05dc\u05d5\u05ea, \u05d0\u05d1\u05dc \u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05d4\u05de\u05d9\u05d9\u05d3\u05d9 \u05dc\u05d0\u05ea\u05e8 \u05dc\u05d0 \u05e8\u05e5 ' +
+          '\u05db\u05d9 \u05d0\u05d9\u05df ORDERS_TOKEN \u05d1\u05de\u05d0\u05e4\u05d9\u05d9\u05e0\u05d9 \u05d4\u05e1\u05e7\u05e8\u05d9\u05e4\u05d8.\n\n' +
+          '\u05ea\u05d9\u05e7\u05d5\u05df: \u05e2\u05d5\u05e8\u05da \u05d4\u05e1\u05e7\u05e8\u05d9\u05e4\u05d8 \u2192 \u2699\ufe0f \u05d4\u05d2\u05d3\u05e8\u05d5\u05ea \u05d4\u05e4\u05e8\u05d5\u05d9\u05e7\u05d8 \u2192 \u05de\u05d0\u05e4\u05d9\u05d9\u05e0\u05d9 \u05e1\u05e7\u05e8\u05d9\u05e4\u05d8 \u2192 ' +
+          '\u05d4\u05d5\u05e1\u05e4\u05ea \u05de\u05d0\u05e4\u05d9\u05d9\u05df \u2192 \u05e9\u05dd: ORDERS_TOKEN \u2192 \u05d4\u05d3\u05d1\u05e7 \u05d0\u05ea \u05d4\u05e2\u05e8\u05da \u2192 \u05e9\u05de\u05d9\u05e8\u05d4.\n' +
+          '\u05d0\u05d7\u05e8 \u05db\u05da \u05d4\u05e8\u05e5 checkReceiptsSync \u05db\u05d3\u05d9 \u05dc\u05d5\u05d5\u05d3\u05d0 \u05e9\u05d4\u05db\u05d5\u05dc \u05e2\u05d5\u05d1\u05d3.');
       }
       return;
     }
@@ -449,39 +451,39 @@ function onReceiptsEdit(e) {
  * Every part of this chain fails quietly by design (a sync problem must never
  * block someone editing a sheet), so when it does not work there is nothing
  * to see anywhere. This checks each link in order and says which one is broken
- * in plain words — instead of leaving "it just doesn't update" to guesswork.
+ * in plain words - instead of leaving "it just doesn't update" to guesswork.
  */
 function checkReceiptsSync() {
   const out = [];
-  const ok = (s) => out.push('✅ ' + s);
-  const bad = (s) => out.push('❌ ' + s);
+  const ok = (s) => out.push('\u2705 ' + s);
+  const bad = (s) => out.push('\u274c ' + s);
 
   const tok = PropertiesService.getScriptProperties().getProperty('ORDERS_TOKEN');
-  if (tok) ok('ORDERS_TOKEN קיים במאפייני הסקריפט (' + tok.length + ' תווים)');
-  else bad('חסר ORDERS_TOKEN → הגדרות הפרויקט ⚙️ → מאפייני סקריפט → ' +
-           'שם: ORDERS_TOKEN, ערך: הטוקן של האתר');
+  if (tok) ok('ORDERS_TOKEN \u05e7\u05d9\u05d9\u05dd \u05d1\u05de\u05d0\u05e4\u05d9\u05d9\u05e0\u05d9 \u05d4\u05e1\u05e7\u05e8\u05d9\u05e4\u05d8 (' + tok.length + ' \u05ea\u05d5\u05d5\u05d9\u05dd)');
+  else bad('\u05d7\u05e1\u05e8 ORDERS_TOKEN \u2192 \u05d4\u05d2\u05d3\u05e8\u05d5\u05ea \u05d4\u05e4\u05e8\u05d5\u05d9\u05e7\u05d8 \u2699\ufe0f \u2192 \u05de\u05d0\u05e4\u05d9\u05d9\u05e0\u05d9 \u05e1\u05e7\u05e8\u05d9\u05e4\u05d8 \u2192 ' +
+           '\u05e9\u05dd: ORDERS_TOKEN, \u05e2\u05e8\u05da: \u05d4\u05d8\u05d5\u05e7\u05df \u05e9\u05dc \u05d4\u05d0\u05ea\u05e8');
 
   const trig = ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'onReceiptsEdit');
-  if (trig.length) ok('הטריגר onReceiptsEdit מותקן (' + trig.length + ')');
-  else bad('הטריגר onReceiptsEdit לא מותקן → הרץ setupTriggers מהתפריט');
+  if (trig.length) ok('\u05d4\u05d8\u05e8\u05d9\u05d2\u05e8 onReceiptsEdit \u05de\u05d5\u05ea\u05e7\u05df (' + trig.length + ')');
+  else bad('\u05d4\u05d8\u05e8\u05d9\u05d2\u05e8 onReceiptsEdit \u05dc\u05d0 \u05de\u05d5\u05ea\u05e7\u05df \u2192 \u05d4\u05e8\u05e5 setupTriggers \u05de\u05d4\u05ea\u05e4\u05e8\u05d9\u05d8');
 
   let sh = null;
   try {
     sh = SpreadsheetApp.openById(RECEIPTS_ID).getSheets()[0];
-    ok('טבלת הקבלות נפתחת: "' + sh.getName() + '"');
+    ok('\u05d8\u05d1\u05dc\u05ea \u05d4\u05e7\u05d1\u05dc\u05d5\u05ea \u05e0\u05e4\u05ea\u05d7\u05ea: "' + sh.getName() + '"');
   } catch (e) {
-    bad('אין גישה לטבלת הקבלות: ' + e);
+    bad('\u05d0\u05d9\u05df \u05d2\u05d9\u05e9\u05d4 \u05dc\u05d8\u05d1\u05dc\u05ea \u05d4\u05e7\u05d1\u05dc\u05d5\u05ea: ' + e);
   }
 
   let sample = null;
   if (sh) {
     const hdr = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(h => String(h).trim());
     const uc = hdr.indexOf(RCPT_USAGE_COL) + 1, oc = hdr.indexOf(RCPT_ORDER_COL) + 1;
-    if (uc) ok('עמודת הניצול "' + RCPT_USAGE_COL + '" נמצאה (עמודה ' + uc + ')');
-    else bad('לא נמצאה עמודה בשם "' + RCPT_USAGE_COL + '" — שינוי שם הכותרת מנתק את הסנכרון');
-    if (oc) ok('עמודת מספר ההזמנה נמצאה (עמודה ' + oc + ')');
-    else bad('לא נמצאה עמודה בשם "' + RCPT_ORDER_COL + '"');
+    if (uc) ok('\u05e2\u05de\u05d5\u05d3\u05ea \u05d4\u05e0\u05d9\u05e6\u05d5\u05dc "' + RCPT_USAGE_COL + '" \u05e0\u05de\u05e6\u05d0\u05d4 (\u05e2\u05de\u05d5\u05d3\u05d4 ' + uc + ')');
+    else bad('\u05dc\u05d0 \u05e0\u05de\u05e6\u05d0\u05d4 \u05e2\u05de\u05d5\u05d3\u05d4 \u05d1\u05e9\u05dd "' + RCPT_USAGE_COL + '" \u2014 \u05e9\u05d9\u05e0\u05d5\u05d9 \u05e9\u05dd \u05d4\u05db\u05d5\u05ea\u05e8\u05ea \u05de\u05e0\u05ea\u05e7 \u05d0\u05ea \u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df');
+    if (oc) ok('\u05e2\u05de\u05d5\u05d3\u05ea \u05de\u05e1\u05e4\u05e8 \u05d4\u05d4\u05d6\u05de\u05e0\u05d4 \u05e0\u05de\u05e6\u05d0\u05d4 (\u05e2\u05de\u05d5\u05d3\u05d4 ' + oc + ')');
+    else bad('\u05dc\u05d0 \u05e0\u05de\u05e6\u05d0\u05d4 \u05e2\u05de\u05d5\u05d3\u05d4 \u05d1\u05e9\u05dd "' + RCPT_ORDER_COL + '"');
 
     if (uc && oc) {
       const last = sh.getLastRow();
@@ -490,8 +492,8 @@ function checkReceiptsSync() {
         const m = String(sh.getRange(r, uc).getValue()).match(/([\d.]+)\s*\/\s*([\d.]+)/);
         if (id && m) { sample = { row: r, id: id, used: parseFloat(m[1]), total: parseFloat(m[2]) }; break; }
       }
-      if (sample) ok('שורה לדוגמה: ' + sample.id + ' = ' + sample.used + '/' + sample.total + ' GB (שורה ' + sample.row + ')');
-      else out.push('ℹ️ אין עדיין שורה עם ניצול בפורמט "0.4 / 1" — לכן אין מה לשלוח');
+      if (sample) ok('\u05e9\u05d5\u05e8\u05d4 \u05dc\u05d3\u05d5\u05d2\u05de\u05d4: ' + sample.id + ' = ' + sample.used + '/' + sample.total + ' GB (\u05e9\u05d5\u05e8\u05d4 ' + sample.row + ')');
+      else out.push('\u2139\ufe0f \u05d0\u05d9\u05df \u05e2\u05d3\u05d9\u05d9\u05df \u05e9\u05d5\u05e8\u05d4 \u05e2\u05dd \u05e0\u05d9\u05e6\u05d5\u05dc \u05d1\u05e4\u05d5\u05e8\u05de\u05d8 "0.4 / 1" \u2014 \u05dc\u05db\u05df \u05d0\u05d9\u05df \u05de\u05d4 \u05dc\u05e9\u05dc\u05d5\u05d7');
     }
   }
 
@@ -507,13 +509,13 @@ function checkReceiptsSync() {
     const code = res.getResponseCode(), txt = res.getContentText();
     if (code === 200) {
       const body = JSON.parse(txt || '{}');
-      if ((body.updated || []).length) ok('האתר עודכן בהצלחה עבור ' + sample.id + ' — הסנכרון עובד מקצה לקצה');
-      else if ((body.not_found || []).length) bad('האתר לא מכיר את ההזמנה ' + sample.id + ' (ייתכן שנמחקה או ישנה מ-90 יום)');
-      else out.push('ℹ️ האתר ענה 200 בלי לעדכן: ' + txt.slice(0, 200));
+      if ((body.updated || []).length) ok('\u05d4\u05d0\u05ea\u05e8 \u05e2\u05d5\u05d3\u05db\u05df \u05d1\u05d4\u05e6\u05dc\u05d7\u05d4 \u05e2\u05d1\u05d5\u05e8 ' + sample.id + ' \u2014 \u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05e2\u05d5\u05d1\u05d3 \u05de\u05e7\u05e6\u05d4 \u05dc\u05e7\u05e6\u05d4');
+      else if ((body.not_found || []).length) bad('\u05d4\u05d0\u05ea\u05e8 \u05dc\u05d0 \u05de\u05db\u05d9\u05e8 \u05d0\u05ea \u05d4\u05d4\u05d6\u05de\u05e0\u05d4 ' + sample.id + ' (\u05d9\u05d9\u05ea\u05db\u05df \u05e9\u05e0\u05de\u05d7\u05e7\u05d4 \u05d0\u05d5 \u05d9\u05e9\u05e0\u05d4 \u05de-90 \u05d9\u05d5\u05dd)');
+      else out.push('\u2139\ufe0f \u05d4\u05d0\u05ea\u05e8 \u05e2\u05e0\u05d4 200 \u05d1\u05dc\u05d9 \u05dc\u05e2\u05d3\u05db\u05df: ' + txt.slice(0, 200));
     } else if (code === 401 || code === 403) {
-      bad('האתר דחה את הטוקן (' + code + ') — ה-ORDERS_TOKEN כאן שונה מזה שבאתר');
+      bad('\u05d4\u05d0\u05ea\u05e8 \u05d3\u05d7\u05d4 \u05d0\u05ea \u05d4\u05d8\u05d5\u05e7\u05df (' + code + ') \u2014 \u05d4-ORDERS_TOKEN \u05db\u05d0\u05df \u05e9\u05d5\u05e0\u05d4 \u05de\u05d6\u05d4 \u05e9\u05d1\u05d0\u05ea\u05e8');
     } else {
-      bad('האתר החזיר ' + code + ': ' + txt.slice(0, 200));
+      bad('\u05d4\u05d0\u05ea\u05e8 \u05d4\u05d7\u05d6\u05d9\u05e8 ' + code + ': ' + txt.slice(0, 200));
     }
   }
 
@@ -532,7 +534,7 @@ function previewLog() {
 
 function runScrapeNow() {
   const token = PropertiesService.getScriptProperties().getProperty('GH_TOKEN');
-  if (!token) throw new Error('חסר GH_TOKEN ב-Script Properties (הגדרות הפרויקט)');
+  if (!token) throw new Error('\u05d7\u05e1\u05e8 GH_TOKEN \u05d1-Script Properties (\u05d4\u05d2\u05d3\u05e8\u05d5\u05ea \u05d4\u05e4\u05e8\u05d5\u05d9\u05e7\u05d8)');
   const res = UrlFetchApp.fetch(GH_DISPATCH, {
     method: 'post',
     contentType: 'application/json',
@@ -541,28 +543,28 @@ function runScrapeNow() {
     muteHttpExceptions: true,
   });
   const ok = res.getResponseCode() === 204;
-  if (!ok) alert_('הפעלת הסקרייפר נכשלה', res.getContentText().slice(0, 500));
-  Logger.log(ok ? 'הסריקה הופעלה ב-GitHub ✓' : 'שגיאה: ' + res.getContentText());
+  if (!ok) alert_('\u05d4\u05e4\u05e2\u05dc\u05ea \u05d4\u05e1\u05e7\u05e8\u05d9\u05d9\u05e4\u05e8 \u05e0\u05db\u05e9\u05dc\u05d4', res.getContentText().slice(0, 500));
+  Logger.log(ok ? '\u05d4\u05e1\u05e8\u05d9\u05e7\u05d4 \u05d4\u05d5\u05e4\u05e2\u05dc\u05d4 \u05d1-GitHub \u2713' : '\u05e9\u05d2\u05d9\u05d0\u05d4: ' + res.getContentText());
 }
 
-// ── fulfillment bot dispatcher — every 5 minutes ────────────────────
+// -- fulfillment bot dispatcher - every 5 minutes --------------------
 // GitHub throttles scheduled workflows on public repos (observed: */5 cron
 // firing ~once an hour). Apps Script triggers are punctual, so this tick
-// dispatches the fulfillment workflow instead. Costs ~1s per run — far
+// dispatches the fulfillment workflow instead. Costs ~1s per run - far
 // inside the daily trigger quota. Failures alert at most once per 6h.
 function fulfillmentTick() {
   const props = PropertiesService.getScriptProperties();
   const token = props.getProperty('GH_TOKEN');
-  if (!token) return;                        // not configured — GitHub cron still runs
+  if (!token) return;                        // not configured - GitHub cron still runs
 
   // The trigger fires every MINUTE, but dispatching every minute would mean
   // 1440 Actions runs a day for an inbox that is empty almost all the time.
   // So: dispatch at once while a paid order is still waiting for its eSIM
   // (customer gets the QR in ~1 minute instead of up to 5), and otherwise
-  // keep the old 5-minute cadence — same idle cost as before.
+  // keep the old 5-minute cadence - same idle cost as before.
   // Finish any order whose eSIM was still being provisioned when the purchase
-  // bot handed over its supplier session. Usually a no-op — the site normally
-  // completes the order on the spot — but it is what closes the gap when the
+  // bot handed over its supplier session. Usually a no-op - the site normally
+  // completes the order on the spot - but it is what closes the gap when the
   // supplier is a few seconds slow, without waiting for the delivery email.
   sweepProvisioningOrders_();
   // Watch whether the supplier can still sell us packages, and email once on
@@ -583,16 +585,16 @@ function fulfillmentTick() {
       payload: JSON.stringify({ ref: 'main' }),
       muteHttpExceptions: true,
     });
-    if (res.getResponseCode() === 204) return;         // dispatched ✓
+    if (res.getResponseCode() === 204) return;         // dispatched (tick)
     throw new Error('HTTP ' + res.getResponseCode() + ': ' +
       res.getContentText().slice(0, 300));
   } catch (err) {
     const last = +(props.getProperty('FT_LAST_ALERT') || 0);
     if (Date.now() - last > 6 * 36e5) {
       props.setProperty('FT_LAST_ALERT', String(Date.now()));
-      alert_('הפעלת בוט המימוש מה-Apps Script נכשלת',
-        String(err) + '\n(הבוט עדיין רץ מה-cron של GitHub, רק לאט יותר. ' +
-        'התראה זו נשלחת לכל היותר פעם ב-6 שעות.)');
+      alert_('\u05d4\u05e4\u05e2\u05dc\u05ea \u05d1\u05d5\u05d8 \u05d4\u05de\u05d9\u05de\u05d5\u05e9 \u05de\u05d4-Apps Script \u05e0\u05db\u05e9\u05dc\u05ea',
+        String(err) + '\n(\u05d4\u05d1\u05d5\u05d8 \u05e2\u05d3\u05d9\u05d9\u05df \u05e8\u05e5 \u05de\u05d4-cron \u05e9\u05dc GitHub, \u05e8\u05e7 \u05dc\u05d0\u05d8 \u05d9\u05d5\u05ea\u05e8. ' +
+        '\u05d4\u05ea\u05e8\u05d0\u05d4 \u05d6\u05d5 \u05e0\u05e9\u05dc\u05d7\u05ea \u05dc\u05db\u05dc \u05d4\u05d9\u05d5\u05ea\u05e8 \u05e4\u05e2\u05dd \u05d1-6 \u05e9\u05e2\u05d5\u05ea.)');
     }
     Logger.log('fulfillmentTick failed: ' + err);
   }
@@ -602,21 +604,21 @@ function fulfillmentTick() {
 // the moment it PAYS; the fulfillment bot later fills the activation code in
 // from esim.dog's delivery email. A row with an order id and no activation
 // code is therefore an order mid-flight.
-const RCP_DATE_COL = 2;         // תאריך
-const RCP_ORDER_COL = 6;        // מס׳ הזמנה
+const RCP_DATE_COL = 2;         // date
+const RCP_ORDER_COL = 6;        // order number
 const RCP_ACTIVATION_COL = 8;   // Activation Code
 const AWAITING_WINDOW_MS = 30 * 60 * 1000;
 
 function rowTime_(v) {
   if (v instanceof Date) return v.getTime();
-  // The bot writes DD/MM/YYYY HH:MM:SS — day first, so Date.parse would read
+  // The bot writes DD/MM/YYYY HH:MM:SS - day first, so Date.parse would read
   // 07/12 as 7 December in some locales and 12 July in others. Parse it by hand.
   const m = String(v).match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})[ ,]+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
   if (!m) return NaN;
   return new Date(+m[3], +m[2] - 1, +m[1], +m[4], +m[5], +(m[6] || 0)).getTime();
 }
 
-// ── supplier watch — every minute ───────────────────────────────────
+// -- supplier watch - every minute -----------------------------------
 // On 2026-07-27 the supplier answered HTTP 200 on every page while all of its
 // JavaScript build files 404'd: the site rendered, the Checkout button did
 // nothing, and nobody could buy. We could still have taken payments for
@@ -624,12 +626,12 @@ function rowTime_(v) {
 //
 // So this asks the site to re-run its real check (page loads AND its build
 // files exist), which both keeps the cached verdict warm for shoppers and
-// tells us the moment selling becomes impossible — or possible again.
+// tells us the moment selling becomes impossible - or possible again.
 // Emails only on a CHANGE, so a long outage does not send 1440 messages.
 function supplierWatch_() {
   const props = PropertiesService.getScriptProperties();
   const tok = props.getProperty('ORDERS_TOKEN');
-  if (!tok) return;                          // not configured — site self-checks
+  if (!tok) return;                          // not configured - site self-checks
 
   let selling, reason;
   try {
@@ -650,28 +652,28 @@ function supplierWatch_() {
 
   const was = props.getProperty('SUPPLIER_SELLING');
   const now = selling ? 'yes' : 'no';
-  if (was === now) return;                   // nothing changed — stay quiet
+  if (was === now) return;                   // nothing changed - stay quiet
   props.setProperty('SUPPLIER_SELLING', now);
-  if (was === null) return;                  // first ever run — no news yet
+  if (was === null) return;                  // first ever run - no news yet
 
   if (!selling) {
-    alert_('הספק לא זמין — המכירות נעצרו אוטומטית',
-      'לא ניתן לרכוש חבילות מהספק כרגע, ולכן האתר עבר למצב תחזוקה ואי אפשר לקנות בו.\n\n' +
-      'סיבה: ' + reason + '\n\n' +
-      'הזמנות קיימות ממשיכות לפעול כרגיל — רק מכירות חדשות מושבתות.\n' +
-      'האתר ייפתח מחדש מעצמו תוך כדקה מרגע שהספק יחזור.');
+    alert_('\u05d4\u05e1\u05e4\u05e7 \u05dc\u05d0 \u05d6\u05de\u05d9\u05df \u2014 \u05d4\u05de\u05db\u05d9\u05e8\u05d5\u05ea \u05e0\u05e2\u05e6\u05e8\u05d5 \u05d0\u05d5\u05d8\u05d5\u05de\u05d8\u05d9\u05ea',
+      '\u05dc\u05d0 \u05e0\u05d9\u05ea\u05df \u05dc\u05e8\u05db\u05d5\u05e9 \u05d7\u05d1\u05d9\u05dc\u05d5\u05ea \u05de\u05d4\u05e1\u05e4\u05e7 \u05db\u05e8\u05d2\u05e2, \u05d5\u05dc\u05db\u05df \u05d4\u05d0\u05ea\u05e8 \u05e2\u05d1\u05e8 \u05dc\u05de\u05e6\u05d1 \u05ea\u05d7\u05d6\u05d5\u05e7\u05d4 \u05d5\u05d0\u05d9 \u05d0\u05e4\u05e9\u05e8 \u05dc\u05e7\u05e0\u05d5\u05ea \u05d1\u05d5.\n\n' +
+      '\u05e1\u05d9\u05d1\u05d4: ' + reason + '\n\n' +
+      '\u05d4\u05d6\u05de\u05e0\u05d5\u05ea \u05e7\u05d9\u05d9\u05de\u05d5\u05ea \u05de\u05de\u05e9\u05d9\u05db\u05d5\u05ea \u05dc\u05e4\u05e2\u05d5\u05dc \u05db\u05e8\u05d2\u05d9\u05dc \u2014 \u05e8\u05e7 \u05de\u05db\u05d9\u05e8\u05d5\u05ea \u05d7\u05d3\u05e9\u05d5\u05ea \u05de\u05d5\u05e9\u05d1\u05ea\u05d5\u05ea.\n' +
+      '\u05d4\u05d0\u05ea\u05e8 \u05d9\u05d9\u05e4\u05ea\u05d7 \u05de\u05d7\u05d3\u05e9 \u05de\u05e2\u05e6\u05de\u05d5 \u05ea\u05d5\u05da \u05db\u05d3\u05e7\u05d4 \u05de\u05e8\u05d2\u05e2 \u05e9\u05d4\u05e1\u05e4\u05e7 \u05d9\u05d7\u05d6\u05d5\u05e8.');
   } else {
-    // Buying works again — hand back every order that was paid for but could
+    // Buying works again - hand back every order that was paid for but could
     // not be bought while the supplier was down, before saying all is well.
     const rescued = retryUnfulfilled_(tok);
-    report_('הספק חזר — המכירות נפתחו מחדש',
-      'ניתן שוב לרכוש חבילות מהספק, והאתר חזר לפעולה רגילה.' +
-      (rescued ? '\n\nהוחזרו לתור ' + rescued + ' הזמנות ששולמו ולא סופקו בזמן התקלה.' : ''));
+    report_('\u05d4\u05e1\u05e4\u05e7 \u05d7\u05d6\u05e8 \u2014 \u05d4\u05de\u05db\u05d9\u05e8\u05d5\u05ea \u05e0\u05e4\u05ea\u05d7\u05d5 \u05de\u05d7\u05d3\u05e9',
+      '\u05e0\u05d9\u05ea\u05df \u05e9\u05d5\u05d1 \u05dc\u05e8\u05db\u05d5\u05e9 \u05d7\u05d1\u05d9\u05dc\u05d5\u05ea \u05de\u05d4\u05e1\u05e4\u05e7, \u05d5\u05d4\u05d0\u05ea\u05e8 \u05d7\u05d6\u05e8 \u05dc\u05e4\u05e2\u05d5\u05dc\u05d4 \u05e8\u05d2\u05d9\u05dc\u05d4.' +
+      (rescued ? '\n\n\u05d4\u05d5\u05d7\u05d6\u05e8\u05d5 \u05dc\u05ea\u05d5\u05e8 ' + rescued + ' \u05d4\u05d6\u05de\u05e0\u05d5\u05ea \u05e9\u05e9\u05d5\u05dc\u05de\u05d5 \u05d5\u05dc\u05d0 \u05e1\u05d5\u05e4\u05e7\u05d5 \u05d1\u05d6\u05de\u05df \u05d4\u05ea\u05e7\u05dc\u05d4.' : ''));
   }
 }
 
 // Give paid-but-unbought orders back to the bot. Returns how many.
-// Orders that have used up their retries are NOT returned here — the site
+// Orders that have used up their retries are NOT returned here - the site
 // emails about those separately, because they need a person.
 function retryUnfulfilled_(tok) {
   try {
@@ -691,7 +693,7 @@ function retryUnfulfilled_(tok) {
 
 function sweepProvisioningOrders_() {
   const tok = PropertiesService.getScriptProperties().getProperty('ORDERS_TOKEN');
-  if (!tok) return;                          // optional — see setup notes above
+  if (!tok) return;                          // optional - see setup notes above
   try {
     const res = UrlFetchApp.fetch('https://www.waverole.com/api/orders', {
       method: 'post',
@@ -710,10 +712,10 @@ function sweepProvisioningOrders_() {
 }
 
 function orderAwaitingEsim_() {
-  // Signal 1 — the SITE's own queue: an order sits there as "pending" from
+  // Signal 1 - the SITE's own queue: an order sits there as "pending" from
   // the second the payment IPN lands, before the PC bot has done anything.
   // The receipts-row signal below only exists AFTER the PC bot both bought
-  // and wrote the row — the night WR-845JFY got stuck proved that row can
+  // and wrote the row - the night WR-845JFY got stuck proved that row can
   // simply never appear. Optional: needs ORDERS_TOKEN in Script Properties
   // (same value as the site's env var); skipped silently without it.
   try {
@@ -734,13 +736,13 @@ function orderAwaitingEsim_() {
   } catch (err) {
     Logger.log('site queue check failed: ' + err);   // fall through to the sheet
   }
-  // Signal 2 — a receipts row with an order number and no activation code
+  // Signal 2 - a receipts row with an order number and no activation code
   // (order bought, eSIM email not yet processed).
   try {
     const sh = SpreadsheetApp.openById(RECEIPTS_ID).getSheets()[0];
     const last = sh.getLastRow();
     if (last < 2) return false;
-    const n = Math.min(15, last - 1);        // newest rows only — enough for any burst
+    const n = Math.min(15, last - 1);        // newest rows only - enough for any burst
     const rows = sh.getRange(last - n + 1, 1, n, RCP_ACTIVATION_COL).getValues();
     for (const row of rows) {
       if (!String(row[RCP_ORDER_COL - 1] || '').trim()) continue;      // not an order row
@@ -752,7 +754,7 @@ function orderAwaitingEsim_() {
       if (Math.abs(age) < AWAITING_WINDOW_MS) return true;
     }
   } catch (err) {
-    // Never let this gate break the dispatcher — fall back to the 5-min cadence.
+    // Never let this gate break the dispatcher - fall back to the 5-min cadence.
     Logger.log('orderAwaitingEsim_ failed: ' + err);
   }
   return false;
@@ -760,19 +762,19 @@ function orderAwaitingEsim_() {
 
 function dailyScrape() {
   // Dispatching the GitHub scraper needs a GH_TOKEN. Without one this step
-  // is SKIPPED SILENTLY — the scraper has its own daily schedule on GitHub,
+  // is SKIPPED SILENTLY - the scraper has its own daily schedule on GitHub,
   // so no alert is needed (it used to email an error every morning).
   const gh = PropertiesService.getScriptProperties().getProperty('GH_TOKEN');
   if (gh) {
     try {
       runScrapeNow();
     } catch (err) {
-      alert_('dailyScrape נכשל', String(err));
+      alert_('dailyScrape \u05e0\u05db\u05e9\u05dc', String(err));
     }
   } else {
-    Logger.log('GH_TOKEN not set — skipping dispatch (GitHub cron handles the scrape).');
+    Logger.log('GH_TOKEN not set \u2014 skipping dispatch (GitHub cron handles the scrape).');
   }
-  // Full site sync 45 min later — after the scraper wrote fresh data to the
+  // Full site sync 45 min later - after the scraper wrote fresh data to the
   // sheet. Programmatic writes don't fire onEdit, so this sync is the ONLY
   // path that gets the daily price changes to the site.
   ScriptApp.newTrigger('fullSyncOnce').timeBased().after(45 * 60 * 1000).create();
@@ -785,11 +787,11 @@ function fullSyncOnce() {
   try {
     fullSync();
   } catch (err) {
-    alert_('הסנכרון היומי המלא נכשל', String(err));
+    alert_('\u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05d4\u05d9\u05d5\u05de\u05d9 \u05d4\u05de\u05dc\u05d0 \u05e0\u05db\u05e9\u05dc', String(err));
   }
 }
 
-// ── weekly Drive backup of both spreadsheets ────────────────────────
+// -- weekly Drive backup of both spreadsheets ------------------------
 function weeklyBackup() {
   try {
     const it = DriveApp.getFoldersByName(BACKUP_FOLDER);
@@ -809,16 +811,16 @@ function weeklyBackup() {
       copies.sort(function (a, b) { return b.getDateCreated() - a.getDateCreated(); });
       copies.slice(BACKUP_KEEP).forEach(function (f) { f.setTrashed(true); });
     });
-    Logger.log('weekly backup done → Drive folder "' + BACKUP_FOLDER + '"');
+    Logger.log('weekly backup done \u2192 Drive folder "' + BACKUP_FOLDER + '"');
   } catch (err) {
-    alert_('הגיבוי השבועי של הטבלאות נכשל', String(err));
+    alert_('\u05d4\u05d2\u05d9\u05d1\u05d5\u05d9 \u05d4\u05e9\u05d1\u05d5\u05e2\u05d9 \u05e9\u05dc \u05d4\u05d8\u05d1\u05dc\u05d0\u05d5\u05ea \u05e0\u05db\u05e9\u05dc', String(err));
   }
 }
 
 // Manual test: verifies the alert-email path works (run from the editor).
 function testAlert() {
-  alert_('בדיקת מערכת ההתראות',
-    'אם קיבלת את המייל הזה — מערכת ההתראות של סנכרון המחירים עובדת ✓');
+  alert_('\u05d1\u05d3\u05d9\u05e7\u05ea \u05de\u05e2\u05e8\u05db\u05ea \u05d4\u05d4\u05ea\u05e8\u05d0\u05d5\u05ea',
+    '\u05d0\u05dd \u05e7\u05d9\u05d1\u05dc\u05ea \u05d0\u05ea \u05d4\u05de\u05d9\u05d9\u05dc \u05d4\u05d6\u05d4 \u2014 \u05de\u05e2\u05e8\u05db\u05ea \u05d4\u05d4\u05ea\u05e8\u05d0\u05d5\u05ea \u05e9\u05dc \u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05d4\u05de\u05d7\u05d9\u05e8\u05d9\u05dd \u05e2\u05d5\u05d1\u05d3\u05ea \u2713');
   Logger.log('test alert sent to ' + ALERT_EMAIL);
 }
 
@@ -835,7 +837,7 @@ const GH_RUNS = 'https://api.github.com/repos/nitzanbarash/esim-price-scraper/ac
 function toDate_(v) {
   // Duck-typed, not `instanceof Date`: values handed over by the Sheets
   // service can come from another JS realm, where instanceof silently
-  // answers false — and a date read as "no date" would mail a stale-data
+  // answers false - and a date read as "no date" would mail a stale-data
   // alarm every single morning. getTime also screens out Invalid Date.
   if (v && typeof v.getTime === 'function') {
     return isNaN(v.getTime()) ? null : v;
@@ -849,14 +851,14 @@ function toDate_(v) {
  * How fresh is the data the scraper actually wrote?
  *
  * The old check asked Drive for the FILE's last-modified time, which moves
- * whenever anyone touches the spreadsheet — including the owner's own edits.
+ * whenever anyone touches the spreadsheet - including the owner's own edits.
  * On 2026-08-19 every scrape run was killed by the workflow time limit and
  * this still reported healthy, because the file had been edited by hand that
  * morning. So read the scraper's OWN per-row stamp instead: it is the only
  * value nothing but a completed scrape can produce.
  *
  * Per-row rather than newest-row: the scraper now saves in batches, so a run
- * cut off half way leaves some rows fresh and the rest a day old — a state
+ * cut off half way leaves some rows fresh and the rest a day old - a state
  * the newest stamp alone would report as perfect.
  *
  * Columns are found by header text here rather than through HEADERS, so the
@@ -865,10 +867,10 @@ function toDate_(v) {
 function scraperFreshness_() {
   const values = sheet_().getDataRange().getValues();
   const head = values[0].map(h => String(h).trim());
-  const iLink = head.indexOf('קישור');
-  const iUpd = head.indexOf('עודכן לאחרונה');
+  const iLink = head.indexOf('\u05e7\u05d9\u05e9\u05d5\u05e8');
+  const iUpd = head.indexOf('\u05e2\u05d5\u05d3\u05db\u05df \u05dc\u05d0\u05d7\u05e8\u05d5\u05e0\u05d4');
   if (iLink < 0 || iUpd < 0) {
-    return { error: 'לא נמצאה עמודת "קישור" או "עודכן לאחרונה" בשורת הכותרות' };
+    return { error: '\u05dc\u05d0 \u05e0\u05de\u05e6\u05d0\u05d4 \u05e2\u05de\u05d5\u05d3\u05ea "\u05e7\u05d9\u05e9\u05d5\u05e8" \u05d0\u05d5 "\u05e2\u05d5\u05d3\u05db\u05df \u05dc\u05d0\u05d7\u05e8\u05d5\u05e0\u05d4" \u05d1\u05e9\u05d5\u05e8\u05ea \u05d4\u05db\u05d5\u05ea\u05e8\u05d5\u05ea' };
   }
 
   const cutoff = Date.now() - MAX_SCRAPE_STALE_HOURS * 36e5;
@@ -890,7 +892,7 @@ function scraperFreshness_() {
 function lastScrapeRun_() {
   // esim-price-scraper is a PUBLIC repo, so its run history needs no token.
   // The first version bailed out when GH_TOKEN was unset and returned "no
-  // problem found" — a check that quietly declines to run, which is the same
+  // problem found" - a check that quietly declines to run, which is the same
   // shape of bug as the all-clear this whole function exists to prevent.
   // The token is sent when present only because it raises the rate limit.
   const token = PropertiesService.getScriptProperties().getProperty('GH_TOKEN');
@@ -898,7 +900,7 @@ function lastScrapeRun_() {
   if (token) headers.Authorization = 'Bearer ' + token;
   const res = UrlFetchApp.fetch(GH_RUNS, { headers: headers, muteHttpExceptions: true });
   if (res.getResponseCode() !== 200) {
-    throw new Error('GitHub API החזיר ' + res.getResponseCode());
+    throw new Error('GitHub API \u05d4\u05d7\u05d6\u05d9\u05e8 ' + res.getResponseCode());
   }
   const runs = JSON.parse(res.getContentText()).workflow_runs || [];
   for (let i = 0; i < runs.length; i++) {
@@ -907,7 +909,7 @@ function lastScrapeRun_() {
   return null;                           // genuinely no finished run yet
 }
 
-// ── watchdog: is the live site actually fresh? ──────────────────────
+// -- watchdog: is the live site actually fresh? ----------------------
 // The handlers that must be installed for the automation to exist at all.
 // Kept next to the watchdog rather than inside setupTriggers so that adding a
 // feature here forces the question "and is it actually running?".
@@ -920,10 +922,10 @@ const EXPECTED_TRIGGERS = ['onEditPush', 'onReceiptsEdit', 'dailyScrape',
  * Every check appends to ONE list of problems and a single place at the end
  * decides between the alert and the all-clear. That structure is the fix for
  * the failure this function itself had: the checks used to email
- * independently, so the site-freshness check could send "✅ הכל תקין" in the
+ * independently, so the site-freshness check could send its all-clear in the
  * same minute the scraper check found the prices a day old (2026-08-19). An
  * all-clear must be a statement about EVERY check, or it is worse than no
- * email at all — it actively tells the owner to stop looking.
+ * email at all - it actively tells the owner to stop looking.
  */
 function checkSiteFresh() {
   const problems = [];
@@ -932,7 +934,7 @@ function checkSiteFresh() {
   // 1. Is the automation even installed?
   //
   // A trigger that was never created fails in the most expensive way there is:
-  // in perfect silence. onReceiptsEdit sat missing for days — the code existed,
+  // in perfect silence. onReceiptsEdit sat missing for days - the code existed,
   // was correct, was tested, and simply had never been deployed, so editing the
   // receipts sheet did nothing and there was nothing anywhere to say why. Newly
   // written code that is never installed looks exactly like broken code.
@@ -940,35 +942,35 @@ function checkSiteFresh() {
     const installed = ScriptApp.getProjectTriggers().map(t => t.getHandlerFunction());
     const absent = EXPECTED_TRIGGERS.filter(f => installed.indexOf(f) < 0);
     if (absent.length) {
-      problems.push('טריגרים חסרים — חלק מהאוטומציה לא רצה בכלל: ' + absent.join(', ') +
-        '\n   כל עוד הם חסרים הם פשוט לא קורים, בלי שום הודעת שגיאה.' +
-        '\n   תיקון: עורך הסקריפט → בחר setupTriggers בתפריט הפונקציות → הרץ ▶');
+      problems.push('\u05d8\u05e8\u05d9\u05d2\u05e8\u05d9\u05dd \u05d7\u05e1\u05e8\u05d9\u05dd \u2014 \u05d7\u05dc\u05e7 \u05de\u05d4\u05d0\u05d5\u05d8\u05d5\u05de\u05e6\u05d9\u05d4 \u05dc\u05d0 \u05e8\u05e6\u05d4 \u05d1\u05db\u05dc\u05dc: ' + absent.join(', ') +
+        '\n   \u05db\u05dc \u05e2\u05d5\u05d3 \u05d4\u05dd \u05d7\u05e1\u05e8\u05d9\u05dd \u05d4\u05dd \u05e4\u05e9\u05d5\u05d8 \u05dc\u05d0 \u05e7\u05d5\u05e8\u05d9\u05dd, \u05d1\u05dc\u05d9 \u05e9\u05d5\u05dd \u05d4\u05d5\u05d3\u05e2\u05ea \u05e9\u05d2\u05d9\u05d0\u05d4.' +
+        '\n   \u05ea\u05d9\u05e7\u05d5\u05df: \u05e2\u05d5\u05e8\u05da \u05d4\u05e1\u05e7\u05e8\u05d9\u05e4\u05d8 \u2192 \u05d1\u05d7\u05e8 setupTriggers \u05d1\u05ea\u05e4\u05e8\u05d9\u05d8 \u05d4\u05e4\u05d5\u05e0\u05e7\u05e6\u05d9\u05d5\u05ea \u2192 \u05d4\u05e8\u05e5 \u25b6');
     } else {
-      passed.push('כל הטריגרים מותקנים (' + EXPECTED_TRIGGERS.length + ')');
+      passed.push('\u05db\u05dc \u05d4\u05d8\u05e8\u05d9\u05d2\u05e8\u05d9\u05dd \u05de\u05d5\u05ea\u05e7\u05e0\u05d9\u05dd (' + EXPECTED_TRIGGERS.length + ')');
     }
   } catch (err) {
-    problems.push('בדיקת הטריגרים נכשלה: ' + err);
+    problems.push('\u05d1\u05d3\u05d9\u05e7\u05ea \u05d4\u05d8\u05e8\u05d9\u05d2\u05e8\u05d9\u05dd \u05e0\u05db\u05e9\u05dc\u05d4: ' + err);
   }
 
   // 2. Did the last scrape run actually SUCCEED? The most direct signal there
-  //    is — a cancelled or failed run is known within minutes, instead of
+  //    is - a cancelled or failed run is known within minutes, instead of
   //    waiting for the data to age past a threshold.
   try {
     const run = lastScrapeRun_();
     if (run && run.conclusion !== 'success') {
-      problems.push('הריצה האחרונה של סקרייפר המחירים הסתיימה ב-' + run.conclusion +
+      problems.push('\u05d4\u05e8\u05d9\u05e6\u05d4 \u05d4\u05d0\u05d7\u05e8\u05d5\u05e0\u05d4 \u05e9\u05dc \u05e1\u05e7\u05e8\u05d9\u05d9\u05e4\u05e8 \u05d4\u05de\u05d7\u05d9\u05e8\u05d9\u05dd \u05d4\u05e1\u05ea\u05d9\u05d9\u05de\u05d4 \u05d1-' + run.conclusion +
         ' (' + run.created_at + ')' +
         '\n   ' + run.html_url +
-        '\n   כלומר המחירים בטבלה לא התעדכנו מאז. אם זה cancelled — הריצה' +
-        '\n   נחתכה על מגבלת הזמן של ה-workflow.');
+        '\n   \u05db\u05dc\u05d5\u05de\u05e8 \u05d4\u05de\u05d7\u05d9\u05e8\u05d9\u05dd \u05d1\u05d8\u05d1\u05dc\u05d4 \u05dc\u05d0 \u05d4\u05ea\u05e2\u05d3\u05db\u05e0\u05d5 \u05de\u05d0\u05d6. \u05d0\u05dd \u05d6\u05d4 cancelled \u2014 \u05d4\u05e8\u05d9\u05e6\u05d4' +
+        '\n   \u05e0\u05d7\u05ea\u05db\u05d4 \u05e2\u05dc \u05de\u05d2\u05d1\u05dc\u05ea \u05d4\u05d6\u05de\u05df \u05e9\u05dc \u05d4-workflow.');
     } else if (run) {
-      passed.push('ריצת הסקרייפר האחרונה: success (' + run.created_at + ')');
+      passed.push('\u05e8\u05d9\u05e6\u05ea \u05d4\u05e1\u05e7\u05e8\u05d9\u05d9\u05e4\u05e8 \u05d4\u05d0\u05d7\u05e8\u05d5\u05e0\u05d4: success (' + run.created_at + ')');
     }
   } catch (err) {
-    // Not fatal to the other checks, but it cannot count as a pass either —
+    // Not fatal to the other checks, but it cannot count as a pass either -
     // an unreachable check is an unknown, and unknowns belong in the alert.
-    problems.push('לא ניתן לבדוק את ריצת הסקרייפר מול GitHub: ' + err +
-      '\n   כלומר אין לי אישור שהסריקה האחרונה הצליחה.');
+    problems.push('\u05dc\u05d0 \u05e0\u05d9\u05ea\u05df \u05dc\u05d1\u05d3\u05d5\u05e7 \u05d0\u05ea \u05e8\u05d9\u05e6\u05ea \u05d4\u05e1\u05e7\u05e8\u05d9\u05d9\u05e4\u05e8 \u05de\u05d5\u05dc GitHub: ' + err +
+      '\n   \u05db\u05dc\u05d5\u05de\u05e8 \u05d0\u05d9\u05df \u05dc\u05d9 \u05d0\u05d9\u05e9\u05d5\u05e8 \u05e9\u05d4\u05e1\u05e8\u05d9\u05e7\u05d4 \u05d4\u05d0\u05d7\u05e8\u05d5\u05e0\u05d4 \u05d4\u05e6\u05dc\u05d9\u05d7\u05d4.');
   }
 
   // 3. Upstream end-to-end: did fresh prices actually LAND in the sheet?
@@ -978,19 +980,19 @@ function checkSiteFresh() {
   try {
     const f = scraperFreshness_();
     if (f.error) {
-      problems.push('בדיקת רעננות הטבלה נכשלה: ' + f.error);
+      problems.push('\u05d1\u05d3\u05d9\u05e7\u05ea \u05e8\u05e2\u05e0\u05e0\u05d5\u05ea \u05d4\u05d8\u05d1\u05dc\u05d4 \u05e0\u05db\u05e9\u05dc\u05d4: ' + f.error);
     } else if (f.stale || f.blank) {
-      problems.push('בטבלת המחירים ' + (f.stale + f.blank) + ' מתוך ' + f.total +
-        ' שורות לא עודכנו ביותר מ-' + MAX_SCRAPE_STALE_HOURS + ' שעות' +
-        (f.blank ? ' (' + f.blank + ' מהן בלי חותמת בכלל)' : '') +
-        '.\n   העדכון הישן ביותר: ' + (f.oldest ? f.oldest.toISOString() : 'לא ידוע') +
-        '\n   הבוטים עובדים לפי המחירים האלה — בדוק את esim-price-scraper → Actions.');
+      problems.push('\u05d1\u05d8\u05d1\u05dc\u05ea \u05d4\u05de\u05d7\u05d9\u05e8\u05d9\u05dd ' + (f.stale + f.blank) + ' \u05de\u05ea\u05d5\u05da ' + f.total +
+        ' \u05e9\u05d5\u05e8\u05d5\u05ea \u05dc\u05d0 \u05e2\u05d5\u05d3\u05db\u05e0\u05d5 \u05d1\u05d9\u05d5\u05ea\u05e8 \u05de-' + MAX_SCRAPE_STALE_HOURS + ' \u05e9\u05e2\u05d5\u05ea' +
+        (f.blank ? ' (' + f.blank + ' \u05de\u05d4\u05df \u05d1\u05dc\u05d9 \u05d7\u05d5\u05ea\u05de\u05ea \u05d1\u05db\u05dc\u05dc)' : '') +
+        '.\n   \u05d4\u05e2\u05d3\u05db\u05d5\u05df \u05d4\u05d9\u05e9\u05df \u05d1\u05d9\u05d5\u05ea\u05e8: ' + (f.oldest ? f.oldest.toISOString() : '\u05dc\u05d0 \u05d9\u05d3\u05d5\u05e2') +
+        '\n   \u05d4\u05d1\u05d5\u05d8\u05d9\u05dd \u05e2\u05d5\u05d1\u05d3\u05d9\u05dd \u05dc\u05e4\u05d9 \u05d4\u05de\u05d7\u05d9\u05e8\u05d9\u05dd \u05d4\u05d0\u05dc\u05d4 \u2014 \u05d1\u05d3\u05d5\u05e7 \u05d0\u05ea esim-price-scraper \u2192 Actions.');
     } else {
-      passed.push('כל ' + f.total + ' שורות המחירים עודכנו ב-' +
-        MAX_SCRAPE_STALE_HOURS + ' השעות האחרונות');
+      passed.push('\u05db\u05dc ' + f.total + ' \u05e9\u05d5\u05e8\u05d5\u05ea \u05d4\u05de\u05d7\u05d9\u05e8\u05d9\u05dd \u05e2\u05d5\u05d3\u05db\u05e0\u05d5 \u05d1-' +
+        MAX_SCRAPE_STALE_HOURS + ' \u05d4\u05e9\u05e2\u05d5\u05ea \u05d4\u05d0\u05d7\u05e8\u05d5\u05e0\u05d5\u05ea');
     }
   } catch (err) {
-    problems.push('בדיקת רעננות הטבלה נכשלה: ' + err);
+    problems.push('\u05d1\u05d3\u05d9\u05e7\u05ea \u05e8\u05e2\u05e0\u05e0\u05d5\u05ea \u05d4\u05d8\u05d1\u05dc\u05d4 \u05e0\u05db\u05e9\u05dc\u05d4: ' + err);
   }
 
   // 4. Downstream: does the live site actually serve fresh data?
@@ -998,42 +1000,42 @@ function checkSiteFresh() {
     const res = UrlFetchApp.fetch(OVERLAY_URL + '?cb=' + Date.now(),
       { muteHttpExceptions: true });
     if (res.getResponseCode() !== 200) {
-      problems.push('האתר לא מחזיר את קובץ הנתונים: HTTP ' +
-        res.getResponseCode() + ' מ-' + OVERLAY_URL);
+      problems.push('\u05d4\u05d0\u05ea\u05e8 \u05dc\u05d0 \u05de\u05d7\u05d6\u05d9\u05e8 \u05d0\u05ea \u05e7\u05d5\u05d1\u05e5 \u05d4\u05e0\u05ea\u05d5\u05e0\u05d9\u05dd: HTTP ' +
+        res.getResponseCode() + ' \u05de-' + OVERLAY_URL);
     } else {
       const updated = new Date(JSON.parse(res.getContentText()).updated);
       const hours = (Date.now() - updated.getTime()) / 36e5;
       Logger.log('site data age: ' + hours.toFixed(1) + 'h');
       // The overlay `updated` only moves when a price actually CHANGED (the
       // endpoint skips no-op commits). A successful recent sync is just as
-      // fresh — the site provably has today's numbers, they're identical.
+      // fresh - the site provably has today's numbers, they're identical.
       const lastOk = PropertiesService.getScriptProperties().getProperty('LAST_SYNC_OK');
       const okHours = lastOk ? (Date.now() - new Date(lastOk).getTime()) / 36e5 : Infinity;
       if (hours < MAX_STALE_HOURS) {
-        passed.push('נתוני האתר עודכנו לפני ' + hours.toFixed(1) + ' שעות');
+        passed.push('\u05e0\u05ea\u05d5\u05e0\u05d9 \u05d4\u05d0\u05ea\u05e8 \u05e2\u05d5\u05d3\u05db\u05e0\u05d5 \u05dc\u05e4\u05e0\u05d9 ' + hours.toFixed(1) + ' \u05e9\u05e2\u05d5\u05ea');
       } else if (okHours < MAX_STALE_HOURS) {
-        passed.push('הסנכרון האחרון רץ בהצלחה לפני ' + okHours.toFixed(1) +
-          ' שעות ולא מצא שינויי מחירים (ולכן חותמת האתר לא זזה — זה תקין)');
+        passed.push('\u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05d4\u05d0\u05d7\u05e8\u05d5\u05df \u05e8\u05e5 \u05d1\u05d4\u05e6\u05dc\u05d7\u05d4 \u05dc\u05e4\u05e0\u05d9 ' + okHours.toFixed(1) +
+          ' \u05e9\u05e2\u05d5\u05ea \u05d5\u05dc\u05d0 \u05de\u05e6\u05d0 \u05e9\u05d9\u05e0\u05d5\u05d9\u05d9 \u05de\u05d7\u05d9\u05e8\u05d9\u05dd (\u05d5\u05dc\u05db\u05df \u05d7\u05d5\u05ea\u05de\u05ea \u05d4\u05d0\u05ea\u05e8 \u05dc\u05d0 \u05d6\u05d6\u05d4 \u2014 \u05d6\u05d4 \u05ea\u05e7\u05d9\u05df)');
       } else {
-        problems.push('הנתונים באתר לא התעדכנו ' + Math.round(hours) + ' שעות' +
-          '\n   העדכון האחרון באתר: ' + updated.toISOString() +
-          '\n   וגם לא היה סנכרון מוצלח ב-' + MAX_STALE_HOURS + ' השעות האחרונות.' +
-          '\n   לתיקון מיידי: להריץ fullSync מעורך ה-Apps Script.');
+        problems.push('\u05d4\u05e0\u05ea\u05d5\u05e0\u05d9\u05dd \u05d1\u05d0\u05ea\u05e8 \u05dc\u05d0 \u05d4\u05ea\u05e2\u05d3\u05db\u05e0\u05d5 ' + Math.round(hours) + ' \u05e9\u05e2\u05d5\u05ea' +
+          '\n   \u05d4\u05e2\u05d3\u05db\u05d5\u05df \u05d4\u05d0\u05d7\u05e8\u05d5\u05df \u05d1\u05d0\u05ea\u05e8: ' + updated.toISOString() +
+          '\n   \u05d5\u05d2\u05dd \u05dc\u05d0 \u05d4\u05d9\u05d4 \u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05de\u05d5\u05e6\u05dc\u05d7 \u05d1-' + MAX_STALE_HOURS + ' \u05d4\u05e9\u05e2\u05d5\u05ea \u05d4\u05d0\u05d7\u05e8\u05d5\u05e0\u05d5\u05ea.' +
+          '\n   \u05dc\u05ea\u05d9\u05e7\u05d5\u05df \u05de\u05d9\u05d9\u05d3\u05d9: \u05dc\u05d4\u05e8\u05d9\u05e5 fullSync \u05de\u05e2\u05d5\u05e8\u05da \u05d4-Apps Script.');
       }
     }
   } catch (err) {
-    problems.push('בדיקת האתר נכשלה: ' + err);
+    problems.push('\u05d1\u05d3\u05d9\u05e7\u05ea \u05d4\u05d0\u05ea\u05e8 \u05e0\u05db\u05e9\u05dc\u05d4: ' + err);
   }
 
   // 5. One verdict, one email.
   const passedText = passed.length
-    ? '\n\nמה כן נבדק ועבר:\n• ' + passed.join('\n• ') : '';
+    ? '\n\n\u05de\u05d4 \u05db\u05df \u05e0\u05d1\u05d3\u05e7 \u05d5\u05e2\u05d1\u05e8:\n\u2022 ' + passed.join('\n\u2022 ') : '';
   if (problems.length) {
-    alert_('הבדיקה היומית מצאה ' + problems.length + ' תקלות',
+    alert_('\u05d4\u05d1\u05d3\u05d9\u05e7\u05d4 \u05d4\u05d9\u05d5\u05de\u05d9\u05ea \u05de\u05e6\u05d0\u05d4 ' + problems.length + ' \u05ea\u05e7\u05dc\u05d5\u05ea',
       problems.map(function (p, i) { return (i + 1) + '. ' + p; }).join('\n\n') + passedText);
   } else {
     // Daily all-clear so a quiet inbox is proof it ran, not that it broke.
-    report_('הבדיקה היומית עברה — הכל תקין ✓',
-      'כל הבדיקות עברו:\n• ' + passed.join('\n• '));
+    report_('\u05d4\u05d1\u05d3\u05d9\u05e7\u05d4 \u05d4\u05d9\u05d5\u05de\u05d9\u05ea \u05e2\u05d1\u05e8\u05d4 \u2014 \u05d4\u05db\u05dc \u05ea\u05e7\u05d9\u05df \u2713',
+      '\u05db\u05dc \u05d4\u05d1\u05d3\u05d9\u05e7\u05d5\u05ea \u05e2\u05d1\u05e8\u05d5:\n\u2022 ' + passed.join('\n\u2022 '));
   }
 }
