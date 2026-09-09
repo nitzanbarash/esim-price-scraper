@@ -13,6 +13,7 @@ import sys
 
 from esim_price_scraper import HEADER_KEYS
 from stellar_prices import (
+    stamp_price_direction,
     MARK_GONE, MARK_REGIONAL, MARK_SHORT, RETAIL_OVER_WHOLESALE, FX_FALLBACK,
     Catalogue, decide, fetch_fx, is_regional_sku, plan_updates, price_cell,
     read_rows,
@@ -213,6 +214,63 @@ check("an exception is a failure too, not a crash",
       fetch_fx(["$1.16 (€1.00)"], fetch=lambda: 1 / 0)[1], "derived from the sheet's own cells")
 check("with nothing to derive from, the constant", fetch_fx([], fetch=lambda: None), (FX_FALLBACK, "hard-coded fallback"))
 check("price cell format", price_cell(2.21, 1.1614), "$2.57 (€2.21)")
+
+print("-- the price column's text direction --")
+
+
+class _FakeSvc:
+    """Enough of the Sheets service to watch what stamp_price_direction sends."""
+
+    def __init__(self, cells):
+        self.cells, self.requests = cells, []
+
+    def spreadsheets(self):
+        return self
+
+    def get(self, **kw):
+        if "includeGridData" in kw:
+            rows = [{"values": [{
+                "userEnteredValue": {"stringValue": t},
+                "userEnteredFormat": ({"textDirection": d} if d else {})}]}
+                for t, d in self.cells]
+            return _Exec({"sheets": [{"data": [{"rowData": rows}]}]})
+        return _Exec({"sheets": [{"properties": {
+            "sheetId": 7, "gridProperties": {"rowCount": 300}}}]})
+
+    def batchUpdate(self, **kw):
+        self.requests.extend(kw["body"]["requests"])
+        return _Exec({})
+
+
+class _Exec:
+    def __init__(self, v):
+        self.v = v
+
+    def execute(self, **kw):
+        return self.v
+
+
+svc = _FakeSvc([("$2.57 (€2.21)", None), ("$1.00 (€0.86)", "LEFT_TO_RIGHT"),
+                ("", None), ("$3.13 (€2.69)", None)])
+backwards = stamp_price_direction(svc, {"price": 6, "prev": 7})
+# two unstamped cells in each of the two columns
+check("counts only non-empty cells that lack the direction", backwards, 4)
+reqs = [r["repeatCell"] for r in svc.requests[0:1]] + [
+    r["repeatCell"] for r in svc.requests[1:]]
+cols = sorted((r["range"]["startColumnIndex"], r["range"]["endColumnIndex"]) for r in reqs)
+check("stamps BOTH money columns, not just the buy price", cols, [(6, 7), (7, 8)])
+req = reqs[0]
+check("stamps the real sheetId, not a hard-coded 0", req["range"]["sheetId"], 7)
+check("skips the header row", req["range"]["startRowIndex"], 1)
+check("covers the whole grid, not just today's rows", req["range"]["endRowIndex"], 300)
+check("sets left-to-right",
+      req["cell"]["userEnteredFormat"]["textDirection"], "LEFT_TO_RIGHT")
+check("touches only the two format fields it owns", req["fields"],
+      "userEnteredFormat.textDirection,userEnteredFormat.horizontalAlignment")
+check("a fully stamped column reports nothing to fix",
+      stamp_price_direction(_FakeSvc([("$1 (€1)", "LEFT_TO_RIGHT")]), {"price": 6}), 0)
+check("a column the sheet does not have is skipped, not crashed on",
+      stamp_price_direction(_FakeSvc([("$1 (€1)", None)]), {"price": 6}), 1)
 
 print()
 if _fails:

@@ -379,16 +379,81 @@ def plan_updates(decisions, fx: float, ts: str, today: str) -> list[tuple[int, s
 # ── Sheets I/O ──────────────────────────────────────────────────────────────
 
 def sheets_service(cred_path: str):
+    """Credentials from the environment in the cloud, from a file on a desktop.
+
+    Same order as the scraper's setup_google_sheets: GitHub Actions has no
+    credentials.json to read, only the GOOGLE_CREDENTIALS_JSON secret.
+    """
     from google.oauth2.service_account import Credentials
     from googleapiclient.discovery import build
-    creds = Credentials.from_service_account_file(
-        cred_path, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    env = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if env:
+        creds = Credentials.from_service_account_info(json.loads(env), scopes=scopes)
+    else:
+        creds = Credentials.from_service_account_file(cred_path, scopes=scopes)
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
 def read_sheet(svc) -> list[list[str]]:
     return svc.spreadsheets().values().get(
         spreadsheetId=SHEET_ID, range="A1:Z").execute().get("values", [])
+
+
+def stamp_price_direction(svc, col: dict[str, int]) -> int:
+    """Make the money columns render left-to-right; report how many needed it.
+
+    The sheet is right-to-left, so '$2.57 (€2.21)' renders euro-first unless the
+    cell says otherwise — the owner reads €2.21 as the price. The string is not
+    the price; the string PLUS this format is.
+
+    Both money columns get it, not just the buy price: on a price move the OLD
+    two-currency string is copied verbatim into 'מחיר קודם', so a column that
+    was never stamped shows yesterday's price backwards while today's reads
+    correctly. It runs over the whole of each column so rows added later are
+    covered, and it runs BEFORE the values are written, because a value that
+    lands in an unstamped cell is a wrong number until the second call returns.
+    """
+    targets = [col[k] for k in ("price", "prev") if k in col]
+    sheet_id, rows = _grid(svc)
+    before = sum(_unstamped(svc, c, rows) for c in targets)
+    svc.spreadsheets().batchUpdate(spreadsheetId=SHEET_ID, body={"requests": [{
+        "repeatCell": {
+            "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": rows,
+                      "startColumnIndex": c, "endColumnIndex": c + 1},
+            "cell": {"userEnteredFormat": {"textDirection": "LEFT_TO_RIGHT",
+                                           "horizontalAlignment": "RIGHT"}},
+            "fields": ("userEnteredFormat.textDirection,"
+                       "userEnteredFormat.horizontalAlignment"),
+        }} for c in targets]}).execute(num_retries=3)
+    return before
+
+
+def _grid(svc) -> tuple[int, int]:
+    """(sheetId, rowCount) of the first tab — the one read_sheet's bare A1:Z hits."""
+    sheet = svc.spreadsheets().get(
+        spreadsheetId=SHEET_ID,
+        fields="sheets(properties(sheetId,gridProperties(rowCount)))",
+    ).execute()["sheets"][0]["properties"]
+    return sheet["sheetId"], sheet["gridProperties"]["rowCount"]
+
+
+def _unstamped(svc, g: int, rows: int) -> int:
+    """How many two-currency cells in this column render backwards right now."""
+    data = svc.spreadsheets().get(
+        spreadsheetId=SHEET_ID, includeGridData=True,
+        ranges=[f"{col_letter(g)}2:{col_letter(g)}{rows}"],
+        fields="sheets(data(rowData(values(userEnteredValue,"
+               "userEnteredFormat/textDirection))))",
+    ).execute()["sheets"][0]["data"][0].get("rowData", [])
+    n = 0
+    for rd in data:
+        v = (rd.get("values") or [{}])[0]
+        text = (v.get("userEnteredValue") or {}).get("stringValue", "")
+        if text.strip() and (v.get("userEnteredFormat") or {}).get(
+                "textDirection") != "LEFT_TO_RIGHT":
+            n += 1
+    return n
 
 
 def write_updates(svc, col: dict[str, int], updates) -> int:
@@ -474,7 +539,9 @@ def main(argv=None) -> int:
         print("\n(dry run — nothing written; add --apply to write)")
         return 0
     n = write_updates(svc, col, updates)
-    print(f"\n✅ wrote {n} cells")
+    fixed = stamp_price_direction(svc, col)
+    print(f"\n✅ wrote {n} cells"
+          + (f"; corrected the text direction of {fixed} money cells" if fixed else ""))
     return 0
 
 

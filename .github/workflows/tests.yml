@@ -48,3 +48,21 @@ jobs:
       # nightly run that already wrote the numbers down.
       - name: Finance core
         run: python -m unittest test_finance_core -v
+
+      # Which SUPPLIER row the books read. One SKU carries a row per supplier,
+      # stacked, and only the row we buy from holds our sell price — keying by
+      # SKU alone let the Stellar row underneath blank out 57 packages' list
+      # price and report a discount of zero on 21 real sales.
+      - name: Finance price rows
+        run: python test_finance_prices.py
+
+      # Which Stellar LISTING each row is priced from. A package code is a
+      # family spanning several GB and day counts, so the wrong pick sells the
+      # customer fewer days than the sheet promises — and the price string is
+      # only true while its cell carries a left-to-right direction.
+      - name: Stellar prices
+        run: python test_stellar_prices.py
+
+      # A duplicate eSIM email is money and trust, both already spent.
+      - name: Delivery dedup
+        run: python test_delivery_dedup.py

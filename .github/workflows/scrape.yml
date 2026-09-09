@@ -16,7 +16,12 @@ jobs:
     runs-on: ubuntu-latest
     # Backstop only. Every step below carries its own limit, so the job limit
     # should never be what stops us — if it is, a step is missing a timeout.
-    timeout-minutes: 75
+    # It must therefore stay above the sum of those limits (6 + 8 + 68 + 6 = 88),
+    # or a step gets cut by the job instead of by its own cap. Raised 75 -> 90 on
+    # 2026-09-09 with the Stellar step: at 75 a slow scraper would have eaten the
+    # 6 minutes the Stellar refresh needs, and 'if: always()' cannot save a step
+    # from a job timeout — the job kills everything, including the run's log.
+    timeout-minutes: 90
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -99,3 +104,23 @@ jobs:
           # The service-account JSON is stored as a repo secret, never in the code.
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: python esim_price_scraper.py
+
+      # Stellar publishes its whole catalogue as one JSON file, so its rows
+      # cost seconds where esim.dog's cost an hour of browser driving. That is
+      # the entire reason this is a separate step and not more scraper work.
+      #
+      # It runs AFTER the scraper, and that order matters: stellar_prices.py
+      # picks a Stellar listing against the days the customer is promised, and
+      # the promise is whatever the esim.dog row says AFTER the scraper's
+      # cheapest-day search has rewritten it. Running first would price today's
+      # rows against yesterday's promise.
+      #
+      # always() because the scraper exits 1 when its budget cuts rows short,
+      # which is a normal outcome, not a reason to leave the Stellar rows a day
+      # stale. It needs no Stellar credentials — the catalogue feed is public.
+      - name: Refresh Stellar prices
+        if: always()
+        timeout-minutes: 6
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python stellar_prices.py --apply
