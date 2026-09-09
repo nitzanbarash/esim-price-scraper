@@ -157,11 +157,11 @@ class TestFeeModel(unittest.TestCase):
 
 class TestSale(unittest.TestCase):
     def _sale(self, sell, buy, fee=None, list_price=None, model=None,
-              provider=None):
+              provider=None, discount=""):
         return fc.build_sale(
             {"date": "09/08/2026 08:03:25", "sku": "2.30.10", "sell": sell,
              "buy": buy, "region": "Greece", "order_id": "WR-TEST",
-             "provider": provider},
+             "provider": provider, "discount": discount},
             {"fee": fee, "list": list_price}, model or fc.FeeModel())
 
     def test_profit_subtracts_both_the_supplier_and_the_processor(self):
@@ -184,11 +184,13 @@ class TestSale(unittest.TestCase):
         # to show a package priced this close to its cost. (The real 20GB
         # row was the owner buying on the company's account; that is an
         # internal order, covered in TestSummary.)
-        s = self._sale("7$", "6.99$", list_price="9.99")
+        s = self._sale("7$", "6.99$", list_price="9.99",
+                       discount="30% ($2.99 הנחה)")
         self.assertAlmostEqual(s.profit, 0.01, places=4)
         self.assertLess(s.margin_pct, 1)
         self.assertTrue(s.discounted)
-        self.assertAlmostEqual(s.discount_pct, 29.93, places=1)
+        self.assertAlmostEqual(s.discount_pct, 30.0, places=1)
+        self.assertAlmostEqual(s.discount_usd, 2.99, places=2)
 
     def test_the_same_order_would_have_lost_money_on_a_card(self):
         s = self._sale("7$", "6.99$", list_price="9.99", provider="card")
@@ -198,6 +200,31 @@ class TestSale(unittest.TestCase):
         s = self._sale("6$", "4.17$", list_price="6")
         self.assertFalse(s.discounted)
         self.assertEqual(s.discount_pct, 0.0)
+
+    def test_a_sale_under_today_s_list_is_not_a_discount_by_itself(self):
+        # The list price is rewritten daily. A sale from before a price move
+        # sits under today's number without anyone having discounted it, and
+        # 13 of the 19 orders the books called "discounted" were this. The
+        # receipts sheet said "-" on every one of them.
+        s = self._sale("6$", "4.17$", list_price="6.49")
+        self.assertIsNone(s.discount_pct)
+        self.assertFalse(s.discounted)
+        self.assertEqual(s.discount_usd, 0.0)
+
+    def test_a_dash_in_the_receipts_sheet_means_a_known_zero(self):
+        s = self._sale("4.5$", "2$", list_price="7", discount="-")
+        self.assertEqual(s.discount_pct, 0.0)
+        self.assertFalse(s.discounted)
+
+    def test_the_recorded_discount_outranks_today_s_list_price(self):
+        s = self._sale("6$", "4.17$", list_price="99", discount="9% ($1.48 הנחה)")
+        self.assertAlmostEqual(s.discount_pct, 9.0, places=2)
+        self.assertAlmostEqual(s.discount_usd, 1.48, places=2)
+
+    def test_a_giveaway_is_a_hundred_percent_off(self):
+        s = self._sale("0$", "0.68$", list_price="0.68", discount="100% (0.68%)")
+        self.assertAlmostEqual(s.discount_pct, 100.0, places=2)
+        self.assertAlmostEqual(s.discount_usd, 0.68, places=2)
 
     def test_unknown_list_price_reports_no_discount_rather_than_zero(self):
         s = self._sale("6$", "4.17$", list_price="")
@@ -361,7 +388,7 @@ class TestSummary(unittest.TestCase):
             when=il(2026, 8, 9, 21, 57), order_id="WR-20", sku="2.30.20",
             region="Greece", gb="20GB", customer="c@x.com", status="פעיל",
             sell=7.0, buy=6.99, fee=0.23, fee_source="מוערך",
-            list_price=9.99))
+            list_price=9.99, discount_note="30% ($2.99 הנחה)"))
         return rows
 
     def test_headline_numbers(self):

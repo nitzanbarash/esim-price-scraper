@@ -248,6 +248,33 @@ def processing_fee(sell_price: float, sheet_fee, model: FeeModel,
 
 # --------------------------------------------------------------------- sales
 
+NO_DISCOUNT = "-"
+
+
+def parse_recorded_discount(text) -> tuple[float | None, float | None]:
+    """(percent, dollars) out of the receipts sheet's 'הנחה - Sale' cell.
+
+    That cell is the only honest record of a discount, because it is written
+    at the moment of sale. Recomputing one from today's list price invents
+    discounts nobody gave: 'מחיר סופי' is rewritten by the scraper daily, so a
+    sale from three weeks ago gets measured against a number that did not
+    exist then. usage_bot.discount_text refuses to make that guess for exactly
+    this reason and leaves the cell alone; the books must not make it either.
+
+    '-' means "looked, and none was given" — a zero, not a missing value.
+    An empty cell means nobody knows, which is not the same as zero.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None, None
+    if raw == NO_DISCOUNT:
+        return 0.0, 0.0
+    pct = re.search(r"(\d+(?:\.\d+)?)\s*%", raw)
+    money = re.search(r"\$\s*(\d+(?:\.\d+)?)", raw)
+    return (float(pct.group(1)) if pct else None,
+            float(money.group(1)) if money else None)
+
+
 @dataclass
 class Sale:
     when: datetime | None
@@ -263,6 +290,7 @@ class Sale:
     fee_source: str
     list_price: float | None
     provider: str = ""
+    discount_note: str = ""      # the receipts sheet's own 'הנחה - Sale' cell
 
     @property
     def internal(self) -> bool:
@@ -285,10 +313,32 @@ class Sale:
 
     @property
     def discount_pct(self) -> float | None:
-        """How far below the list price this one actually went out."""
-        if not self.list_price or self.list_price <= 0 or not self.sell:
-            return None
-        return round((self.list_price - self.sell) / self.list_price * 100, 2)
+        """The discount this sale actually carried, as recorded when it was made.
+
+        Deliberately NOT computed from today's list price — see
+        parse_recorded_discount. An unrecorded discount is reported as unknown
+        rather than guessed at.
+        """
+        pct, _ = parse_recorded_discount(self.discount_note)
+        if pct is not None:
+            return pct
+        # Nothing recorded. Paying AT or ABOVE the list price is still a
+        # knowable "no discount" — the same conclusion usage_bot.discount_text
+        # draws. Paying under it is the ambiguous case that usage_bot refuses
+        # to call, because today's list price is not the one that was quoted.
+        if self.list_price and self.list_price > 0 and self.sell >= self.list_price:
+            return 0.0
+        return None
+
+    @property
+    def discount_usd(self) -> float:
+        """Money the customer actually saved, 0 when none was recorded."""
+        pct, money = parse_recorded_discount(self.discount_note)
+        if money is not None:
+            return round(money, 2)
+        if pct and self.list_price and self.list_price > self.sell:
+            return round(self.list_price - self.sell, 2)
+        return 0.0
 
     @property
     def discounted(self) -> bool:
@@ -328,6 +378,7 @@ def build_sale(row: dict, price_row: dict | None, model: FeeModel) -> Sale:
         fee_source=fee_source,
         list_price=list_price,
         provider=model.provider(provider).name,
+        discount_note=(row.get("discount") or "").strip(),
     )
 
 
@@ -667,8 +718,7 @@ def summarise(all_sales: list[Sale], expenses: list[Expense],
         internal_cost=internal_cost,
         discounted_orders=len(discounted),
         discounted_pct=round(len(discounted) / len(sales) * 100, 1) if sales else 0.0,
-        discount_given=round(sum(
-            (s.list_price or s.sell) - s.sell for s in discounted), 2),
+        discount_given=round(sum(s.discount_usd for s in discounted), 2),
         months=months,
         packages=packages,
     )

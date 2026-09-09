@@ -59,6 +59,8 @@ from finance_core import (COGS, CONFIRMED, NEEDS_REVIEW, Expense, FeeModel,
 
 RECEIPTS_SHEET_ID = "1bWH_Zef0aNwZjLOR07hjJRZRXkrY73mX0aMLGPH6uao"
 PRICE_SHEET_ID = "108D3BUV-MNcIuRZuKUgb-E-b1Ra8moxWZZyI5JxnyRo"
+# The supplier whose row carries our sell price. Mirrors bot/sheets.py.
+BUY_FROM = "esim.dog"
 
 FINANCE_TITLE = "Waverole — כספים"
 FINANCE_SHEET_ID = os.getenv("FINANCE_SHEET_ID", "").strip()
@@ -195,6 +197,10 @@ def read_receipts(gc: gspread.Client) -> list[dict]:
         "status": find("סטטוס", "status"),
         "buy": find("קנייה", "buy"),
         "sell": find("מכירה", "sell"),
+        # Written at the moment of sale, and the only honest record of a
+        # discount — the books used to recompute one from today's list price,
+        # which invented discounts on every sale older than a price move.
+        "discount": find("הנחה"),
         # Optional. Add a column named e.g. "אמצעי תשלום" to the receipts
         # sheet and per-order fees start being counted from that instead of
         # the account-wide default.
@@ -202,7 +208,7 @@ def read_receipts(gc: gspread.Client) -> list[dict]:
         "fee_actual": find("עמלה בפועל", "עמלת סליקה"),
     }
     required = [k for k, v in cols.items()
-                if v is None and k not in ("provider", "fee_actual")]
+                if v is None and k not in ("provider", "fee_actual", "discount")]
     if required:
         log(f"WARNING receipts sheet is missing columns: {required}")
 
@@ -231,6 +237,8 @@ def read_prices(gc: gspread.Client) -> dict[str, dict]:
         return None
 
     c_sku = 0
+    c_source = find("מקור")
+    c_chosen = find("נבחר")
     c_fee = find("סליקה")
     c_list = find("מחיר סופי")
     c_buy = find("מחיר קנייה")
@@ -238,7 +246,10 @@ def read_prices(gc: gspread.Client) -> dict[str, dict]:
     c_gb = find("GB")
     c_days = find("זמן חבילה")
 
-    out: dict[str, dict] = {}
+    # One SKU now has one row per supplier, stacked. Only the row we buy from
+    # carries our sell price, so keying by SKU alone let the row underneath —
+    # a supplier we have never bought from — decide what a package lists for.
+    by_sku: dict[str, list[tuple[str, str, dict]]] = {}
     for row in values[1:]:
         sku = (row[c_sku] if c_sku < len(row) else "").strip()
         if not sku:
@@ -246,14 +257,35 @@ def read_prices(gc: gspread.Client) -> dict[str, dict]:
 
         def cell(i):
             return row[i] if i is not None and i < len(row) else ""
-        out[sku] = {
+        by_sku.setdefault(sku, []).append((cell(c_source).strip().lower(),
+                                           cell(c_chosen).strip(), {
             "fee": cell(c_fee),
             "list": cell(c_list),
             "buy": cell(c_buy),
             "countries": cell(c_countries),
             "gb": cell(c_gb),
             "days": cell(c_days),
-        }
+        }))
+
+    out: dict[str, dict] = {}
+    for sku, rows in by_sku.items():
+        # A blank מקור counts as ours, the way the scraper, the Apps Script and
+        # usage_bot all read it — the owner types the supplier in second.
+        mine = [(tick, r) for src, tick, r in rows if src in ("", BUY_FROM)]
+        # The day-scan can leave TWO buyable rows under one SKU (different day
+        # counts at the same price), and position is not the tie-break: the
+        # owner ticks 'נבחר' on the one we sell, which is what bot/sheets.py
+        # buys from. Picking the higher row instead prices sales against a
+        # package we did not sell.
+        ticked = [r for tick, r in mine if tick]
+        if len(ticked) == 1:
+            out[sku] = ticked[0]
+        elif mine:
+            out[sku] = mine[0][1]
+        else:
+            # Supplier-only SKU: keep it priced rather than dropping it into
+            # the "sold but not in the price sheet" list.
+            out[sku] = rows[0][2]
     return out
 
 
