@@ -69,7 +69,8 @@ const HEADERS = {
   source:      ['\u05de\u05e7\u05d5\u05e8'],                     // which supplier this row prices
   chosen:      ['\u05e0\u05d1\u05d7\u05e8'],                     // (tick) = the row of the pair the site sells
   stock:       ['\u05d1\u05de\u05dc\u05d0\u05d9/\u05e8\u05d5\u05d5\u05d7\u05d9'],              // empty = in stock
-  fee:         ['\u05e1\u05dc\u05d9\u05e7\u05d4'],
+  fee:         ['\u05e1\u05dc\u05d9\u05e7\u05d4'],                     // what the CUSTOMER is shown (the ladder)
+  my_price:    ['\u05de\u05d7\u05d9\u05e8 \u05e9\u05dc\u05d9'],                // what actually lands, after the real cut
   price:       ['\u05de\u05d7\u05d9\u05e8 \u05e1\u05d5\u05e4\u05d9', '\u05db\u05d5\u05dc\u05dc \u05de\u05e2\u05de'],    // FINAL customer price (incl. VAT + fee)
   sale:        ['\u05de\u05d1\u05e2\u05e6\u05e2\u05d9\u05dd (\u05d0\u05d7\u05d5\u05d6\u05d9\u05dd)'],         // empty/0 cancels the sale
 };
@@ -80,6 +81,72 @@ const REQUIRED_FIELDS = ['sku', 'price'];
 // 2026-09-10): green = the row the site sells, grey = the other supplier's row.
 const ROW_CHOSEN_BG   = '#d8efd3';
 const ROW_UNCHOSEN_BG = '#f2f2f2';
+
+// -- the two fees, and why there are two -----------------------------
+//
+// The sheet's own table (top right, "\u05d8\u05d5\u05d5\u05d7 \u05de\u05d7\u05d9\u05e8"/"\u05e2\u05de\u05dc\u05d4") is a PRICING ladder,
+// not a cost. It is what the customer is shown and what the site displays:
+// $0.40 up to $2, $0.60 up to $5, and so on. Above $20 it is zero - the fee
+// is on us, so the customer sees none.
+//
+// What the processor actually keeps is a different number: 4% of the sale
+// plus $0.35. That one is nobody's business but the owner's, so it never
+// leaves the sheet - it is subtracted in '\u05de\u05d7\u05d9\u05e8 \u05e9\u05dc\u05d9', the private column.
+//
+// Before 2026-09-10 both numbers lived in one column and 39 of 84 rows had
+// drifted off the ladder, some by more than a third of the fee. Typing the
+// final price is now the ONLY input; the other two are derived, so they
+// cannot disagree again.
+const FEE_LADDER    = [[2, 0.4], [5, 0.6], [10, 0.8], [15, 1.0], [20, 1.2]];
+const FEE_OVER_TOP  = 0;      // over $20: shown as no fee, absorbed by us
+const REAL_FEE_RATE = 0.04;   // 4% of the sale ...
+const REAL_FEE_FIXED = 0.35;  // ... plus 35 cents
+
+function tableFee_(price) {
+  for (let i = 0; i < FEE_LADDER.length; i++) {
+    if (price <= FEE_LADDER[i][0]) return FEE_LADDER[i][1];
+  }
+  return FEE_OVER_TOP;
+}
+
+function realFee_(price) {
+  return Math.round((price * REAL_FEE_RATE + REAL_FEE_FIXED) * 100) / 100;
+}
+
+// Final price typed -> ladder fee and real net follow.
+//
+// Runs on any edit that touches the final-price column, one row or a pasted
+// block. Clearing the price clears both derived cells: a row with no sell
+// price is not for sale, and a stale net beside an empty price reads as one.
+// Programmatic writes do not fire onEdit, so writing these two cells here
+// cannot re-enter.
+function applyFee_(sheet, map, e) {
+  if (map.price === undefined) return;
+  if (map.fee === undefined && map.my_price === undefined) return;
+  const col = map.price + 1;
+  if (e.range.getColumn() > col || e.range.getLastColumn() < col) return;
+  const first = Math.max(2, e.range.getRow());
+  const last  = e.range.getLastRow();
+  if (last < first) return;
+  const width = Math.max.apply(null, Object.values(map)) + 1;
+  const data  = sheet.getRange(first, 1, last - first + 1, width).getValues();
+  for (let i = 0; i < data.length; i++) {
+    const row = first + i;
+    const sku = map.sku === undefined ? 'x' : String(data[i][map.sku] || '').trim();
+    if (!sku) continue;                       // spacer row, not a package
+    const price = num_(data[i][map.price]);
+    if (map.fee !== undefined) {
+      sheet.getRange(row, map.fee + 1)
+           .setValue(price === null ? '' : tableFee_(price));
+    }
+    if (map.my_price !== undefined) {
+      sheet.getRange(row, map.my_price + 1)
+           .setValue(price === null ? '' :
+                     Math.round((price - realFee_(price)) * 100) / 100);
+    }
+  }
+  SpreadsheetApp.flush();   // the sync below reads these cells back
+}
 
 function setupTriggers() {
   ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
@@ -376,6 +443,7 @@ function onEditPush(e) {
     const watched = Object.values(map).map(i => i + 1);
     const c1 = e.range.getColumn(), c2 = e.range.getLastColumn();
     if (!watched.some(c => c >= c1 && c <= c2)) return;   // not a synced column
+    applyFee_(sheet, map, e);
     enforceChoice_(sheet, map, e);
     const rows = [];
     for (let r = Math.max(2, e.range.getRow()); r <= e.range.getLastRow(); r++) rows.push(r);
