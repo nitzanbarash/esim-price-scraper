@@ -143,6 +143,51 @@ function colMap_(sheet) {
   return map;
 }
 
+// Did the Hebrew column names survive the trip into the editor?
+//
+// The Apps Script editor lays RTL text out inside LTR code, so every Hebrew
+// header in HEADERS above renders scrambled — cosmetic, but it makes "did my
+// paste arrive intact?" unanswerable by eye. Worse, only 'sku' and 'price' are
+// REQUIRED: a mangled 'מקור' or 'נבחר' does not throw, it silently reads as
+// absent, and pickRow_() then falls back to esim.dog for every SKU. Safe, but
+// indistinguishable from working.
+//
+// So: Run this and read NUMBERS. Every column must report a number. A `-1`
+// means that header did not match the sheet, and the paste is the suspect.
+function checkColumns() {
+  const sheet = sheet_();
+  const head = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(h => String(h).trim());
+  const lines = [];
+  for (const [key, names] of Object.entries(HEADERS)) {
+    let at = -1;
+    for (const name of names) { const i = head.indexOf(name); if (i >= 0) { at = i; break; } }
+    lines.push('  ' + key + ' -> column ' + (at < 0 ? 'NOT FOUND' : at + 1 + ' (' + colLetter_(at) + ')'));
+  }
+  // And what the sheet actually holds, so the tick can be seen without reading
+  // a single Hebrew character.
+  const map = colMap_(sheet);
+  const data = sheet.getDataRange().getValues();
+  const bySupplier = {}, ticked = {};
+  for (let r = 1; r < data.length; r++) {
+    const pkg = rowToPackage_(data[r], map);
+    if (!pkg) continue;
+    bySupplier[pkg.source] = (bySupplier[pkg.source] || 0) + 1;
+    if (pkg._chosen) ticked[pkg.source] = (ticked[pkg.source] || 0) + 1;
+  }
+  const sold = {};
+  for (const pkg of buildPackages_(null)) sold[pkg.source] = (sold[pkg.source] || 0) + 1;
+  Logger.log('COLUMNS\n' + lines.join('\n') +
+    '\n\nPRICED ROWS PER SUPPLIER: ' + JSON.stringify(bySupplier) +
+    '\nOF THOSE, TICKED: ' + JSON.stringify(ticked) +
+    '\n\nWHAT THE SITE WOULD BE SENT: ' + JSON.stringify(sold));
+}
+
+function colLetter_(i) {
+  let s = '';
+  for (i += 1; i > 0; i = Math.floor((i - 1) / 26)) s = String.fromCharCode(65 + (i - 1) % 26) + s;
+  return s;
+}
+
 function num_(v) {
   const n = parseFloat(String(v).replace(/[^\d.]/g, ''));
   return isNaN(n) ? null : n;
