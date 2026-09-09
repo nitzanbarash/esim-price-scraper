@@ -721,7 +721,7 @@ function orderAwaitingEsim_() {
   try {
     const tok = PropertiesService.getScriptProperties().getProperty('ORDERS_TOKEN');
     if (tok) {
-      const res = UrlFetchApp.fetch('https://www.waverole.com/api/orders?status=pending', {
+      const res = UrlFetchApp.fetch('https://www.waverole.com/api/orders?status=pending&probe=1', {
         headers: { Authorization: 'Bearer ' + tok },
         muteHttpExceptions: true,
       });
