@@ -1052,6 +1052,8 @@ class ESIMScraper:
                     'old_gb': _get('gb'),
                     'old_validity': _get('validity'),
                     'old_code': _get('code'),
+                    # Only read to order the work below; never written back.
+                    'old_updated': _get('updated'),
                 })
         return items, col_index
 
@@ -1063,6 +1065,22 @@ class ESIMScraper:
         if not items:
             print("ℹ️  No links found in column E.")
             return -1
+
+        # Sheet order is a fixed order, and the budget always cuts the same
+        # end off it. On 2026-09-08 both runs stopped at 58 minutes and left
+        # exactly three rows unchecked - the last three - while the other 82
+        # were re-priced twice that day. Left alone, a row that falls off the
+        # end never comes back: it is last again tomorrow.
+        #
+        # Going stalest-first makes the tail rotate. Whatever the budget skips
+        # today has the oldest stamp tomorrow and is priced before anything
+        # else, so the cost of a short run is spread across the catalogue
+        # instead of landing on the same three packages every day. A row that
+        # has never been stamped sorts first, which is what we want.
+        items.sort(key=lambda it: (it.get('old_updated') or "").strip())
+        oldest = (items[0].get('old_updated') or "").strip()
+        print(f"🕒 Stalest first - oldest stamp on the list: "
+              f"{oldest or '(never updated)'}")
 
         print(f"\n📋 Checking {len(items)} packages...\n")
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
