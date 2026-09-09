@@ -65,6 +65,7 @@ const HEADERS = {
   networks:    ['Networks'],
   breakout_ip: ['Breakout IP'],
   source:      ['מקור'],                     // which supplier this row prices
+  chosen:      ['נבחר'],                     // ✓ = the row of the pair the site sells
   stock:       ['במלאי/רווחי'],              // empty = in stock
   fee:         ['סליקה'],
   price:       ['מחיר סופי', 'כולל מעמ'],    // FINAL customer price (incl. VAT + fee)
@@ -150,15 +151,12 @@ function num_(v) {
 function rowToPackage_(row, map) {
   const sku = String(row[map.sku] || '').trim();
   if (!sku || sku.indexOf('.') < 0) return null;    // not a package row
-  // A SKU can occupy more than one row: the sheet now stacks the same
-  // package as each supplier sells it — esim.dog's row and Stellar's row,
-  // one above the other, under one code. Only the esim.dog row is what the
-  // site sells today. Without this, BOTH rows would be pushed under the same
-  // sku and the endpoint would keep whichever arrived last, quietly swapping
-  // a live package's price, GB and stock for a supplier we have not bought
-  // a single eSIM from.
-  const src = String(row[map.source] || '').trim();
-  if (src && src.toLowerCase() !== 'esim.dog') return null;
+  // A SKU can occupy more than one row: the sheet stacks the same package
+  // as each supplier sells it — esim.dog's row and Stellar's row, one above
+  // the other, under one code. Which of them the site sells is decided in
+  // pickRow_(), by the ✓ in 'נבחר'; here every priced row is a candidate.
+  // Blank 'מקור' means esim.dog, as it does for the scraper and the bot.
+  const src = String(row[map.source] || '').trim().toLowerCase() || 'esim.dog';
   // A row with no customer price is a note to ourselves, not a product. Every
   // one of the 82 live esim.dog rows carries one, so this turns nothing off
   // today; what it buys is a comparison row that CANNOT become a storefront
@@ -168,7 +166,8 @@ function rowToPackage_(row, map) {
   // it was written down next to the one we actually sell.
   const price = num_(row[map.price]);
   if (price === null) return null;
-  const pkg = { sku: sku };
+  const pkg = { sku: sku, source: src };
+  pkg._chosen = map.chosen !== undefined && String(row[map.chosen] || '').trim() !== '';
   pkg.price = price;
   pkg.sale = num_(row[map.sale]) || 0;
   pkg.in_stock = String(row[map.stock] || '').trim() === '';
@@ -182,15 +181,41 @@ function rowToPackage_(row, map) {
   return pkg;
 }
 
+// The one row of a SKU's pair the site sells. The ✓ wins when exactly one
+// row carries it; otherwise esim.dog's row, the supplier we have always
+// bought from. A ticked Stellar row with no customer price never gets here
+// (rowToPackage_ dropped it), so the tick alone cannot empty a SKU. The site
+// still refuses checkout on a supplier its bot cannot buy from — the tick
+// moves the PRICE, LIVE_SUPPLIERS on the site moves the money.
+function pickRow_(cands) {
+  const ticked = cands.filter(p => p._chosen);
+  const pick = ticked.length === 1 ? ticked[0] : cands.find(p => p.source === 'esim.dog');
+  if (!pick) return null;
+  const pkg = Object.assign({}, pick);
+  delete pkg._chosen;
+  return pkg;
+}
+
 function buildPackages_(rowsWanted) {   // rowsWanted: null = all, or Set of sheet row numbers
   const sheet = sheet_();
   const map = colMap_(sheet);
   const data = sheet.getDataRange().getValues();
-  const out = [];
+  // Always read the whole sheet, even for an edit to one row: the row that
+  // changed may be the ticked Stellar half of a pair, and choosing between
+  // the halves needs both of them in hand.
+  const bySku = {};
+  const touched = new Set();
   for (let r = 1; r < data.length; r++) {
-    if (rowsWanted && !rowsWanted.has(r + 1)) continue;
     const pkg = rowToPackage_(data[r], map);
-    if (pkg) out.push(pkg);
+    if (!pkg) continue;
+    (bySku[pkg.sku] = bySku[pkg.sku] || []).push(pkg);
+    if (!rowsWanted || rowsWanted.has(r + 1)) touched.add(pkg.sku);
+  }
+  const out = [];
+  for (const sku of Object.keys(bySku)) {
+    if (!touched.has(sku)) continue;
+    const pick = pickRow_(bySku[sku]);
+    if (pick) out.push(pick);
   }
   return out;
 }
