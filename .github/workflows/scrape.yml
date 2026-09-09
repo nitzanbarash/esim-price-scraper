@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     # Backstop only. Every step below carries its own limit, so the job limit
     # should never be what stops us — if it is, a step is missing a timeout.
-    timeout-minutes: 70
+    timeout-minutes: 75
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -71,16 +71,31 @@ jobs:
       # 30 days still work?" and started asking "which day is cheapest?". The
       # second question has to price the whole band: 530 extra page reads a run
       # across 83 rows, about 13 minutes at DAY_SCAN_CONCURRENCY 5. The step cap
-      # moves with it and both still sit under the job's 70-minute ceiling.
+      # moves with it and both still sit under the job's ceiling — 75 since
+      # 2026-09-08, when the budget went to 62 and this cap to 68.
       - name: Run scraper
-        timeout-minutes: 65
+        timeout-minutes: 68
         env:
-          SCRAPE_BUDGET_MIN: "58"
+          # 58 -> 62 on 2026-09-08, alongside the concurrency raise above.
+          # Both of that day's runs hit 58 with three rows left, so the work
+          # no longer fits in the old budget even once the reads speed up.
+          # This stays the SMALLER of the two limits on purpose: the budget
+          # saves what it has and names what it skipped, the step cap kills
+          # the run between two saves and explains nothing.
+          SCRAPE_BUDGET_MIN: "62"
           # How many validities of ONE row are priced at once. Each scrape()
           # launches its own browser and shares nothing, so these are safe to
-          # overlap; the runner has 2 cores, which is what keeps this at 5 and
-          # not 12.
-          DAY_SCAN_CONCURRENCY: "5"
+          # overlap; the runner has 2 cores, which is what keeps this off 12.
+          #
+          # Raised 5 -> 8 on 2026-09-08. The volume estimate above was right
+          # (546 probes against the 530 predicted); the THROUGHPUT was not.
+          # 546 reads were budgeted at 13 minutes and cost about 31, so a read
+          # is roughly 2.4x slower than assumed - these are browser launches
+          # waiting on esim.dog, not arithmetic, so the two cores are idle
+          # through most of each one and a deeper queue is the lever that
+          # actually moves. If 8 still does not fit, the next honest fix is to
+          # stop launching a browser per probe, NOT to raise this to 20.
+          DAY_SCAN_CONCURRENCY: "8"
           # The service-account JSON is stored as a repo secret, never in the code.
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: python esim_price_scraper.py
