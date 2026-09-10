@@ -491,15 +491,23 @@ check("-a1, and delivered", f18b.creates[0][0] == "waverole-WR-TEST01-a1"
 # the FIRST request created nothing -- so once one answer has been silent about
 # the money, 'failed' is off the table for the rest of the call.
 print("\n19. unknown, then a refusal -> still unknown, never 'failed'")
-site, ws19, _, _ = scenario([order()], (f19 := StellarFake(create=[500, 403])))
-check("the 403 covers the replay, not the 500 before it -- so no failed report",
+site, ws19, _, _ = scenario([order()], (f19 := StellarFake(create=[500, 422])))
+check("the 422 covers the replay, not the 500 before it -- so no failed report",
       not site.reports("failed"), str(site.posts))
 check("review row instead", ws19.col(2, sb.H_STATUS) == sb.ST_REVIEW)
 check("asked twice under one key", len(f19.creates) == 2
       and {k for k, _ in f19.creates} == {"waverole-WR-TEST01-a0"})
 print("\n   ...but a 4xx on the FIRST answer still earns the word")
-site, ws19b, _, _ = scenario([order()], StellarFake(create=403))
+site, ws19b, _, _ = scenario([order()], StellarFake(create=400))
 check("reported failed", len(site.reports("failed")) == 1)
+
+print("\n   an answer about our KEY is not an answer about the order")
+for code in (401, 403):
+    site, ws19c, _, _ = scenario([order()], (f19c := StellarFake(create=code)))
+    check(f"{code}: the order is told nothing and keeps its place in the queue",
+          not site.reports("failed") and len(ws19c.rows) == 1 and len(f19c.creates) == 1)
+    check(f"{code}: the alert points at the key, not the order",
+          alerts and "key" in alerts[0][0], str(alerts))
 
 # ── 20. a row that names no Stellar order is never re-bought ─────────────────
 # order_rows() reads the link cell as the sheet RENDERS it. A reformatted link,
@@ -549,6 +557,72 @@ check("a run at :04 still alerts", not sb._quiet_hour(datetime(2026, 9, 10, 4, 4
 check("a run at :09 still alerts", not sb._quiet_hour(datetime(2026, 9, 10, 4, 9, tzinfo=fb.TZ)))
 check("a run at :10 is held", sb._quiet_hour(datetime(2026, 9, 10, 4, 10, tzinfo=fb.TZ)))
 check("a run at :30 is held", sb._quiet_hour(datetime(2026, 9, 10, 4, 30, tzinfo=fb.TZ)))
+
+# ── 24. a portal link a person pasted by hand still names its order ─────────
+# The unknown-outcome alert TELLS the owner to paste a link into the row. A
+# copied url carries a trailing slash, a ?tab= or a #fragment, and an anchored
+# regex read every one of those as "no order" -- the reading that costs money.
+print("\n24. a hand-pasted portal link still settles")
+for label, link in (("trailing slash", "https://wholesale.stellarsecurity.com/orders/so-1/"),
+                    ("query string", "https://wholesale.stellarsecurity.com/orders/so-1?tab=esims"),
+                    ("fragment", "https://wholesale.stellarsecurity.com/orders/so-1#top")):
+    ws24 = Ws([receipt_row("WR-TEST01", sb.ST_PROCESSING)])
+    ws24.rows[1][HDR.index("Link - esim.dog")] = link
+    site, ws24, _, _ = scenario([order()], (f24 := StellarFake()), ws=ws24)
+    check(f"settled from the existing order, nothing bought ({label})",
+          len(f24.creates) == 0 and len(site.reports("fulfilled")) == 1, str(alerts))
+
+# ── 25. a broken catalogue read must not refuse a single order ──────────────
+# An empty page or a renamed id format makes every coded row 'vanish'. Without
+# a guard choose() refuses each one and reports it 'failed', spending one of
+# the site's retry attempts on every queued order over a fault that is ours.
+print("\n25. a catalogue read that loses most rows buys nothing and blames nobody")
+many_rows = [sheet_row()] + [sheet_row(sku=f"1.62.{i}", code=f"JC0{i}") for i in range(4)]
+site, ws25, bought, _ = scenario([order(), order(oid="WR-TWO")], (f25 := StellarFake()),
+                                 rows=many_rows, plans=[])
+check("nothing bought, no row, and NO order reported failed",
+      bought == 0 and len(ws25.rows) == 1 and not site.reports("failed"), str(site.posts))
+check("one alert about the catalogue, not one per order",
+      len(alerts) == 1 and "catalogue" in alerts[0][0], str(alerts))
+
+# ── 26. a connection that dropped AFTER the request is not a refusal ─────────
+print("\n26. which connection errors can have spent money")
+import requests as _rq
+check("the server hung up mid-answer -> it was sent",
+      sb.reached_stellar(_rq.ConnectionError("RemoteDisconnected('Remote end closed connection')")))
+check("could not connect at all -> it never left",
+      not sb.reached_stellar(_rq.ConnectionError(
+          "HTTPSConnectionPool: Max retries exceeded (Caused by NewConnectionError(...))")))
+check("dns did not resolve -> it never left",
+      not sb.reached_stellar(_rq.ConnectionError("Name or service not known")))
+
+# ── 27. the row that proves money was spent survives another writer ─────────
+# n is READ and then written, and the PC buyer appends to this same sheet.
+print("\n27. another bot takes the row number between the read and the write")
+
+
+class Thief(Ws):
+    """Appends a row of its own the instant ours lands on n, once."""
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.stolen = False
+
+    def update(self, a1, values, value_input_option=None):
+        super().update(a1, values, value_input_option)
+        if not self.stolen:
+            self.stolen = True
+            n = int(a1[1:])
+            other = [""] * len(HDR)
+            other[HDR.index("מס׳ הזמנה")] = "WR-OTHER"
+            self.rows[n - 1] = other        # the other writer got there first
+
+
+ws27 = Thief()
+site, ws27, _, _ = scenario([order()], (f27 := StellarFake()), ws=ws27)
+check("the other bot's row is not overwritten", ws27.col(2, "מס׳ הזמנה") == "WR-OTHER")
+check("...and ours is written again, further down",
+      ws27.col(3, "מס׳ הזמנה") == "WR-TEST01" and ws27.col(3, sb.H_STATUS) == sb.ST_ACTIVE,
+      str(ws27.rows[2][:8]))
 
 # ── summary (last, so it gates the exit code) ────────────────────────────────
 print()

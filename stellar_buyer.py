@@ -80,10 +80,41 @@ SETTLE_WAIT_S = int(os.getenv("STELLAR_SETTLE_WAIT_S", "90"))   # one run's pati
 POLL_EVERY_S = 10
 REPLAY_WAIT_S = float(os.getenv("STELLAR_REPLAY_WAIT_S", "3"))  # before re-asking the same key
 
+# How long this run may spend before it hands the rest back to the next one.
+# The worst case is not the common one -- a create_order that times out is 60s,
+# a settle is 90 -- so five orders can outlast the step's own timeout, and being
+# KILLED by that timeout is a stop with nothing written and nothing said. The
+# budget makes the run stop itself instead, and the step's timeout is only ever
+# the backstop (memory: scrape-workflow-budget).
+RUN_BUDGET_S = int(os.getenv("STELLAR_RUN_BUDGET_S", "300"))
+
 # Answers that mean "not now", which is not "no": Stellar says it did not
 # process the request. Nothing is written, nothing is reported, and the next
 # run asks again under the same key -- an outage that heals itself.
 BUSY_CODES = {408, 425, 429, 503}
+
+# Answers about US, not about the order: a rotated or revoked key, an edge
+# serving a challenge page. Reporting these as the ORDER's failure would spend
+# one of the site's MAX_BUY_ATTEMPTS on every queued order at once, over a
+# fault that has nothing to do with any of them (memory: orders-token-locations
+# -- the last rotation broke its consumers silently too).
+AUTH_CODES = {401, 403, 407}
+
+# What a dropped connection says about whether the request was SENT. requests
+# raises the same ConnectionError for "could not connect" and "connected, then
+# the server hung up"; only the second can have spent money.
+NEVER_SENT = ("NewConnectionError", "Failed to establish a new connection",
+              "Name or service not known", "nodename nor servname",
+              "Temporary failure in name resolution", "Connection refused")
+
+
+def reached_stellar(ex: Exception) -> bool:
+    return not any(m in repr(ex) for m in NEVER_SENT)
+
+
+class Blocked(Exception):
+    """The world is wrong, not the order. Nothing is bought this run and every
+    order keeps its place in the queue."""
 FX_FALLBACK = 1.16       # only when the sheet's own '$x (€y)' cell cannot say
 
 # Receipts 'סטטוס - Status' values this bot writes. The sheet is the ledger,
@@ -204,9 +235,21 @@ class Stellar:
         try:
             r = self.s.post(f"{BASE}/orders", json={"plans": [{"plan_id": plan_id, "quantity": 1}]},
                             headers={"Idempotency-Key": idem_key}, timeout=60)
-        except requests.exceptions.ReadTimeout:
-            log.warning("create_order: no answer within the timeout -- outcome unknown")
+        except requests.exceptions.ConnectTimeout:
+            raise                       # never left this machine: nothing to know
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ChunkedEncodingError) as ex:
+            log.warning(f"create_order: {type(ex).__name__} -- outcome unknown")
             return 0, {"error": {"code": "timeout", "message": "no answer from Stellar"}}
+        except requests.exceptions.ConnectionError as ex:
+            # ConnectTimeout is caught above; what is left is either "could not
+            # connect" (nothing was sent, let it raise -- the order simply
+            # stays queued) or "connected and then lost it", which is the
+            # request going out and the answer never coming back.
+            if not reached_stellar(ex):
+                raise
+            log.warning("create_order: connection lost after the request -- outcome unknown")
+            return 0, {"error": {"code": "disconnected", "message": "no answer from Stellar"}}
         try:
             body = r.json()
         except ValueError:
@@ -281,7 +324,11 @@ def order_rows(ws, order_id: str) -> list[dict]:
         if r[idx[H_ORDER]].strip() != order_id or not r[idx[H_ROUTE]].strip().startswith(ROUTE_PREFIX):
             continue
         link = r[idx[H_LINK_SUP]].strip()
-        m = re.search(r"/orders/([A-Za-z0-9-]+)$", link)
+            # Not anchored: the owner is TOLD to paste a portal link into a row,
+        # and a copied url carries a trailing slash, a ?tab= or a #fragment.
+        # Anchoring it made every one of those parse as "no order", which is
+        # the reading that costs money.
+        m = re.search(r"/orders/([A-Za-z0-9_-]+)", link)
         out.append({"n": n, "status": r[idx[H_STATUS]].strip(),
                     "stellar_id": m.group(1) if m else ""})
     return out
@@ -289,14 +336,30 @@ def order_rows(ws, order_id: str) -> list[dict]:
 
 def append_row(ws, values: dict) -> int:
     """Explicit A{n} write, never append_row: gspread's table detection once
-    shifted a receipts row 18 columns right (memory: esim-bot-project)."""
+    shifted a receipts row 18 columns right (memory: esim-bot-project).
+
+    The row number is READ and then written, and the PC buyer and the
+    fulfillment bot append to this same sheet -- so between the two, someone
+    else's row can land on n and this one overwrites it. This row is the proof
+    that money was spent; losing it buys the package again. So the write is
+    read back once, and repeated at the new end if it did not survive.
+    """
     hdr = _hdr(ws)
-    n = len(ws.get_all_values()) + 1
     row = [""] * len(hdr)
     for k, v in values.items():
         if k in hdr and v not in (None, ""):
             row[hdr.index(k)] = str(v)
-    ws.update(f"A{n}", [row], value_input_option="USER_ENTERED")
+    stamp, col = str(values.get(H_ORDER) or ""), hdr.index(H_ORDER)
+    for last in (False, True):
+        n = len(ws.get_all_values()) + 1
+        ws.update(f"A{n}", [row], value_input_option="USER_ENTERED")
+        if not stamp or last:
+            return n
+        back = ws.get_all_values()
+        got = back[n - 1] if len(back) >= n else []
+        if len(got) > col and got[col].strip() == stamp:
+            return n
+        log.warning(f"receipts row {n} was taken by another writer -- appending again")
     return n
 
 
@@ -477,9 +540,20 @@ class Run:
     def catalogue(self) -> sp.Catalogue:
         if self._cat is None:
             plans = self.st.plans()
+            cat = sp.Catalogue.from_api(plans)
+            # A read that makes most coded rows vanish at once is a broken read
+            # -- an empty page, a renamed id format, a key answering 200 with
+            # nothing -- not a supplier that dropped half its catalogue. Every
+            # order in the queue would be refused by choose() and reported
+            # 'failed' on the strength of it, spending one of the site's
+            # MAX_BUY_ATTEMPTS on each. The nightly refresh runs this same
+            # guard before it writes a price; nothing may be bought without it.
+            why = sp.sanity([d for d in (sp.decide(cat, r) for r in self.rows().values()) if d])
+            if why:
+                raise Blocked(why)
             self._raw = {str(p.get("id")): p for p in plans}
-            self._cat = sp.Catalogue.from_api(plans)
-            log.info(f"catalogue: {len(self._cat.variants)} fixed listings")
+            self._cat = cat
+            log.info(f"catalogue: {len(cat.variants)} fixed listings")
         return self._cat
 
     def row_for(self, sku: str) -> sp.StellarRow:
@@ -507,7 +581,7 @@ class Run:
         live = [r for r in attempts if not r["status"].startswith(ST_FAILED)]
         if live:
             r = live[-1]
-            if r["status"] == ST_REVIEW:
+            if r["status"].startswith(ST_REVIEW):
                 log.info(f"{oid}: in manual review (row {r['n']}) -- hands off")
                 return
             if not r["stellar_id"]:
@@ -550,7 +624,7 @@ class Run:
                          f"({sku}, {v.gb:g}GB/{v.days}d). Top up at wholesale.stellarsecurity.com; "
                          f"the order stays queued and is bought on the next run after that.",
                          self.now)
-            log.warning(f"{oid}: wallet {have} < {cents} cents -- waiting for a top-up")
+            log.warning(f"{oid}: the wallet is short of this order -- waiting for a top-up")
             return 0, ""
 
         idem = f"waverole-{oid}-a{attempt}"
@@ -587,7 +661,7 @@ class Run:
             sid = str(data["id"])
             n = append_row(self.ws, {**base, H_LINK_SUP: PORTAL_ORDER.format(id=sid),
                                      H_STATUS: ST_PROCESSING})
-            log.info(f"{oid}: Stellar order {sid} placed ({v.gb:g}GB/{v.days}d, EUR {v.wholesale_eur:.2f}), row {n}")
+            log.info(f"{oid}: Stellar order {sid} placed ({v.gb:g}GB/{v.days}d), row {n}")
             return n, sid
         if code == 402:
             alert_hourly(f"wallet refused {oid}", f"Stellar answered 402 (insufficient balance) "
@@ -604,6 +678,17 @@ class Run:
                       f"Find it in the portal, deliver by hand or settle, then clear row {n} of the receipts sheet.")
             return n, ""
         msg = f"HTTP {code} {err.get('code', '')} {err.get('message', '')}".strip()
+
+        if code in AUTH_CODES:
+            # Says nothing about this order, so the order is told nothing. It
+            # keeps its place in the queue and the next run asks again.
+            log.error(f"{oid}: Stellar refused the KEY ({msg}) -- not the order's fault")
+            alert_hourly("Stellar refused the key",
+                         f"Stellar answered {msg}. That is our key or an edge in front of it, not "
+                         f"{oid} ({sku}) -- so nothing was reported against the order and every "
+                         f"queued Stellar order is simply waiting. Check STELLAR_API_KEY in the "
+                         f"repo secrets and the account at wholesale.stellarsecurity.com.", self.now)
+            return 0, ""
 
         if code in BUSY_CODES:
             # Stellar says it did not process the request. Nothing is written
@@ -756,10 +841,21 @@ def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -
     st = st or Stellar(fb.env("STELLAR_API_KEY"))
     ws = ws if ws is not None else fb.sheet_client().open_by_key(fb.RECEIPTS_SHEET_ID).sheet1
     r = Run(st, ws, now)
+    started = time.monotonic()
     for o in orders:
+        if time.monotonic() - started > RUN_BUDGET_S:
+            log.warning(f"{RUN_BUDGET_S}s spent -- the remaining order(s) stay queued for the "
+                        f"next run, which is five minutes away")
+            break
         oid = str(o.get("order_id") or "?")
         try:
             r.handle(o)
+        except Blocked as ex:
+            log.error(f"nothing is bought this run: {ex}")
+            alert_hourly("the Stellar catalogue read is not trustworthy",
+                         f"{ex}\n\nNothing was bought; every queued Stellar order keeps its "
+                         f"place and the next run tries again.", r.now)
+            break
         except Exception as ex:
             log.exception(f"{oid}: {type(ex).__name__}")
             alert_hourly(f"{oid}: {type(ex).__name__}", f"{ex}\n\nThe order stays queued; this repeats next run.", r.now)

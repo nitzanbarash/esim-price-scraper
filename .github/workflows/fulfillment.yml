@@ -16,7 +16,7 @@ concurrency:
 jobs:
   fulfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -39,7 +39,11 @@ jobs:
       # deliveries. Money rules and the receipts-sheet ledger: stellar_buyer.py.
       - name: Stellar buyer
         continue-on-error: true
-        timeout-minutes: 4
+        # The backstop only. The bot stops itself at STELLAR_RUN_BUDGET_S (300s)
+        # and hands whatever is left to the next run; being killed HERE is a
+        # stop with nothing written and nothing said, so this must be looser
+        # than the budget, not tighter.
+        timeout-minutes: 8
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
