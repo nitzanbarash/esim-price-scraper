@@ -402,9 +402,20 @@ site, ws13, _, _ = scenario([order()], (f13 := StellarFake()), ws=ws13)
 check("bought as a first attempt (-a0)", len(f13.creates) == 1 and f13.creates[0][0] == "waverole-WR-TEST01-a0")
 
 # ── 14. the empty queue costs nothing ────────────────────────────────────────
-print("\n14. an empty queue touches neither Stellar nor the sheets")
-site, ws14, bought, _ = scenario([], (f14 := StellarFake()))
-check("no calls", not f14.gets and not f14.creates and bought == 0)
+print("\n14. an empty queue buys nothing and touches no sheet")
+site, ws14, bought, log14 = scenario([], (f14 := StellarFake()))
+check("nothing is bought and no row is written",
+      not f14.creates and bought == 0 and len(ws14.rows) == 1)
+# It does ask ONE read-only question, because this is the only moment the key
+# is ever exercised without a paid customer behind it (section 28).
+check("...but the key is exercised: one wallet read", f14.gets == [f"{sb.BASE}/wallet"])
+check("...a key that works says nothing", not alerts)
+check("...and the balance stays out of a public log",
+      "10000" not in log14 and "100.00" not in log14, log14)
+
+print("\n   mid-hour the idle run is completely free")
+site, ws14b, bought, _ = scenario([], (f14b := StellarFake()), now=NOW_MID)
+check("no calls at all", not f14b.gets and not f14b.creates and bought == 0)
 
 # ── 15. discount wording ─────────────────────────────────────────────────────
 print("\n15. discount wording matches the PC bot's")
@@ -623,6 +634,80 @@ check("the other bot's row is not overwritten", ws27.col(2, "מס׳ הזמנה")
 check("...and ours is written again, further down",
       ws27.col(3, "מס׳ הזמנה") == "WR-TEST01" and ws27.col(3, sb.H_STATUS) == sb.ST_ACTIVE,
       str(ws27.rows[2][:8]))
+
+
+# -- 28. the key is proven before a customer proves it ------------------------
+# `run()` returns on an empty queue, so this step went green in two seconds
+# without ever touching STELLAR_API_KEY. A wrong or missing secret would first
+# have been discovered by someone who had already paid.
+print("\n28. the readiness check is the only thing that tests the key")
+
+
+class Refuses(StellarFake):
+    """Stellar answers 401/403 to everything: rotated key, or the wrong secret."""
+    def __init__(self, code=401):
+        super().__init__()
+        self.code = code
+
+    def get(self, url, timeout=None, **kw):
+        self.gets.append(url)
+        return Resp(self.code, {"error": {"code": "unauthorized", "message": "bad key"}})
+
+
+for _code in (401, 403):
+    alerts.clear()
+    sb.fb.alert = lambda s, b: alerts.append((s, b))
+    ok = sb.preflight(sb.Stellar("k", session=Refuses(_code)), now=NOW_TOP)
+    check(f"{_code} -> not ready, and the owner is told", ok is False and len(alerts) == 1)
+    check(f"   ...and the alert names the KEY, not an order",
+          "key" in alerts[0][0].lower() and "WR-" not in alerts[0][1], str(alerts[:1]))
+
+alerts.clear()
+ok = sb.preflight(sb.Stellar("k", session=Refuses(401)), now=NOW_MID)
+check("a refused key mid-hour is held for the top of the hour", ok is False and not alerts)
+
+
+class Down(StellarFake):
+    def get(self, url, timeout=None, **kw):
+        self.gets.append(url)
+        return Resp(503, {"error": {"code": "unavailable", "message": "later"}})
+
+
+alerts.clear()
+ok = sb.preflight(sb.Stellar("k", session=Down()), now=NOW_TOP)
+check("Stellar merely being down is not a key problem, and mails nothing",
+      ok is False and not alerts)
+
+alerts.clear()
+ok = sb.preflight(sb.Stellar("k", session=StellarFake(wallet=0)), now=NOW_TOP)
+check("a working key over an empty wallet: not ready, still quiet", ok is False and not alerts)
+
+alerts.clear()
+ok = sb.preflight(sb.Stellar("k", session=StellarFake(wallet=10000)), now=NOW_TOP)
+check("a working key over a funded wallet: ready, and silent", ok is True and not alerts)
+
+print("\n   the hand-started preflight mails the balance either way")
+alerts.clear()
+sb.preflight(sb.Stellar("k", session=StellarFake(wallet=250)), loud=True, now=NOW_MID)
+check("loud speaks even in the quiet half of the hour", len(alerts) == 1)
+check("   ...and carries the number that cannot be read anywhere else",
+      "EUR 2.50" in alerts[0][1], str(alerts[:1]))
+alerts.clear()
+sb.preflight(sb.Stellar("k", session=StellarFake(wallet=0)), loud=True, now=NOW_MID)
+check("   ...an empty wallet is spelled out as a blocker, not just a number",
+      len(alerts) == 1 and "EUR 0.00" in alerts[0][1] and "top it up" in alerts[0][1].lower(),
+      str(alerts[:1]))
+
+print("\n   a missing secret is as loud as a wrong one")
+alerts.clear()
+_key = os.environ.pop("STELLAR_API_KEY", None)
+ok = sb.preflight(now=NOW_TOP)
+if _key is not None:
+    os.environ["STELLAR_API_KEY"] = _key
+check("no key in the environment -> not ready, and named", ok is False and len(alerts) == 1)
+check("   ...and the alert says which secret is missing",
+      "STELLAR_API_KEY" in alerts[0][1], str(alerts[:1]))
+
 
 # ── summary (last, so it gates the exit code) ────────────────────────────────
 print()

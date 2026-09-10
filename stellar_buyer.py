@@ -832,10 +832,85 @@ class Run:
         log.info(f"{oid}: delivered from Stellar order {sid}")
 
 
+# -- readiness ---------------------------------------------------------------
+
+MIN_FUEL_CENTS = int(os.getenv("STELLAR_MIN_FUEL_CENTS", "200"))
+
+
+def preflight(st: Optional[Stellar] = None, loud: bool = False,
+              now: Optional[datetime] = None) -> bool:
+    """Ask Stellar the one read-only question nothing else in this file asks:
+    does this key still work?
+
+    `run()` returns on an empty queue before the key is ever touched, so this
+    step going green in two seconds proves the workflow is wired and proves
+    NOTHING about the secret behind it -- the same shape that let a wrong
+    ORDERS_TOKEN sit unnoticed (memory: orders-token-locations). Left alone,
+    the first thing to test the key would be a customer who has already paid.
+
+    Quiet by default: it speaks only when the key is missing or refused, which
+    is never a false alarm. `loud=True` is the hand-started preflight run and
+    mails the answer either way, with the balance in it -- outside the portal
+    there is nowhere else to read that number.
+    """
+    try:
+        st = st or Stellar(fb.env("STELLAR_API_KEY"))
+    except Exception as ex:
+        alert_hourly("no Stellar key in this run",
+                     f"{ex}\n\nNothing can be bought from Stellar until STELLAR_API_KEY is "
+                     f"set in the repo's Actions secrets and reaches this step.", now)
+        log.error("STELLAR_API_KEY is not set")
+        return False
+
+    try:
+        cents = st.wallet_cents()
+    except requests.HTTPError as ex:
+        code = getattr(ex.response, "status_code", 0)
+        if code in AUTH_CODES:
+            alert_hourly("Stellar refuses our key",
+                         f"GET /wallet answered {code}. Nothing can be bought from Stellar "
+                         f"until this is fixed: check STELLAR_API_KEY in the repo's Actions "
+                         f"secrets against the one in the portal.", now)
+            log.error(f"Stellar refuses our key ({code})")
+        else:
+            log.warning(f"wallet read answered {code} -- not the key; asking again next run")
+            if loud:
+                alert_now("preflight: Stellar answered an error", f"GET /wallet -> HTTP {code}.")
+        return False
+    except Exception as ex:
+        # Stellar being briefly unreachable says nothing about the key, and a
+        # queue this run had nothing to buy from is not an outage worth mail.
+        log.warning(f"wallet unreachable ({type(ex).__name__}) -- asking again next run")
+        if loud:
+            alert_now("preflight: Stellar unreachable", f"{type(ex).__name__}: {ex}")
+        return False
+
+    fuelled = cents >= MIN_FUEL_CENTS
+    # The amount stays out of the log on purpose: this repo is public.
+    log.info(f"Stellar accepted the key; wallet {'funded' if fuelled else 'EMPTY'}")
+    if loud:
+        alert_now("preflight: the key works",
+                  f"Stellar accepted the key from GitHub Actions.\n\n"
+                  f"Wallet available: EUR {cents/100:.2f}\n\n" +
+                  ("There is enough in it to buy.\n\n" if fuelled else
+                   "That is too low to buy anything -- top it up BEFORE a Stellar row goes "
+                   "on sale, or every paid Stellar order waits for the wallet.\n\n") +
+                  "This run bought nothing; it only asked.")
+    return fuelled
+
+
 def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -> int:
     orders = pending_orders()
     if not orders:
         log.info("no Stellar orders pending")
+        # An idle run is the only chance to catch a key that stopped working
+        # before a paying customer does. Once an hour, in the same window the
+        # alerts use, so an idle bot stays a free bot.
+        if not _quiet_hour(now):
+            try:
+                preflight(st, now=now)
+            except Exception:
+                log.exception("readiness check failed")
         return 0
     log.info(f"{len(orders)} Stellar order(s) pending")
     st = st or Stellar(fb.env("STELLAR_API_KEY"))
@@ -865,6 +940,13 @@ def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     try:
+        # `--preflight` (stellar_preflight.yml, by hand from the Actions tab)
+        # asks Stellar whether the key works and mails back the balance. It
+        # never buys, so it is safe to run at any moment, including while the
+        # queue has orders in it.
+        if "--preflight" in sys.argv[1:]:
+            preflight(loud=True)
+            return 0
         run()
         return 0
     except Exception as ex:

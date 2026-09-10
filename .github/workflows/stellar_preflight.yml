@@ -1,0 +1,37 @@
+name: Stellar preflight (does the key work?)
+
+# Bot #8's key can SPEND, so it lives only in Actions secrets and cannot be
+# read or tested from either Mac. The buyer step itself returns on an empty
+# queue BEFORE it touches the key, so a two-second green run says nothing
+# about the secret behind it -- the first thing to test it would otherwise be
+# a customer who has already paid.
+#
+# This asks Stellar one read-only question (GET /wallet) and mails back the
+# answer plus the balance. It never buys. Run it by hand from the Actions tab
+# before putting a Stellar row on sale, and after any key change.
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: stellar-preflight
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: pip install -q gspread requests playwright google-auth google-api-python-client
+
+      - name: Ask Stellar
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          STELLAR_API_KEY: ${{ secrets.STELLAR_API_KEY }}
+        run: python stellar_buyer.py --preflight
