@@ -1,0 +1,46 @@
+# Manual check that the two Stellar keys in repo secrets work, and that the
+# read-only key really is read-only. Prints field NAMES only: this repo is
+# public, so its logs are public, and neither prices nor the balance belong there.
+name: Stellar smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE: https://wholesale.stellarsecurity.com/api/v1
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: plans with STELLAR_READ_KEY (expects 200)
+        env:
+          KEY: ${{ secrets.STELLAR_READ_KEY }}
+        run: |
+          code=$(curl -s -o plans.json -w '%{http_code}' -H "Authorization: Bearer $KEY" -H 'Accept: application/json' "$BASE/plans")
+          echo "HTTP $code"
+          jq -r 'if type=="array" then "plans: \(length)"
+                 elif (.data|type)=="array" then "plans on this page: \(.data|length)   top-level keys: \(keys|join(","))"
+                 else "top-level keys: \(keys|join(","))" end' plans.json
+          test "$code" = 200
+
+      - name: wallet with STELLAR_API_KEY (expects 200)
+        env:
+          KEY: ${{ secrets.STELLAR_API_KEY }}
+        run: |
+          code=$(curl -s -o wallet.json -w '%{http_code}' -H "Authorization: Bearer $KEY" -H 'Accept: application/json' "$BASE/wallet")
+          echo "HTTP $code"
+          echo "fields: $(jq -r '[paths(scalars)|join(".")]|join(",")' wallet.json)"
+          test "$code" = 200
+
+      - name: wallet with STELLAR_READ_KEY (expects a refusal)
+        env:
+          KEY: ${{ secrets.STELLAR_READ_KEY }}
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $KEY" "$BASE/wallet")
+          echo "HTTP $code (anything but 200 is correct)"
+          test "$code" != 200
