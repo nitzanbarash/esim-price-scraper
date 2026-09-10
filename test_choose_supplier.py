@@ -19,7 +19,13 @@ pinned here without a sheet, a network or a credential:
       moved onto a row with no customer price,
     * a carried cell is written with the Python TYPE it was read as,
     * רווח is filled in on the blank rows of every two-supplier SKU, in the
-      scraper's format, off the SKU's מחיר שלי.
+      scraper's format, off the SKU's מחיר שלי,
+    * and the MIRROR: on every run, switch or no switch, every row of a SKU is
+      made to quote the same U/S/T/V as the chosen row — but only the cells
+      that differ, so a second run in a row writes nothing; never on a SKU with
+      no tick; never when the chosen row's own U is not a price; and never onto
+      a blank-מקור duplicate under a one-supplier SKU. רווח is recomputed per
+      row off that row's OWN cost, never copied.
 
 Run:  python test_choose_supplier.py
 """
@@ -29,8 +35,8 @@ import sys
 import day_policy
 from choose_supplier import (
     CARRY, LAST_COL, LOSER_BG, TICK, WINNER_BG, Row, _entered_value,
-    cap_switches, decide, eligible, final_usd, money, profit_text, source_of,
-    switch_note, usd, usd_outside_parens,
+    cap_switches, decide, eligible, final_usd, mirror_of, money, profit_text,
+    same_cell, source_of, switch_note, usd, usd_outside_parens,
 )
 
 _fails: list[str] = []
@@ -391,6 +397,181 @@ check("a cap of 1 lets the one switch through",
       (0, ["keep", "switch"]))
 check("the kept SKU still fills \u05e8\u05d5\u05d5\u05d7 under a cap",
       writes_of(kept_and_switch2[0], "profit"), [(3, profit_text(5.40, 3.06))])
+
+print("\n-- same_cell: what 'already matches' means, so a rerun writes nothing --")
+check("two blanks are the same blank", same_cell("", None), True)
+check("whitespace is blank too", same_cell("", "   "), True)
+check("equal text is the same cell", same_cell("16.99", "16.99"), True)
+check("equal numbers are the same cell", same_cell(16.99, 16.99), True)
+# The sheet's formulas add up S/T/U. A number and its text are not the same
+# cell, and the run that replaces one with the other is the fix, not the churn
+# (memory: variant-cell-rendering).
+check("a number and its text are NOT the same cell", same_cell(16.99, "16.99"), False)
+check("blank over a value is a change", same_cell("", "10%"), False)
+check("a value over blank is a change", same_cell("10%", ""), False)
+
+
+print("\n-- the mirror: every row of a SKU quotes the SKU's own price --")
+
+
+def twin(**stellar_kw):
+    """A ticked, priced esim.dog row and a Stellar row 0.6% cheaper.
+
+    Under the 1% gate, so nothing switches and no P is due (both rows already
+    hold one): whatever this SKU writes, the mirror wrote it.
+    """
+    stellar_kw.setdefault("profit", "\U0001f7e2 +$2.34 (+76.5%)")
+    return [dog(2, "1.66.10", "$3.08", my_price="15.96", fee="1.2",
+                final="16.99", discount="10%"),
+            stellar(3, "1.66.10", "$3.06", **stellar_kw)]
+
+
+def apply_writes(rows, d):
+    """The sheet as it will BE after this run — so the next run can be asked
+    what it would write, which is the only honest test of idempotence."""
+    by_row = {r.row: r for r in rows}
+    for row, key, value in d.writes:
+        setattr(by_row[row], key, value)
+    return rows
+
+
+rows = twin()
+d = only(decide(rows))
+check("a twin under the gate does not move the tick", d.action, "keep")
+check("...and the blank twin gets the whole customer side, U first",
+      d.writes, [(3, "final", "16.99"), (3, "my_price", "15.96"),
+                 (3, "fee", "1.2"), (3, "discount", "10%")])
+check("...counted as a mirror, apart from the switch", d.mirrored, 4)
+check("...and nothing is recoloured for a mirror", d.colours, [])
+check("...and no cost, no R, no J is touched",
+      {k for _, k, _ in d.writes} <= set(CARRY), True)
+
+# The whole point of comparing before writing: tomorrow's run is silent.
+apply_writes(rows, d)
+d2 = only(decide(rows))
+check("the very next run writes nothing at all", d2.writes, [])
+check("...and mirrors nothing", d2.mirrored, 0)
+
+d = only(decide(twin(final="16.99", my_price="15.96", fee="1.2", discount="10%")))
+check("a twin that already matches is not rewritten", d.writes, [])
+check("...and is not counted as mirrored", d.mirrored, 0)
+
+d = only(decide(twin(final="9.99", my_price="15.96", fee="1.2", discount="10%")))
+check("a twin quoting its own price is overwritten from the chosen row",
+      d.writes, [(3, "final", "16.99")])
+check("...and only that one cell", d.mirrored, 1)
+
+print("\n-- P is recomputed per row, never mirrored --")
+d = only(decide([dog(2, "1.66.10", "$3.08", my_price="5.40", final="5.99", profit=""),
+                 stellar(3, "1.66.10", "$3.06", profit="")]))
+check("each row's P is off its OWN cost",
+      writes_of(d, "profit"),
+      [(2, profit_text(5.40, 3.08)), (3, profit_text(5.40, 3.06))])
+check("...so the two rows do not hold the same P",
+      profit_text(5.40, 3.08) != profit_text(5.40, 3.06), True)
+check("...while U/S/T/V on the twin came from the chosen row",
+      [(k, v) for row, k, v in d.writes if row == 3 and k in CARRY],
+      [("final", "5.99"), ("my_price", "5.40"), ("fee", "0.8"), ("discount", "10%")])
+check("...and P is never one of the mirrored keys", "profit" in CARRY, False)
+
+print("\n-- no readable U on the chosen row: the SKU is skipped whole --")
+d = only(decide([dog(2, "1.66.10", "$3.08", final="—", profit="x"),
+                 stellar(3, "1.66.10", "$3.06", profit="x")]))
+check("an unreadable U mirrors nothing", d.writes, [])
+check("...and says which cell to look at", "U unreadable" in d.mirror_note, True)
+check("...and the SKU is otherwise left exactly as it is", d.action, "keep")
+# On a switch this was already the rule, and it still is.
+d = only(decide([dog(2, "1.66.10", "$10.00", final="", profit="x"),
+                 stellar(3, "1.66.10", "$8.00", profit="x")]))
+check("...and on a switch the SKU is skipped, as before",
+      (d.action, d.writes, d.mirrored), ("skip", [], 0))
+d = only(decide([dog(2, "1.66.10", "$10.00"), stellar(3, "1.66.10", "$5.00", chosen=TICK)]))
+check("an ambiguous SKU mirrors nothing either", (d.writes, d.mirrored), ([], 0))
+
+print("\n-- no tick at all: nothing is mirrored and nothing is invented --")
+# The real one: SKU 2.49.50 holds two rows and no tick, the esim.dog row priced
+# at 18.99 and the Stellar row at nothing. There is no chosen row to copy, so
+# the owner is told to set the tick instead of the bot guessing which row he
+# meant to sell.
+d = only(decide([dog(2, "2.49.50", "$10.00", chosen="", final="18.99", profit="x"),
+                 stellar(3, "2.49.50", "$9.95", profit="x")]))
+check("a SKU with no tick writes nothing", d.writes, [])
+check("...mirrors nothing", d.mirrored, 0)
+check("...and no tick is invented", writes_of(d, "chosen"), [])
+check("...and the log names the missing tick", TICK in d.mirror_note, True)
+
+print("\n-- a blank source is not automatically the other half of a twin --")
+# Both rows read as esim.dog, so this is one supplier written twice, not a
+# pair. The customer price is not spread onto a duplicate line.
+d = only(decide([dog(2, "1.66.10", "$3.08", final="16.99", my_price="15.96", profit="x"),
+                 Row(row=3, sku="1.66.10", source="", price="$3.06",
+                     validity="30d", profit="x")]))
+check("a blank-source duplicate under a one-supplier SKU is left alone", d.writes, [])
+# Opposite a Stellar row it IS the other half, and it is filled in.
+d = only(decide([stellar(2, "1.66.10", "$3.08", chosen=TICK, final="16.99",
+                         my_price="15.96", profit="x"),
+                 Row(row=3, sku="1.66.10", source="", price="$3.06",
+                     validity="30d", profit="x")]))
+check("a blank source opposite Stellar is a real twin, and is filled",
+      d.writes, [(3, "final", "16.99"), (3, "my_price", "15.96")])
+
+print("\n-- on a switch: the winner is carried, the rest are mirrored --")
+d = only(decide([dog(2, "1.0B.10", "$10.00", my_price="15.96", fee="1.2",
+                     final="16.99", discount="10%", profit="x"),
+                 stellar(3, "1.0B.10", "$8.00", profit="x"),
+                 stellar(4, "1.0B.10", "$9.00", profit="x")]))
+check("the tick moves to the cheapest row", (d.action, d.winner.row), ("switch", 3))
+check("the carry writes the winner and the mirror writes the rest",
+      [(row, k) for row, k, _ in d.writes if k in CARRY],
+      [(3, "final"), (3, "my_price"), (3, "fee"), (3, "discount"),
+       (4, "final"), (4, "my_price"), (4, "fee"), (4, "discount")])
+check("...the row the values came FROM is never rewritten",
+      [row for row, k, _ in d.writes if k in CARRY and row == 2], [])
+check("...the third row gets the SKU's price, not the winner's blank",
+      [(k, v) for row, k, v in d.writes if row == 4 and k in CARRY],
+      [("final", "16.99"), ("my_price", "15.96"), ("fee", "1.2"), ("discount", "10%")])
+check("...and only those four count as mirrored", d.mirrored, 4)
+
+ds = three_switches()
+cap_switches(ds, 2)
+check("a deferred switch mirrors nothing", (ds[2].mirrored, ds[2].mirror_note), (0, ""))
+
+print("\n-- a mirrored cell keeps the TYPE of the cell it came from --")
+d = only(decide([dog(2, "1.66.10", "$3.08", my_price=15.96, fee=1.2, final=16.99,
+                     discount="10%"),
+                 stellar(3, "1.66.10", "$3.06", profit="x")]))
+mirrored = {k: v for _, k, v in d.writes if k in CARRY}
+check("a float mirrors as a number", _entered_value(mirrored["final"]),
+      {"userEnteredValue": {"numberValue": 16.99}})
+check("an int-ish fee too", _entered_value(mirrored["fee"]),
+      {"userEnteredValue": {"numberValue": 1.2}})
+check("a str mirrors as text", _entered_value(mirrored["discount"]),
+      {"userEnteredValue": {"stringValue": "10%"}})
+d = only(decide(twin()))
+check("a str price stays text on the twin as well",
+      _entered_value({k: v for _, k, v in d.writes if k in CARRY}["final"]),
+      {"userEnteredValue": {"stringValue": "16.99"}})
+# A twin holding the TEXT '16.99' under a chosen row holding the NUMBER 16.99
+# is not "already matching": text does not add up in the sheet's formulas.
+d = only(decide([dog(2, "1.66.10", "$3.08", my_price=15.96, fee=1.2, final=16.99,
+                     discount="10%"),
+                 stellar(3, "1.66.10", "$3.06", my_price=15.96, fee=1.2,
+                         final="16.99", discount="10%", profit="x")]))
+check("the text of a number is rewritten as the number", d.writes, [(3, "final", 16.99)])
+
+print("\n-- mirror_of on its own --")
+chosen = dog(2, "1.66.10", "$3.08", final="16.99", my_price="15.96")
+other = stellar(3, "1.66.10", "$3.06")
+check("it returns the writes and no note",
+      mirror_of([chosen, other], chosen, {}),
+      ([(3, "final", "16.99"), (3, "my_price", "15.96"),
+        (3, "fee", "0.8"), (3, "discount", "10%")], ""))
+# On a switch the source is what the run is ABOUT to write onto the winner,
+# not what that row holds right now.
+check("a carry overrides the chosen row's own cells",
+      mirror_of([chosen, other], other, {"final": "5.99", "my_price": "5.40",
+                                         "fee": "0.8", "discount": ""})[0],
+      [(2, "final", "5.99"), (2, "my_price", "5.40"), (2, "discount", "")])
 
 if _fails:
     print(f"\n{len(_fails)} FAILED: " + ", ".join(_fails))

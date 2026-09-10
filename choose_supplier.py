@@ -65,6 +65,31 @@ owner has never been able to compare the two rows on the one number that matters
 It is written in the scraper's own format, off the SKU's מחיר שלי, and only
 where that price exists.
 
+THE MIRROR, also on every run, switch or no switch
+--------------------------------------------------
+The customer side of a SKU belongs to the SKU, not to the supplier. So every
+row of a SKU is made to quote the same U/S/T/V as the row the site actually
+sells from — the row carrying the tick. Until now those four moved only when
+the TICK moved, which left 23 twin rows that have never held a customer price
+at all: the owner opens a SKU, reads the row in front of him, and sees nothing.
+A cell is written only when it DIFFERS from the chosen row's, so the second run
+in a row writes nothing and burns no quota.
+
+Three things the mirror will not do:
+    * mirror a SKU with no tick anywhere. There is no chosen row to copy from,
+      and the chooser does not invent one — it says so in the log instead, and
+      the owner puts the tick where he wants it (SKU 2.49.50 is such a SKU).
+    * mirror when the chosen row's own U is not a readable price. There is no
+      customer price to spread, and spreading a blank is how a package goes
+      dark the day the tick lands on it.
+    * write the customer price onto a row whose מקור is blank under a SKU that
+      has only ONE supplier. A blank מקור reads as esim.dog, so that row is a
+      duplicate line, not the other half of a twin.
+
+P is never mirrored — it is RECOMPUTED per row, off the SKU's own מחיר שלי and
+that row's OWN cost, exactly as it always was. Two suppliers cost different
+money, so one P copied onto both rows would be a lie on one of them.
+
 Run:
     python choose_supplier.py            dry run — prints the table, writes nothing
     python choose_supplier.py --apply    writes to the sheet
@@ -276,6 +301,72 @@ def money(v: Optional[float]) -> str:
     return f"${v:.2f}" if v is not None else "—"
 
 
+def _blank(cell) -> bool:
+    """Nothing in the cell — '', None, or only spaces and bidi marks."""
+    return not text(cell).strip()
+
+
+def same_cell(a, b) -> bool:
+    """True when writing a over b would change nothing — so nothing is written.
+
+    Two blanks are the same blank: '' and None and a missing cell all read as
+    empty, and clearing an already-empty cell is a wasted request.
+
+    Otherwise the comparison is Python's own, TYPE INCLUDED. 16.99 and '16.99'
+    are NOT the same cell: one is money the sheet's formulas can add up and the
+    other is text that a currency format once turned into an unparseable price
+    (memory: variant-cell-rendering). So the first run writes the number over
+    the text — and every run after it, reading the number back, writes nothing.
+    """
+    if _blank(a) and _blank(b):
+        return True
+    return a == b
+
+
+def _twin_pair(group: list[Row]) -> bool:
+    """Does this SKU really have TWO suppliers under it?
+
+    Two rows are not a twin just because there are two of them — a blank מקור
+    reads as esim.dog (DEFAULT_SOURCE), so an esim.dog row beside a blank one
+    is one supplier written twice. The customer price is not spread onto the
+    blank half of that: it is a duplicate line, not the other side of a pair.
+    """
+    return len({source_key(r) for r in group}) > 1
+
+
+def mirror_of(group: list[Row], chosen: Row, carried: dict) -> tuple[list, str]:
+    """The chosen row's customer side, onto every OTHER row of the same SKU.
+
+    `carried` is what a switch is already writing onto the winner this run, if
+    anything: the mirror has to spread the values the sheet will HOLD when the
+    run finishes, not the ones the winner's row happens to hold right now.
+
+    Returns (writes, note). The note is filled only when the mirror declined by
+    RULE — an unreadable customer price — so the log can say which cell to fix.
+    Declining because everything already matches is silence, and is the normal
+    state of a sheet that ran yesterday.
+    """
+    src = {key: (carried[key] if key in carried else chosen.get(key))
+           for key in CARRY}
+    # The same gate the carry uses, for the same reason: U is the price the
+    # site charges. A row that cannot state one has nothing to lend the others.
+    if final_usd(src["final"]) is None:
+        seen = text(src["final"]).strip() or "blank"
+        return [], f"U unreadable ({seen}) — no customer price to mirror"
+
+    twin = _twin_pair(group)
+    writes = []
+    for r in group:
+        if r is chosen:
+            continue               # the carry already wrote it, or it is the source
+        if _blank(r.source) and not twin:
+            continue               # a duplicate esim.dog line, not a twin
+        for key in CARRY:
+            if not same_cell(src[key], r.get(key)):
+                writes.append((r.row, key, src[key]))
+    return writes, ""
+
+
 def switch_note(old: Row, new: Row) -> str:
     """The J cell of a switch: where it moved from, to, and at what two costs."""
     return (f"↔ ספק: {source_of(old)} → {source_of(new)} "
@@ -293,6 +384,12 @@ class Decision:
     winner: Optional[Row] = None
     writes: list = field(default_factory=list)   # (sheet row, column key, value)
     colours: list = field(default_factory=list)  # (sheet row, hex)
+    mirrored: int = 0               # cells the mirror wrote, counted apart from
+                                    # the switch — a run can mirror without
+                                    # moving a single tick, and usually does
+    mirror_note: str = ""           # why the mirror wrote nothing, when the
+                                    # reason is a rule and not just "already
+                                    # matches" — the owner has to be told
 
     @property
     def old_cost(self) -> Optional[float]:
@@ -359,6 +456,7 @@ def decide(rows: list[Row]) -> list[Decision]:
                 reason = f"{gap:.1f}% cheaper"
 
         d = Decision(sku=sku, incumbent=inc, winner=winner, reason=reason)
+        carried: dict = {}          # what a switch hands the winner this run
         if winner is not inc:
             # The carry gate, read BEFORE anything is written. U is the price
             # the customer is charged; if it does not parse, there is nothing
@@ -384,13 +482,31 @@ def decide(rows: list[Row]) -> list[Decision]:
             # one. An unreadable U on an UNTICKED incumbent carries nothing:
             # no tick means the site was not selling that row's price anyway.
             if final_usd(inc.final) is not None:
+                carried = {key: inc.get(key) for key in CARRY}
                 for key in CARRY:
-                    d.writes.append((winner.row, key, inc.get(key)))
+                    d.writes.append((winner.row, key, carried[key]))
             d.writes.append((winner.row, "changed", switch_note(inc, winner)))
             d.colours.append((winner.row, WINNER_BG))
             d.colours.extend((r.row, LOSER_BG) for r in group if r is not winner)
 
+        # The mirror, on every run: every row of the SKU quotes the SKU's own
+        # customer price, not just the row the tick happens to sit on today.
+        # It needs a chosen row to copy FROM — the tick that is there, or the
+        # one this run is putting there for a reason it can name. With no tick
+        # at all the chooser does not pick one: it says so and leaves the SKU.
+        if any(text(r.chosen).strip() for r in group) or d.action == "switch":
+            mirror, note = mirror_of(group, winner, carried)
+            d.writes.extend(mirror)
+            d.mirrored = len(mirror)
+            d.mirror_note = note
+        else:
+            d.mirror_note = (f"no {TICK} in נבחר — nothing "
+                             f"is mirrored until one row is chosen")
+
         # P, on every multi-row SKU: the Stellar rows have never had one.
+        # NOT mirrored, and never copied off the chosen row: it is recomputed
+        # from the SKU's own מחיר שלי against THIS row's cost, because the two
+        # suppliers are not paid the same money for the same package.
         mine = price_num(inc.my_price)
         if mine is not None:
             for r in group:
@@ -421,6 +537,8 @@ def cap_switches(decisions: list[Decision], limit: int) -> int:
         d.action = "deferred"
         d.writes = []            # including this SKU's רווח fills: all or nothing
         d.colours = []
+        d.mirrored = 0           # and its mirror: the row it would copy FROM is
+        d.mirror_note = ""       # the one this run is no longer going to choose
         left += 1
     return left
 
@@ -582,6 +700,10 @@ def _describe(d: Decision) -> str:
         tail += "   [held by --max-switches]"
     if profits:
         tail += f"   [+{profits} P]"
+    if d.mirrored:
+        tail += f"   [⇉{d.mirrored} mirrored]"
+    if d.mirror_note:
+        tail += f"   [no mirror: {d.mirror_note}]"
     return head + tail
 
 
@@ -625,9 +747,20 @@ def main(argv=None) -> int:
     skipped = [d for d in decisions if d.action == "skip"]
     cells = sum(len(d.writes) for d in decisions)
     profits = sum(1 for d in decisions for _, key, _ in d.writes if key == "profit")
+    mirrored = sum(d.mirrored for d in decisions)
+    mirror_skus = sum(1 for d in decisions if d.mirrored)
     print(f"\n\U0001f4ca switched {len(switched)} / kept {len(kept)} / skipped {len(skipped)}"
           f" | {cells} cells ({profits} of them \u05e8\u05d5\u05d5\u05d7) | "
           f"{sum(len(d.colours) for d in decisions)} rows recoloured")
+    # The mirror is counted on its own line: it is not a switch, it moves no
+    # money between suppliers, and on a quiet day it is the only thing the run
+    # does. Zero here means every row of every SKU already quotes the SKU price.
+    print(f"\u21c9  mirrored {mirrored} cell{'' if mirrored == 1 else 's'} on "
+          f"{mirror_skus} SKU{'' if mirror_skus == 1 else 's'} "
+          f"(U/S/T/V onto every row of the SKU)")
+    for d in decisions:
+        if d.mirror_note:
+            print(f"   \u21c9  {d.sku}: {d.mirror_note}")
     if left:
         print(f"\u23f8  --max-switches {a.max_switches}: {left} more switch"
               f"{'es' if left != 1 else ''} left for a later run, untouched")
