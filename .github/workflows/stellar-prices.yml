@@ -1,0 +1,69 @@
+# Stellar rows added to the sheet between daily scrapes sit priceless until the
+# next 10:00 run; the owner asked for ~4h freshness on 2026-09-10.
+name: Stellar prices (every 4h)
+
+# Stellar answers its whole catalogue over an API in about a minute, so unlike
+# the esim.dog browser scrape there is no reason to pay for it only once a day.
+# This job is the same two steps scrape.yml ends with, on their own light
+# schedule. scrape.yml KEEPS its own copies: after a scrape both prices must be
+# today's before the chooser compares them, and that ordering is the whole
+# reason those steps live inside that run.
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+# The sheet has one set of price columns and two writers. Sharing a group with
+# scrape.yml means a 4-hourly run that lands mid-scrape QUEUES behind it rather
+# than writing the same rows at the same time; cancel-in-progress: false because
+# the scrape must never be killed by this cheap job, and a queued price refresh
+# is worth running late.
+concurrency:
+  group: price-sheet
+  cancel-in-progress: false
+
+jobs:
+  prices:
+    runs-on: ubuntu-latest
+    # Backstop only — the two steps below cap themselves at 5 + 5, and the
+    # checkout/python/pip setup is another couple of minutes.
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        timeout-minutes: 6
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # STELLAR_READ_KEY is the plans:read-only key (memory:
+      # stellar-key-placement). Without it the script will not write anything:
+      # its only remaining source is the public RETAIL feed, and it refuses to
+      # write estimates off it — it says so in this log and exits 3.
+      - name: Refresh Stellar prices
+        id: stellar
+        timeout-minutes: 5
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          STELLAR_READ_KEY: ${{ secrets.STELLAR_READ_KEY }}
+        run: python stellar_prices.py --apply
+
+      # Same gate as scrape.yml, and for the same reason: stellar_prices.py
+      # exits 3 on 'no wholesale key / estimate refused', and a chooser running
+      # behind that would compare esim.dog's real cost against a guess and move
+      # live SKUs on it. A failed step means the same thing. Both are skipped
+      # and the ticks stay where the owner last had them.
+      - name: Choose supplier
+        if: always() && steps.stellar.outcome == 'success'
+        timeout-minutes: 5
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python choose_supplier.py --apply

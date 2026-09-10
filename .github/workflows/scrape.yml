@@ -11,6 +11,15 @@ on:
   # Manual trigger (Actions tab) + external triggers (cron-job.org).
   workflow_dispatch:
 
+# The sheet has one set of price columns and, since 2026-09-10, two writers:
+# this scrape and the 4-hourly stellar-prices.yml. They share this group so the
+# light job queues behind a running scrape instead of writing the same rows at
+# the same time. cancel-in-progress: false — a scrape costs an hour of browser
+# driving and must never be killed to let a one-minute price refresh in.
+concurrency:
+  group: price-sheet
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
