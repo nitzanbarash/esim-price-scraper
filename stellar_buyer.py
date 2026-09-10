@@ -342,8 +342,17 @@ def source_text(rail: str) -> str:
 def _quiet_hour(now: Optional[datetime] = None) -> bool:
     """This step runs every few minutes. A condition that persists (an empty
     wallet, Stellar down) must not mail every run; the first minutes of each
-    hour carry it, and the site's own stale-order ladder covers the rest."""
-    return (now or datetime.now(fb.TZ)).minute >= 3
+    hour carry it, and the site's own stale-order ladder covers the rest.
+
+    The window has to be WIDER than the gap between runs, or it is not a
+    throttle but a lottery. Actions delays a */5 schedule by an unpredictable
+    few minutes, so a three-minute window at the top of the hour is hit only
+    if the delay happens to land there: runs at :04, :09, :14 never alert at
+    all and a persistent fault goes unreported for days. Ten minutes always
+    contains a slot of a five-minute cadence, and costs at most two mails an
+    hour, which is the bound that matters (memory: stuck-claim-watchdog).
+    """
+    return (now or datetime.now(fb.TZ)).minute >= 10
 
 
 def alert_hourly(subject: str, body: str, now: Optional[datetime] = None):
@@ -487,12 +496,29 @@ class Run:
         if not claim(oid):
             return
         attempts = order_rows(self.ws, oid)
-        live = [r for r in attempts if r["status"] == ST_REVIEW or
-                (r["stellar_id"] and not r["status"].startswith(ST_FAILED))]
+        # Only a row that explicitly says FAILED authorises another purchase.
+        # Anything else -- processing, active, in review, a word a person
+        # typed, a blank cell -- means an attempt is outstanding and this bot
+        # keeps its hands off. The old rule also demanded that the supplier
+        # link PARSE into a Stellar order id, so a link the owner reformatted,
+        # or a cell the sheet renders as a hyperlink label rather than a url
+        # (memory: variant-cell-rendering), turned a row that had already
+        # spent money into "no attempt was made" -- and bought it again.
+        live = [r for r in attempts if not r["status"].startswith(ST_FAILED)]
         if live:
             r = live[-1]
             if r["status"] == ST_REVIEW:
                 log.info(f"{oid}: in manual review (row {r['n']}) -- hands off")
+                return
+            if not r["stellar_id"]:
+                log.warning(f"{oid}: row {r['n']} says {r['status']!r} but names no Stellar order")
+                alert_hourly(f"{oid}: receipts row {r['n']} cannot be settled",
+                             f"Row {r['n']} says {r['status']!r} for {oid} but its supplier link "
+                             f"does not name a Stellar order, so nothing can be settled from it "
+                             f"-- and nothing is bought either, because that row may already have "
+                             f"cost money. Paste the order's portal link into it, or set it to "
+                             f"'{ST_FAILED}' if nothing was bought and the next run will retry.",
+                             self.now)
                 return
             self.settle(o, r["n"], r["stellar_id"], wait=False)
             return
@@ -529,13 +555,19 @@ class Run:
 
         idem = f"waverole-{oid}-a{attempt}"
         code, body = self.st.create_order(v.plan_id, idem)
-        if unknown_outcome(code, body):
-            # The answer says nothing about the money, and guessing is the one
-            # move that can cost a second package. Ask the same question again
-            # under the SAME key: if an order was created, the replay is handed
-            # that order back and the run carries on as if the first answer had
-            # arrived. (The replay re-sends the same plan; a listing that moved
-            # under us answers 409, which is a review row -- never a purchase.)
+        # Once ONE answer has failed to say whether the order was created, the
+        # whole exchange is unknown and STAYS unknown: no later answer can
+        # prove the first POST created nothing. A clean success resolves it --
+        # Stellar hands the same order back -- and nothing else does, so this
+        # flag closes the 'failed' branch below for the rest of the call.
+        unsure = unknown_outcome(code, body)
+        if unsure:
+            # Guessing is the one move that can cost a second package. Ask the
+            # same question again under the SAME key: if an order was created,
+            # the replay is handed that order back and the run carries on as if
+            # the first answer had arrived. (The replay re-sends the same plan;
+            # a listing that moved under us answers 409, which is a review row
+            # -- never a purchase.)
             log.warning(f"{oid}: HTTP {code} says nothing about the money -- replaying {idem}")
             time.sleep(REPLAY_WAIT_S)
             code, body = self.st.create_order(v.plan_id, idem)
@@ -585,7 +617,7 @@ class Run:
                          f"key {idem}, so this cannot become a second package.", self.now)
             return 0, ""
 
-        if 400 <= code < 500:
+        if 400 <= code < 500 and not unsure:
             # Stellar READ the request and rejected it -- a bad plan, a bad
             # key, a rule of theirs. Nothing was created, and this is the only
             # shape of answer that earns the word the site reserves: 'failed'
@@ -601,18 +633,20 @@ class Run:
                       f"and the next attempt buys under a new key.")
             return 0, ""
 
-        # Twice now Stellar has not said whether the money moved. The site is
-        # NOT told 'failed': it would read that as "nothing was bought" and
+        # Stellar has still not said whether the money moved -- either twice
+        # over, or once and then with a refusal that only covers the REPLAY.
+        # The site is NOT told 'failed': it would read that as "nothing was
         # hand this PAID order back to be bought again, and the wallet may
         # already be down a package. So the order simply keeps its place in the
         # queue, this row stops the next run from touching it, and a person
         # settles it from the portal.
         n = append_row(self.ws, {**base, H_LINK_SUP: "https://wholesale.stellarsecurity.com/orders",
                                  H_STATUS: ST_REVIEW})
-        alert_now(f"{oid} needs a look: Stellar answered {code} twice",
+        alert_now(f"{oid} needs a look: Stellar would not say what it did",
                   f"Stellar: {msg}\n\nThe order for {oid} ({sku}, {v.gb:g}GB/{v.days}d, "
-                  f"EUR {v.wholesale_eur:.2f}) may or may not exist under key {idem} -- Stellar "
-                  f"did not say, twice. Nothing has been reported to the site, so the order is "
+                  f"EUR {v.wholesale_eur:.2f}) may or may not exist under key {idem} -- the first "
+                  f"answer said nothing about the money and the second did not settle it. "
+                  f"Nothing has been reported to the site, so the order is "
                   f"still queued, and nothing more is bought for it while row {n} of the receipts "
                   f"sheet says so.\n\nCheck the wallet and the orders list in the portal:\n"
                   f"  * the order IS there -- paste its link into row {n} and set the status to "
@@ -650,6 +684,19 @@ class Run:
                 return
             if time.monotonic() >= deadline:
                 log.info(f"{oid}: Stellar order {sid} still {status or 'provisioning'} -- next run")
+                # A wait that is NOT this run's own purchase means an earlier
+                # run already spent the money and the order has still not come
+                # good; so does any status outside the two that are a normal
+                # wait -- 'fulfilled' with no readable credentials lands here
+                # too. Provisioning takes seconds, so either way the customer
+                # has paid and has nothing. The hourly throttle IS the delay:
+                # the runs just after a purchase say nothing at all.
+                if not wait or status not in NON_TERMINAL:
+                    alert_hourly(f"{oid}: Stellar order still {status or 'provisioning'}",
+                                 f"Stellar order {sid} for {oid} (receipts row {n}) is "
+                                 f"'{status or 'not provisioned'}' and has no credentials this key "
+                                 f"can read. The wallet is already debited. Look at it in the "
+                                 f"portal -- the customer has paid and has nothing.", self.now)
                 return
             time.sleep(POLL_EVERY_S)
 
@@ -676,10 +723,16 @@ class Run:
             if not gb:
                 gb = sp._gb_from_mb(int((raw.get("data") or {}).get("megabytes") or 0))
         payload = site_payload(cred, region, networks, gb, days)
-        # The customer first: the site's record is what the order page shows
-        # and what the fulfillment bot mails. The sheet is the books.
-        report_fulfilled(oid, payload)
-        log.info(f"{oid}: delivered from Stellar order {sid}")
+        # The sheet FIRST, then the site. That reads backwards -- the customer
+        # ought to come first -- until you ask what a run KILLED between the two
+        # leaves behind. Row written, site not told: the order is still pending,
+        # and the next run finds this very row and settles it, five minutes
+        # late. Site told, row not written: the order leaves the queue for good
+        # and the row is stranded at 'processing', so the usage meter never
+        # starts (it starts at ST_ACTIVE) and the books never learn the cost.
+        # Only one of those heals itself, and this step runs on a 4-minute
+        # timeout. A sheet that REFUSES the write still does not hold up the
+        # customer: it is reported anyway and the owner is told.
         try:
             update_row(self.ws, n, {H_QR: payload["qr_code"], H_ACT: payload["activation_code"],
                                     H_SMDP: payload["smdp"], H_APN: payload["apn"],
@@ -687,8 +740,11 @@ class Run:
                                     H_PLAN: f"{gb:g}GB - {days} days — {networks}".rstrip(" —")})
         except Exception as ex:
             log.exception("receipts row update failed")
-            alert_now(f"{oid} delivered, receipts row {n} not updated",
-                      f"The customer has the eSIM; the sheet row is missing its credentials: {ex}")
+            alert_now(f"{oid}: receipts row {n} not updated",
+                      f"The eSIM is being handed to the customer now; the sheet row is missing "
+                      f"its credentials and its status: {ex}")
+        report_fulfilled(oid, payload)
+        log.info(f"{oid}: delivered from Stellar order {sid}")
 
 
 def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -> int:

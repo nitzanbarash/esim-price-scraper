@@ -50,14 +50,18 @@ class Resp:
 
 class Site:
     """waverole.com /api/orders: the queue, the claim, the reports."""
-    def __init__(self, orders, claim_by: str = ""):
+    def __init__(self, orders, claim_by: str = "", fail_report: bool = False):
         self.orders, self.claim_by, self.posts, self.gets = orders, claim_by, [], []
+        self.fail_report = fail_report      # the site is unreachable when reporting
 
     def get(self, url, params=None, headers=None, timeout=None):
         self.gets.append(dict(params or {}))
         return Resp(200, {"orders": self.orders})
 
     def post(self, url, json=None, headers=None, timeout=None):
+        if self.fail_report and "status" in json:
+            import requests
+            raise requests.ConnectionError("site unreachable")
         self.posts.append(dict(json))
         if "claim" in json:
             if self.claim_by:
@@ -212,9 +216,9 @@ NOW_MID = datetime(2026, 9, 10, 4, 30, tzinfo=fb.TZ)    # hourly alerts held
 
 
 def scenario(orders, stellar: StellarFake, ws: Ws | None = None, rows=None, claim_by="", now=NOW_TOP,
-             plans=PLANS, settle_wait=5):
+             plans=PLANS, settle_wait=5, fail_report=False):
     """Wire the fakes in, run once, hand everything back."""
-    site = Site(orders, claim_by)
+    site = Site(orders, claim_by, fail_report)
     ws = ws or Ws()
     alerts.clear()
     sb.requests.get, sb.requests.post = site.get, site.post
@@ -481,6 +485,70 @@ print("\n   the retry buys under a NEW key")
 site, ws18, _, _ = scenario([order()], (f18b := StellarFake()), ws=ws18)
 check("-a1, and delivered", f18b.creates[0][0] == "waverole-WR-TEST01-a1"
       and len(site.reports("fulfilled")) == 1, str(f18b.creates))
+
+# ── 19. an unknown answer poisons everything after it ────────────────────────
+# The replay's answer only ever covers the REPLAY. Nothing it says can prove
+# the FIRST request created nothing -- so once one answer has been silent about
+# the money, 'failed' is off the table for the rest of the call.
+print("\n19. unknown, then a refusal -> still unknown, never 'failed'")
+site, ws19, _, _ = scenario([order()], (f19 := StellarFake(create=[500, 403])))
+check("the 403 covers the replay, not the 500 before it -- so no failed report",
+      not site.reports("failed"), str(site.posts))
+check("review row instead", ws19.col(2, sb.H_STATUS) == sb.ST_REVIEW)
+check("asked twice under one key", len(f19.creates) == 2
+      and {k for k, _ in f19.creates} == {"waverole-WR-TEST01-a0"})
+print("\n   ...but a 4xx on the FIRST answer still earns the word")
+site, ws19b, _, _ = scenario([order()], StellarFake(create=403))
+check("reported failed", len(site.reports("failed")) == 1)
+
+# ── 20. a row that names no Stellar order is never re-bought ─────────────────
+# order_rows() reads the link cell as the sheet RENDERS it. A reformatted link,
+# or a cell the sheet shows as a hyperlink LABEL (memory: variant-cell-
+# rendering), parses to nothing -- and a row that already spent money must not
+# become "no attempt was made".
+print("\n20. a row that already spent money but names no order is not bought again")
+for label, link in (("no id in the link", ""), ("the sheet rendered a label", "label")):
+    ws20 = Ws([receipt_row("WR-TEST01", sb.ST_PROCESSING, stellar_id="")])
+    if link == "label":
+        ws20.rows[1][HDR.index("Link - esim.dog")] = "Stellar order so-1"
+    site, ws20, _, _ = scenario([order()], (f20 := StellarFake()), ws=ws20)
+    check(f"nothing bought ({label})", len(f20.creates) == 0 and len(ws20.rows) == 2)
+    check(f"...and the owner is told how to unstick it ({label})",
+          alerts and "cannot be settled" in alerts[0][0], str(alerts))
+
+# ── 21. which write happens first, when a run is killed between them ─────────
+print("\n21. the receipts row is written BEFORE the site is told")
+site, ws21, _, _ = scenario([order()], StellarFake(), fail_report=True)
+check("the site never got the report", not site.reports("fulfilled"))
+check("...but the row is already פעיל, so the next run settles from it",
+      ws21.col(2, sb.H_STATUS) == sb.ST_ACTIVE and ws21.col(2, "Activation Code") == LPA)
+
+# ── 22. an order an earlier run paid for and never finished ──────────────────
+print("\n22. money spent, still not provisioned -> the owner is told")
+ws22 = Ws([receipt_row("WR-TEST01", sb.ST_PROCESSING)])
+site, ws22, _, _ = scenario([order()], (f22 := StellarFake(statuses=("processing",))), ws=ws22)
+check("nothing bought, nothing reported", len(f22.creates) == 0
+      and not site.reports("failed") and not site.reports("fulfilled"))
+check("one alert, naming the row", alerts and "still processing" in alerts[0][0], str(alerts))
+site, _, _, _ = scenario([order()], StellarFake(statuses=("processing",)),
+                         ws=Ws([receipt_row("WR-TEST01", sb.ST_PROCESSING)]), now=NOW_MID)
+check("...held mid-hour", not alerts)
+print("\n   fulfilled at Stellar but the key cannot read the credentials is the same story")
+site, _, _, _ = scenario([order()], StellarFake(esims_read=False), settle_wait=0)
+check("alerted, not delivered", alerts and "still fulfilled" in alerts[0][0], str(alerts))
+print("\n   ...and a normal wait right after the purchase says nothing")
+site, _, _, _ = scenario([order()], StellarFake(statuses=("processing",)), settle_wait=0)
+check("no alert", not alerts, str(alerts))
+
+# ── 23. the alert window must be wider than the gap between runs ─────────────
+# A */5 schedule that Actions delays by four minutes lands on :04, :09, :14 --
+# never inside a three-minute window at the top of the hour, so a persistent
+# fault would have gone unreported for days.
+print("\n23. the hourly window survives a delayed cron")
+check("a run at :04 still alerts", not sb._quiet_hour(datetime(2026, 9, 10, 4, 4, tzinfo=fb.TZ)))
+check("a run at :09 still alerts", not sb._quiet_hour(datetime(2026, 9, 10, 4, 9, tzinfo=fb.TZ)))
+check("a run at :10 is held", sb._quiet_hour(datetime(2026, 9, 10, 4, 10, tzinfo=fb.TZ)))
+check("a run at :30 is held", sb._quiet_hour(datetime(2026, 9, 10, 4, 30, tzinfo=fb.TZ)))
 
 # ── summary (last, so it gates the exit code) ────────────────────────────────
 print()
