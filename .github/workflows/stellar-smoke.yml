@@ -77,13 +77,50 @@ jobs:
             echo "esim fields: $(python3 -c 'import json,sys; P=lambda o,p="": [y for k,v in o.items() for y in [(p+"."+k if p else k)]+P(v,(p+"."+k if p else k))] if isinstance(o,dict) else ([y for v in o[:1] for y in P(v,p+"[]")] if isinstance(o,list) else []); print(", ".join(sorted(set(P(json.load(open(sys.argv[1])))))))' esim.json)"
           done
 
+      # The step above showed the eSIM payload carrying no figures at all --
+      # only the flag data.usage_available and data.lifecycle.
+      # last_usage_update_at -- so the meter is almost certainly its own
+      # endpoint. This step asks for it BY NAME: every candidate path, the
+      # status it answers with, and on 200 the dotted key paths. A wrong guess
+      # costs a 404 line in the log and nothing else, which is far cheaper than
+      # another live purchase. NAMES ONLY, and the ids stay out of the log too:
+      # same helper, same env, same rule as the step above.
+      - name: usage endpoint hunt (names only)
+        env:
+          KEY: ${{ secrets.STELLAR_API_KEY }}
+          ORDER_ID: ${{ inputs.order_id }}
+        run: |
+          keys() { python3 -c 'import json,sys; P=lambda o,p="": [y for k,v in o.items() for y in [(p+"."+k if p else k)]+P(v,(p+"."+k if p else k))] if isinstance(o,dict) else ([y for v in o[:1] for y in P(v,p+"[]")] if isinstance(o,list) else []); print(", ".join(sorted(set(P(json.load(open(sys.argv[1])))))) or "(200, but no keys)")' "$1" 2>/dev/null || echo "(200, but not json)"; }
+          probe() {
+            c=$(curl -s -o probe.json -w '%{http_code}' -H "Authorization: Bearer $KEY" -H 'Accept: application/json' "$BASE$2") || c="000"
+            echo "GET $1 -> HTTP $c"
+            if [ "$c" = 200 ]; then echo "     fields: $(keys probe.json)"; fi
+          }
+          SID=$(jq -r '(.data.esims // [])[0].sim_id // empty' order.json 2>/dev/null || true)
+          if [ -n "$SID" ]; then
+            probe "/esims/<sim_id>/usage"       "/esims/$SID/usage"
+            probe "/esims/<sim_id>/data"        "/esims/$SID/data"
+            probe "/esims/<sim_id>/consumption" "/esims/$SID/consumption"
+          else
+            echo "this order names no sim_id -- the /esims/... probes are skipped"
+          fi
+          probe "/orders/<order_id>/usage" "/orders/$ORDER_ID/usage"
+          if [ -n "$SID" ]; then
+            probe "/esims/<sim_id>?include=usage" "/esims/$SID?include=usage"
+          fi
+
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -q gspread requests playwright google-auth google-api-python-client
 
+      # continue-on-error: this DRY RUN talks to the Sheet, and a second client
+      # reading at the same moment has already failed it with a "Connection
+      # refused" that says nothing about the code. A red run there would hide
+      # the field-name steps above, which are the whole point of the job.
       - name: stellar_prices.py DRY RUN from the wholesale API (writes nothing)
+        continue-on-error: true
         env:
           STELLAR_READ_KEY: ${{ secrets.STELLAR_READ_KEY }}
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
