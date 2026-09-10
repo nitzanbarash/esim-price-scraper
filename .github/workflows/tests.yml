@@ -63,6 +63,12 @@ jobs:
       - name: Stellar prices
         run: python test_stellar_prices.py
 
+      # Which Stellar order is placed, under which idempotency key, what the
+      # site is handed back -- and when NOTHING is bought. The one write in
+      # this repo that spends money.
+      - name: Stellar buyer
+        run: python test_stellar_buyer.py
+
       # A duplicate eSIM email is money and trust, both already spent.
       - name: Delivery dedup
         run: python test_delivery_dedup.py

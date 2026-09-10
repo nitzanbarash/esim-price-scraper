@@ -25,9 +25,27 @@ jobs:
           python-version: "3.13"
 
       # No browser any more: the bot reads the supplier's JSON endpoint
-      # directly, which cut this job from ~2 minutes to a few seconds.
+      # directly, which cut this job from ~2 minutes to a few seconds. The
+      # Stellar buyer imports the price scripts, which import playwright and
+      # the Google client at module level -- libraries only, no browser.
       - name: Install dependencies
-        run: pip install -q gspread requests
+        run: pip install -q gspread requests playwright google-auth google-api-python-client
+
+      # Bot #8: buys the queue's supplier=stellar orders from Stellar Wholesale
+      # and hands the site the eSIM, so the fulfillment step below mails it in
+      # this same run. Idle and free when no Stellar order is pending. Its key
+      # can SPEND (memory: stellar-key-placement), so it is scoped to this one
+      # step; continue-on-error so a Stellar fault never blocks esim.dog
+      # deliveries. Money rules and the receipts-sheet ledger: stellar_buyer.py.
+      - name: Stellar buyer
+        continue-on-error: true
+        timeout-minutes: 4
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          STELLAR_API_KEY: ${{ secrets.STELLAR_API_KEY }}
+        run: python stellar_buyer.py
 
       - name: Run fulfillment bot
         env:
