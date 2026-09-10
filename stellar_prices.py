@@ -10,12 +10,21 @@ product we sell under a given SKU.
 
 Where the price comes from
 --------------------------
-The public feed carries Stellar's RETAIL price. We buy at the wholesale tier,
-which sits a fixed factor below it: measured 2026-09-09 over 58 of our rows
-against the wholesale portal read of 2026-09-07, retail / wholesale = 1.2192
-with a standard deviation of 0.0041 — the whole spread is rounding to the
-cent. So wholesale = retail / RETAIL_OVER_WHOLESALE, until the wholesale API
-itself is wired in (it needs a Bearer key; the feed needs nothing).
+With STELLAR_READ_KEY in the environment (a plans:read-only key — memory:
+stellar-key-placement) the catalogue is read from the wholesale API,
+GET /api/v1/plans, paged at 100 a call: the price on each listing is the
+one we actually pay, in EUR, and every listing carries the plan UUID an
+order is placed against. Without the key the script falls back to the
+public retail feed and ESTIMATES wholesale as retail / RETAIL_OVER_WHOLESALE
+(1.2192, measured 2026-09-09 over 58 rows, sd 0.0041). The fallback says so
+in the run log; it exists so a lost key degrades the prices, not the run.
+
+Two things the API settles that the feed could not: `data.megabytes` is the
+true size (3 GB is 3072), and `coverage.codes` is the plan's own coverage,
+not its product page's. The regional rule is kept as it was — a code sold
+under ANY multi-country listing is regional — the conservative reading of
+both sources. A read that makes most coded rows vanish at once is treated
+as a broken read and nothing is written (see sanity()).
 
 Why the listing has to be CHOSEN
 --------------------------------
@@ -52,7 +61,8 @@ breakout are read, not written. A row with no code ('—') is left alone.
 Run:
     python stellar_prices.py              dry run — prints the plan, writes nothing
     python stellar_prices.py --apply      writes to the sheet
-    python stellar_prices.py --feed F     read a saved feed file instead of fetching
+    python stellar_prices.py --feed F     read a saved retail feed instead of fetching
+    python stellar_prices.py --plans F    read a saved wholesale-API dump instead of fetching
 """
 
 from __future__ import annotations
@@ -63,6 +73,7 @@ import os
 import re
 import statistics
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -71,7 +82,10 @@ import requests
 
 from esim_price_scraper import HEADER_KEYS, SHEET_ID, col_letter
 
-FEED_URL = "https://stellarsecurity.com/assets/esim/products.index.json"
+FEED_URL = "https://stellarsecurity.com/assets/esim/products.index.json"   # retail; fallback only
+API_URL = "https://wholesale.stellarsecurity.com/api/v1/plans"
+API_PER_PAGE = 100            # the API's maximum
+API_MAX_PAGES = 60            # 6,000 listings; the catalogue is ~3,400. Also the 60/min budget.
 FX_URL = "https://api.frankfurter.app/latest"
 # Measured 2026-09-09: 58 rows, median 1.2192, stdev 0.0041. Re-measure the
 # day the wholesale API is wired in — a drift here mis-prices every row.
@@ -100,13 +114,10 @@ class Variant:
     code: str          # package code — the family, from the SKU's tail
     gb: float          # meta.data_gb: the TRUE size (top-level data_gb is ceil'd)
     days: int
-    retail_eur: float
+    wholesale_eur: float   # what WE pay: the API's price, or retail / 1.2192 from the feed
     slug: str          # the product the listing sat under
     name: str
-
-    @property
-    def wholesale_eur(self) -> float:
-        return round(self.retail_eur / RETAIL_OVER_WHOLESALE, 2)
+    plan_id: str = ""  # the API's UUID — what an order is placed against; '' from the feed
 
 
 class Catalogue:
@@ -140,11 +151,41 @@ class Catalogue:
                 if gb is None or days is None or cents is None:
                     continue
                 code = m.group(4)
-                variants.append(Variant(code, float(gb), int(days), cents / 100.0,
+                variants.append(Variant(code, float(gb), int(days),
+                                        round(cents / 100.0 / RETAIL_OVER_WHOLESALE, 2),
                                         slug, str(v.get("name", ""))))
                 if is_regional:
                     regional.add(code)
         return cls(variants, regional, str(feed.get("snapshot_generated_at", "")))
+
+    @classmethod
+    def from_api(cls, plans: list) -> "Catalogue":
+        """The wholesale API's listings (GET /plans, every page). The price is
+        what we pay. Daily-unlimited plans are billed per day and their SKU
+        reads 3GBD-1D, so both the billing unit and the SKU shape drop them."""
+        variants, regional, synced = [], set(), ""
+        for p in plans:
+            price = p.get("price") or {}
+            if price.get("billing_unit", "plan") != "plan":
+                continue          # per-day unlimited plans are another product
+            if (p.get("duration") or {}).get("configurable"):
+                continue
+            if not p.get("available", True):
+                continue
+            m = _SKU_RE.match(str(p.get("sku") or "").upper())
+            if not m:
+                continue
+            mb, days, cents = (p.get("data") or {}).get("megabytes"), p.get("validity_days"), price.get("amount_cents")
+            if mb is None or days is None or cents is None:
+                continue
+            code = m.group(4)
+            variants.append(Variant(code, _gb_from_mb(int(mb)), int(days), cents / 100.0,
+                                    str(p.get("product_slug") or ""), str(p.get("name", "")),
+                                    str(p.get("id", ""))))
+            if len((p.get("coverage") or {}).get("codes") or []) > 1:
+                regional.add(code)
+            synced = max(synced, str(p.get("catalogue_synced_at") or ""))
+        return cls(variants, regional, synced)
 
     def age_hours(self, now: Optional[datetime] = None) -> Optional[float]:
         if not self.generated_at:
@@ -157,10 +198,36 @@ class Catalogue:
         return (now - gen).total_seconds() / 3600
 
 
+def _gb_from_mb(mb: int) -> float:
+    """Stellar counts 1 GB as 1024 MB (3 GB is 3072). Sub-GB plans are named in
+    round decimal sizes and the sheet says 0.75 for 750MB, so a size that is
+    not a clean binary multiple is read as decimal — 750 and 768 both land on
+    0.75, 500 and 512 on 0.5."""
+    return round(mb / 1024, 3) if mb % 256 == 0 else round(mb / 1000, 3)
+
+
 def fetch_feed() -> dict:
     r = requests.get(FEED_URL, timeout=60)
     r.raise_for_status()
     return r.json()
+
+
+def fetch_plans(key: str) -> list:
+    """Every listing of the wholesale catalogue. ~35 calls at 100 a page against
+    a 60/minute limit; a second between pages keeps well clear of it."""
+    s = requests.Session()
+    s.headers.update({"Authorization": f"Bearer {key}", "Accept": "application/json"})
+    out, page = [], 1
+    while page <= API_MAX_PAGES:
+        r = s.get(API_URL, params={"per_page": API_PER_PAGE, "page": page}, timeout=60)
+        r.raise_for_status()
+        body = r.json()
+        out.extend(body.get("data") or [])
+        if page >= int((body.get("meta") or {}).get("last_page") or page):
+            break
+        page += 1
+        time.sleep(1)
+    return out
 
 
 # ── the sheet ───────────────────────────────────────────────────────────────
@@ -271,6 +338,19 @@ def decide(cat: Catalogue, row: StellarRow) -> Optional[Decision]:
     # what turns the 20-day twin into the 30-day one across the sheet.
     best = min(ok, key=lambda v: (v.wholesale_eur, -v.days))
     return Decision(row, best)
+
+
+def sanity(decisions) -> str:
+    """A read that makes MOST coded rows vanish at once is a broken read (an
+    empty page, a renamed SKU format, a revoked key answering 200 with nothing)
+    — not a supplier that dropped half its catalogue overnight. The reason to
+    stop, or '' to go on."""
+    coded = [d for d in decisions if d.reason != "regional"]
+    gone = sum(1 for d in coded if d.reason == "gone")
+    if len(coded) >= 4 and gone * 2 > len(coded):
+        return (f"{gone} of {len(coded)} package codes vanished at once — that is a broken "
+                f"catalogue read, not a catalogue; nothing written")
+    return ""
 
 
 # ── money ───────────────────────────────────────────────────────────────────
@@ -493,20 +573,30 @@ def main(argv=None) -> int:
         pass
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--apply", action="store_true", help="write to the sheet (default: dry run)")
-    ap.add_argument("--feed", help="read a saved products.index.json instead of fetching")
+    ap.add_argument("--feed", help="read a saved products.index.json (retail feed) instead of fetching")
+    ap.add_argument("--plans", help="read a saved wholesale-API dump (JSON list of plans) instead of fetching")
     ap.add_argument("--credentials",
                     default=os.environ.get("SHEETS_CREDENTIALS",
                                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")))
     a = ap.parse_args(argv)
 
-    if a.feed:
+    key = os.environ.get("STELLAR_READ_KEY", "").strip()
+    if a.plans:
+        with open(a.plans, encoding="utf-8") as f:
+            dump = json.load(f)
+        cat = Catalogue.from_api(dump if isinstance(dump, list) else dump.get("data") or [])
+        source = f"saved API dump {a.plans}"
+    elif a.feed:
         with open(a.feed, encoding="utf-8") as f:
-            feed = json.load(f)
+            cat = Catalogue.from_feed(json.load(f))
+        source = f"saved retail feed {a.feed}"
+    elif key:
+        cat, source = Catalogue.from_api(fetch_plans(key)), "wholesale API — real cost"
     else:
-        feed = fetch_feed()
-    cat = Catalogue.from_feed(feed)
+        cat = Catalogue.from_feed(fetch_feed())
+        source = f"public RETAIL feed / {RETAIL_OVER_WHOLESALE} — an ESTIMATE, no STELLAR_READ_KEY"
     age = cat.age_hours()
-    print(f"📦 Stellar catalogue: {len(cat.variants)} fixed-data listings, "
+    print(f"📦 Stellar catalogue via {source}: {len(cat.variants)} fixed-data listings, "
           f"{len(cat.by_code)} package codes, {len(cat.regional_codes)} regional codes; "
           f"snapshot {cat.generated_at or '?'}"
           + (f" ({age:.1f}h old)" if age is not None else ""))
@@ -526,6 +616,10 @@ def main(argv=None) -> int:
           f"{len(rows) - len(decisions)} left alone\n")
     for d in decisions:
         print("  " + _describe(d, fx))
+    stop = sanity(decisions)
+    if stop:
+        print(f"\n🛑 {stop}")
+        return 2
 
     picked = [d for d in decisions if d.pick]
     repriced = sum(1 for d in picked if d.row.eur is not None and abs(d.pick.wholesale_eur - d.row.eur) > 0.001)

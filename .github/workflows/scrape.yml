@@ -105,9 +105,9 @@ jobs:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: python esim_price_scraper.py
 
-      # Stellar publishes its whole catalogue as one JSON file, so its rows
-      # cost seconds where esim.dog's cost an hour of browser driving. That is
-      # the entire reason this is a separate step and not more scraper work.
+      # Stellar answers its whole catalogue over an API in under a minute, so
+      # its rows cost seconds where esim.dog's cost an hour of browser driving.
+      # That is the entire reason this is a separate step and not more scraper work.
       #
       # It runs AFTER the scraper, and that order matters: stellar_prices.py
       # picks a Stellar listing against the days the customer is promised, and
@@ -117,10 +117,13 @@ jobs:
       #
       # always() because the scraper exits 1 when its budget cuts rows short,
       # which is a normal outcome, not a reason to leave the Stellar rows a day
-      # stale. It needs no Stellar credentials — the catalogue feed is public.
+      # stale. STELLAR_READ_KEY is the plans:read-only key (memory:
+      # stellar-key-placement). Without it the script falls back to the public
+      # RETAIL feed and estimates wholesale, and says so in this log.
       - name: Refresh Stellar prices
         if: always()
         timeout-minutes: 6
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          STELLAR_READ_KEY: ${{ secrets.STELLAR_READ_KEY }}
         run: python stellar_prices.py --apply

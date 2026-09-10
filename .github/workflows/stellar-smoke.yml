@@ -1,6 +1,8 @@
-# Manual check that the two Stellar keys in repo secrets work, and that the
-# read-only key really is read-only. Prints field NAMES only: this repo is
-# public, so its logs are public, and neither prices nor the balance belong there.
+# Manual check that the two Stellar keys in repo secrets work, that the
+# read-only key really is read-only, and that stellar_prices.py can price the
+# sheet from the wholesale API. The last step is a DRY RUN: it prints the
+# plan and writes nothing. The curl steps print field NAMES only — this repo
+# is public, so its logs are public.
 name: Stellar smoke test
 
 on:
@@ -15,7 +17,7 @@ env:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 6
     steps:
       - name: plans with STELLAR_READ_KEY (expects 200)
         env:
@@ -23,9 +25,7 @@ jobs:
         run: |
           code=$(curl -s -o plans.json -w '%{http_code}' -H "Authorization: Bearer $KEY" -H 'Accept: application/json' "$BASE/plans")
           echo "HTTP $code"
-          jq -r 'if type=="array" then "plans: \(length)"
-                 elif (.data|type)=="array" then "plans on this page: \(.data|length)   top-level keys: \(keys|join(","))"
-                 else "top-level keys: \(keys|join(","))" end' plans.json
+          jq -r '"plans on this page: \(.data|length)   total: \(.meta.total)   pages: \(.meta.last_page)"' plans.json
           test "$code" = 200
 
       - name: wallet with STELLAR_API_KEY (expects 200)
@@ -44,3 +44,15 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $KEY" "$BASE/wallet")
           echo "HTTP $code (anything but 200 is correct)"
           test "$code" != 200
+
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q gspread requests playwright google-auth google-api-python-client
+
+      - name: stellar_prices.py DRY RUN from the wholesale API (writes nothing)
+        env:
+          STELLAR_READ_KEY: ${{ secrets.STELLAR_READ_KEY }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python stellar_prices.py

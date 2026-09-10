@@ -272,6 +272,53 @@ check("a fully stamped column reports nothing to fix",
 check("a column the sheet does not have is skipped, not crashed on",
       stamp_price_direction(_FakeSvc([("$1 (€1)", None)]), {"price": 6}), 1)
 
+# ── the wholesale API (from_api) ───────────────────────────────────────────
+from stellar_prices import Decision, _gb_from_mb, sanity
+
+def plan(sku, cents, mb, days, codes=("DE",), available=True, unit="plan",
+         configurable=False, pid="uuid-1", synced="2026-09-10T05:00:00Z"):
+    return {"id": pid, "sku": sku, "name": sku, "product_slug": "germany",
+            "data": {"megabytes": mb, "label": None, "type": None},
+            "validity_days": days, "available": available,
+            "duration": {"configurable": configurable, "default_days": days,
+                         "minimum_days": days, "maximum_days": days},
+            "price": {"currency": "EUR", "amount": f"{cents/100:.2f}",
+                      "amount_cents": cents, "billing_unit": unit},
+            "coverage": {"codes": list(codes), "countries": [], "networks": [],
+                         "breakout_ip_country_code": "GB"},
+            "catalogue_synced_at": synced}
+
+api = Catalogue.from_api([
+    plan("ESIM-GERMANY-10GB-30D-CKH995", 221, 10240, 30),
+    plan("ESIM-GERMANY-10GB-20D-CKH995", 221, 10240, 20, pid="uuid-2", synced="2026-09-09T05:00:00Z"),
+    plan("ESIM-GERMANY-750MB-7D-CKH993", 40, 768, 7),
+    plan("ESIM-MOROCCO-3GBD-1D-PW8BZYG4P", 223, 3072, 1, unit="day", configurable=True),
+    plan("ESIM-EUROPE-5GB-30D-CKH980", 159, 5120, 30, codes=("DE", "FR", "IT")),
+    plan("ESIM-GERMANY-20GB-30D-CKH1013", 420, 20480, 30, available=False),
+    plan(None, 100, 1024, 7),
+])
+check("API price is what we pay — NOT divided by the retail factor",
+      sorted(v.wholesale_eur for v in api.by_code["CKH995"]), [2.21, 2.21])
+check("plan UUID rides along for the buyer", api.by_code["CKH995"][0].plan_id, "uuid-1")
+check("daily-unlimited, unavailable and SKU-less listings are dropped",
+      sorted(api.by_code), ["CKH980", "CKH993", "CKH995"])
+check("regional is decided by the plan's own coverage codes", api.regional_codes, {"CKH980"})
+check("the newest catalogue scan is the snapshot time", api.generated_at, "2026-09-10T05:00:00Z")
+check("binary megabytes land on the sheet's decimal sizes",
+      [_gb_from_mb(m) for m in (3072, 10240, 768, 750, 512, 500, 100, 1536, 1500)],
+      [3.0, 10.0, 0.75, 0.75, 0.5, 0.5, 0.1, 1.5, 1.5])
+check("750MB row matches a 768MB listing", api.by_code["CKH993"][0].gb, 0.75)
+
+# ── the broken-read guard ──────────────────────────────────────────────────
+def dec(reason): return Decision(None, None, reason)
+check("most codes gone at once = a broken read, stop",
+      bool(sanity([dec("gone"), dec("gone"), dec("gone"), dec("")])), True)
+check("a few gone is a catalogue change, go on",
+      sanity([dec("gone"), dec(""), dec(""), dec("")]), "")
+check("regional refusals do not count either way",
+      sanity([dec("gone"), dec("gone"), dec("regional"), dec("regional"), dec(""), dec("")]), "")
+check("too few coded rows to judge — go on", sanity([dec("gone"), dec("gone")]), "")
+
 print()
 if _fails:
     print(f"❌ {len(_fails)} failed: {_fails}")
