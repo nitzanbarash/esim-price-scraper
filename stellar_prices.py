@@ -86,6 +86,7 @@ FEED_URL = "https://stellarsecurity.com/assets/esim/products.index.json"   # ret
 API_URL = "https://wholesale.stellarsecurity.com/api/v1/plans"
 API_PER_PAGE = 100            # the API's maximum
 API_MAX_PAGES = 60            # 6,000 listings; the catalogue is ~3,400. Also the 60/min budget.
+LONGER_TOL = 0.05             # a longer validity may cost up to 5% over the cheapest listing
 FX_URL = "https://api.frankfurter.app/latest"
 # Measured 2026-09-09: 58 rows, median 1.2192, stdev 0.0041. Re-measure the
 # day the wholesale API is wired in — a drift here mis-prices every row.
@@ -318,6 +319,8 @@ class Decision:
     pick: Optional[Variant]
     reason: str = ""            # "" | "gone" | "short" | "regional"
     have_days: tuple = ()
+    paid_up: float = 0.0        # EUR paid over the cheapest, to hold the longer plan
+    won_days: int = 0           # days the cheapest listing would have cost us
 
 
 def decide(cat: Catalogue, row: StellarRow) -> Optional[Decision]:
@@ -334,10 +337,18 @@ def decide(cat: Catalogue, row: StellarRow) -> Optional[Decision]:
     ok = [v for v in same_gb if v.days >= floor]
     if not ok:
         return Decision(row, None, "short", tuple(sorted({v.days for v in same_gb})))
-    # Cheapest wins; a tie goes to the longer product. That single rule is
-    # what turns the 20-day twin into the 30-day one across the sheet.
-    best = min(ok, key=lambda v: (v.wholesale_eur, -v.days))
-    return Decision(row, best)
+    # Inside one package code the listings are the SAME product cut at different
+    # (GB, days), so a cent between the 20-day and the 30-day twin is a pricing
+    # artifact, not a difference in what the buyer receives. Cheapest-wins
+    # therefore sold a third of the validity for an agora. So: the LONGEST wins,
+    # and a shorter listing only takes it back by saving real money -- more than
+    # LONGER_TOL of the cheapest price. A tie goes to the plainer name, so a
+    # '(nonhkip)' twin never wins on the order the API happened to list it in.
+    thrift = min(ok, key=lambda v: (v.wholesale_eur, -v.days))     # the old rule's pick
+    near = [v for v in ok if v.wholesale_eur <= thrift.wholesale_eur * (1 + LONGER_TOL) + 1e-9]
+    best = max(near, key=lambda v: (v.days, -v.wholesale_eur, -len(v.name)))
+    return Decision(row, best, paid_up=round(best.wholesale_eur - thrift.wholesale_eur, 4),
+                    won_days=best.days - thrift.days)
 
 
 def sanity(decisions) -> str:
@@ -563,7 +574,9 @@ def _describe(d: Decision, fx: float) -> str:
     old = f"€{r.eur:.2f}" if r.eur is not None else "—"
     days = f"{r.days}d" if r.days == v.days else f"{r.days}d→{v.days}d"
     mark = " " if r.eur is not None and abs(v.wholesale_eur - r.eur) < 0.001 else "$"
-    return f"{head} {mark} {old} → €{v.wholesale_eur:.2f}  {days:<9} {price_cell(v.wholesale_eur, fx)}"
+    held = f"   +{d.won_days}d for +{d.paid_up * 100:.0f}c" if d.won_days > 0 else ""
+    return (f"{head} {mark} {old} → €{v.wholesale_eur:.2f}  {days:<9} "
+            f"{price_cell(v.wholesale_eur, fx)}{held}")
 
 
 def main(argv=None) -> int:
@@ -628,6 +641,13 @@ def main(argv=None) -> int:
     print(f"\n📊 priced {len(picked)} | price moved on {repriced} | days corrected on {redayed} | "
           f"gone {refused['gone']} | too short {refused['short']} | regional {refused['regional']} | "
           f"{len(updates)} cells")
+    longer = [d for d in picked if d.won_days > 0]
+    if longer:
+        print(f"⏳ held the longer plan on {len(longer)} rows: "
+              f"+{sum(d.won_days for d in longer)} days for +{sum(d.paid_up for d in longer) * 100:.0f} cents total")
+        for d in longer:
+            print(f"     row {d.row.row:<4}{d.row.sku:<9}{d.row.country:<12}{d.row.code:<11}"
+                  f"{d.pick.days}d instead of {d.pick.days - d.won_days}d, +{d.paid_up * 100:.0f}c")
 
     if not a.apply:
         print("\n(dry run — nothing written; add --apply to write)")

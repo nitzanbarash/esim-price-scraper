@@ -15,8 +15,8 @@ from esim_price_scraper import HEADER_KEYS
 from stellar_prices import (
     stamp_price_direction,
     MARK_GONE, MARK_REGIONAL, MARK_SHORT, RETAIL_OVER_WHOLESALE, FX_FALLBACK,
-    Catalogue, decide, fetch_fx, is_regional_sku, plan_updates, price_cell,
-    read_rows,
+    Catalogue, Variant, StellarRow, decide, fetch_fx, is_regional_sku,
+    plan_updates, price_cell, read_rows,
 )
 
 _fails = []
@@ -320,6 +320,47 @@ check("regional refusals do not count either way",
 check("too few coded rows to judge — go on", sanity([dec("gone"), dec("gone")]), "")
 
 print()
+
+
+print("-- validity is not for sale --")
+
+# Variant(code, gb, days, wholesale_eur, slug, name)
+IDN20 = ("JC900", 10.0, 20, 2.12, "indonesia", "Indonesia 10GB 20Days")
+IDN30 = ("JC900", 10.0, 30, 2.13, "indonesia", "Indonesia 10GB 30Days")
+CUT20 = ("JC900", 10.0, 20, 2.00, "s", "20Days")
+
+
+def _row(floor, days=None):
+    return StellarRow(1, "1.60.10", "INDONESIA", "JC900", 10.0, days or floor,
+                      None, "", "", "", floor)
+
+
+def _pick(floor, *vs):
+    """(days, EUR, days won back, cents paid for them) for a 10GB Indonesia row."""
+    d = decide(Catalogue([Variant(*v) for v in vs], set()), _row(floor))
+    return (d.pick.days, d.pick.wholesale_eur, d.won_days, round(d.paid_up * 100))
+
+
+check("an agora never buys back ten days of validity",
+      _pick(20, IDN20, IDN30), (30, 2.13, 10, 1))
+check("at exactly 5% over the cheapest the longer plan still wins",
+      _pick(20, CUT20, ("JC900", 10.0, 30, 2.10, "s", "30Days")), (30, 2.10, 10, 10))
+check("one cent past 5% and thrift takes it back",
+      _pick(20, CUT20, ("JC900", 10.0, 30, 2.11, "s", "30Days")), (20, 2.00, 0, 0))
+check("a genuinely dearer long plan is still refused",
+      _pick(20, CUT20, ("JC900", 10.0, 30, 2.50, "s", "30Days")), (20, 2.00, 0, 0))
+check("the promise outranks the bargain: a cheap 15d listing cannot win",
+      _pick(20, ("JC900", 10.0, 15, 0.50, "s", "15Days"), IDN20, IDN30), (30, 2.13, 10, 1))
+check("a row with nothing longer to buy reports no upgrade",
+      _pick(30, IDN30), (30, 2.13, 0, 0))
+check("a (nonhkip) twin never wins on the order the API listed it in",
+      decide(Catalogue([Variant(*v) for v in (
+          ("JC900", 10.0, 30, 2.13, "s", "Indonesia 10GB 30Days (nonhkip)"),
+          ("JC900", 10.0, 30, 2.13, "s", "Indonesia 10GB 30Days"))], set()),
+          _row(30)).pick.name,
+      "Indonesia 10GB 30Days")
+
+
 if _fails:
     print(f"❌ {len(_fails)} failed: {_fails}")
     sys.exit(1)
