@@ -945,8 +945,11 @@ def main() -> int:
         # never buys, so it is safe to run at any moment, including while the
         # queue has orders in it.
         if "--preflight" in sys.argv[1:]:
-            preflight(loud=True)
-            return 0
+            # The exit code has to carry the answer. A preflight that goes
+            # green whether or not the key works is the very disease it was
+            # written to cure -- and the run log is 403 to everyone outside
+            # the Actions tab, so a red X is the only signal that travels.
+            return 0 if preflight(loud=True) else 1
         run()
         return 0
     except Exception as ex:
