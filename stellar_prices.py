@@ -55,7 +55,8 @@ What this script owns on a Stellar row
 Only the cells the catalogue answers: days, buy price, the bookkeeping beside
 it (previous price / updated / changed / last change), and the stock column —
 that one only while it holds one of this script's own markers. A value the
-owner typed there is never cleared. SKU, country, GB, code, networks and
+owner typed there is never cleared. The Networks cell is written from the
+API listing's coverage (operators • generations). SKU, country, GB, code and
 breakout are read, not written. A row with no code ('—') is left alone.
 
 Run:
@@ -119,6 +120,20 @@ class Variant:
     slug: str          # the product the listing sat under
     name: str
     plan_id: str = ""  # the API's UUID — what an order is placed against; '' from the feed
+    networks: str = ""  # 'Vodafone/Wind • 5G' from coverage.networks; '' from the feed
+
+
+def networks_label(coverage: dict) -> str:
+    """'Operator/Operator • 4G + 5G' out of a listing's coverage.networks —
+    the one format the sheet's Networks column, the order page and the
+    receipts row all use. '' when the listing names none."""
+    nets = (coverage or {}).get("networks") or []
+    ops = sorted({str(n.get("operator") or "") for n in nets if n.get("operator")})
+    gens = sorted({str(n.get("network") or "") for n in nets if n.get("network")})
+    label = "/".join(ops)
+    if gens:
+        label = f"{label} • {' + '.join(gens)}" if label else " + ".join(gens)
+    return label
 
 
 class Catalogue:
@@ -182,7 +197,7 @@ class Catalogue:
             code = m.group(4)
             variants.append(Variant(code, _gb_from_mb(int(mb)), int(days), cents / 100.0,
                                     str(p.get("product_slug") or ""), str(p.get("name", "")),
-                                    str(p.get("id", ""))))
+                                    str(p.get("id", "")), networks_label(p.get("coverage") or {})))
             if len((p.get("coverage") or {}).get("codes") or []) > 1:
                 regional.add(code)
             synced = max(synced, str(p.get("catalogue_synced_at") or ""))
@@ -246,6 +261,7 @@ class StellarRow:
     changed: str
     stock: str
     floor_days: Optional[int] = None   # what the customer is promised
+    networks: str = ""                 # the Networks cell as it stands
 
 
 def _num(s) -> Optional[float]:
@@ -305,7 +321,8 @@ def read_rows(values: list[list[str]]) -> tuple[list[StellarRow], dict[str, int]
             row=idx, sku=sku, country=r[col["countries"]].strip(),
             code=r[col["route"]].strip(), gb=_num(r[col["gb"]]),
             days=int(days) if days else None, eur=_eur(price), price_cell=price,
-            changed=r[col["changed"]].strip(), stock=r[col["stock"]].strip()))
+            changed=r[col["changed"]].strip(), stock=r[col["stock"]].strip(),
+            networks=r[col["network"]].strip() if "network" in col else ""))
     for s in stellar:
         s.floor_days = sold_days.get(s.sku, s.days)
     return stellar, col
@@ -442,6 +459,11 @@ def plan_updates(decisions, fx: float, ts: str, today: str) -> list[tuple[int, s
         v = d.pick
         new_eur = v.wholesale_eur
         put(r.row, "price", price_cell(new_eur, fx))
+        # The Networks cell comes from the listing's coverage — never typed by
+        # hand (127 Stellar rows had none on 2026-09-10). The feed carries no
+        # networks, so a feed run leaves the cell as it is.
+        if v.networks and v.networks != r.networks:
+            put(r.row, "network", v.networks)
 
         notes = []
         if r.eur is None:

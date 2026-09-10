@@ -88,6 +88,7 @@ jobs:
           # saves what it has and names what it skipped, the step cap kills
           # the run between two saves and explains nothing.
           SCRAPE_BUDGET_MIN: "62"
+          SCRAPE_CONCURRENCY: "3"   # packages read at once; each is its own Chromium
           # How many validities of ONE row are priced at once. Each scrape()
           # launches its own browser and shares nothing, so these are safe to
           # overlap; the runner has 2 cores, which is what keeps this off 12.

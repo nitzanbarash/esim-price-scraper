@@ -472,12 +472,7 @@ def choose(cat: sp.Catalogue, row: sp.StellarRow, order: dict) -> sp.Variant:
 def plan_facts(raw_plan: dict, row: sp.StellarRow) -> tuple[str, str]:
     """(region, networks) for the order page and the receipts row, from the
     listing itself -- the sheet's Hebrew country name is the fallback."""
-    cov = raw_plan.get("coverage") or {}
-    ops = sorted({str(n.get("operator") or "") for n in cov.get("networks") or [] if n.get("operator")})
-    gens = sorted({str(n.get("network") or "") for n in cov.get("networks") or [] if n.get("network")})
-    networks = "/".join(ops)
-    if gens:
-        networks = f"{networks} • {' + '.join(gens)}" if networks else " + ".join(gens)
+    networks = sp.networks_label(raw_plan.get("coverage") or {})
     region = str(raw_plan.get("destination") or row.country or "")
     return region, networks
 
@@ -511,9 +506,13 @@ def site_payload(cred: dict, region: str, networks: str, gb: float, days: int) -
     act = cred["activation_code"]
     parts = act.split("$")
     smdp = parts[1] if len(parts) >= 3 else ""
-    qr = cred.get("qr_code_url") or ""
+    # Stellar's qr_code_url is NOT an image: it answers text/html (a page on
+    # p.esimlink.org, checked 2026-09-10), and handing it over as qr_code drew
+    # an empty square on the order page and a broken attachment in the mail.
+    # The site draws the QR from the activation code; the link stays on the
+    # receipts row only.
     return {"activation_code": act,
-            "qr_code": qr if qr.startswith("https://") else "",
+            "qr_code": "",
             "smdp": smdp, "iccid": "", "apn": cred.get("apn") or "",
             "region": region, "plan": f"{gb:g}GB - {days} days", "networks": networks}
 
@@ -819,7 +818,7 @@ class Run:
         # timeout. A sheet that REFUSES the write still does not hold up the
         # customer: it is reported anyway and the owner is told.
         try:
-            update_row(self.ws, n, {H_QR: payload["qr_code"], H_ACT: payload["activation_code"],
+            update_row(self.ws, n, {H_QR: cred.get("qr_code_url") or "", H_ACT: payload["activation_code"],
                                     H_SMDP: payload["smdp"], H_APN: payload["apn"],
                                     H_REGION: region, H_STATUS: ST_ACTIVE,
                                     H_PLAN: f"{gb:g}GB - {days} days — {networks}".rstrip(" —")})

@@ -28,6 +28,7 @@ Regional codes: A=mini, B=grande (e.g. 1.0A.10, 1.0B.5).
 """
 
 import asyncio
+import collections
 import json
 import os
 import sys
@@ -151,6 +152,38 @@ DAY_LADDER = (1, 3, 5, 7, 10, 14, 15, 20, 21, 25, 30, 31)
 # outer loop stays sequential — this is what keeps a 12-rung scan costing about
 # two reads instead of twelve, and the 45-minute budget survivable.
 DAY_SCAN_CONCURRENCY = int(os.environ.get('DAY_SCAN_CONCURRENCY', 4))
+# Packages read at once. Each read is its own Chromium, so they cannot collide;
+# the verdicts stay sequential. 149 rows one at a time overran a 62-minute
+# budget on 2026-09-08..10 (memory: scrape-workflow-budget said "concurrency,
+# not another timeout").
+SCRAPE_CONCURRENCY = int(os.environ.get('SCRAPE_CONCURRENCY', 3))
+
+
+async def prefetched(items, fetch, n):
+    """Yields (item, result) in the items' own order while up to n fetches
+    are in flight. A fetch that raises yields its exception instead of ending
+    the run. Closing the generator cancels whatever is still running."""
+    queue, rest = collections.deque(), iter(items)
+
+    def spawn():
+        for it in rest:
+            queue.append((it, asyncio.ensure_future(fetch(it))))
+            return
+
+    try:
+        for _ in range(max(1, n)):
+            spawn()
+        while queue:
+            it, task = queue.popleft()
+            try:
+                out = await task
+            except Exception as e:          # noqa: BLE001 — one package, not the run
+                out = e
+            spawn()
+            yield it, out
+    finally:
+        for _, task in queue:
+            task.cancel()
 
 # The owner's profitability bar, lifted out of run() so the fallback judges a
 # candidate by exactly the same rule that judges the package it would replace.
@@ -1126,7 +1159,25 @@ class ESIMScraper:
         skipped = 0
         t0 = _time.time()
         deadline = t0 + SCRAPE_BUDGET_MIN * 60
-        for it in items:
+        async def fetch(it):
+            """The network half of one package — the read and the day
+            fallback — so several can be in flight while the verdicts below
+            stay sequential (they share `updates` and the counters)."""
+            req_gb = to_val(parse_url(it['link']).get('gb'))
+            if req_gb is not None and req_gb < MIN_SELLABLE_GB:
+                return None                   # judged below, without a read
+            t_pkg = _time.time()
+            res = await self.scrape_confirmed(it['link'], it['variant'], it['old_price'])
+            alt = await self.find_alternative(it, res, deadline)
+            # A package that takes minutes is the whole story of a run that ran
+            # out of time, and the per-row cost is invisible in a total.
+            dt = _time.time() - t_pkg
+            if dt > 60:
+                print(f"  🐌 Row {it['row']} took {dt:.0f}s")
+            return res, alt
+
+        reads = prefetched(items, fetch, SCRAPE_CONCURRENCY)
+        async for it, fetched in reads:
             # Out of time: save, say exactly what was left unchecked, and stop.
             if _time.time() > deadline:
                 skipped = len(items) - done
@@ -1155,19 +1206,16 @@ class ESIMScraper:
                 print(f"  ⛔ Row {r}: {req_gb}GB is under {MIN_SELLABLE_GB:g}GB — not sold, skipped")
                 continue
 
-            t_pkg = _time.time()
-            res = await self.scrape_confirmed(it['link'], it['variant'], it['old_price'])
-            # A package that takes minutes is the whole story of a run that ran
-            # out of time, and the per-row cost is invisible in a total.
-            dt = _time.time() - t_pkg
-            if dt > 60:
-                print(f"  🐌 Row {r} took {dt:.0f}s")
-
+            if isinstance(fetched, BaseException):
+                put(r, 'updated', ts)
+                put(r, 'changed', f"Check failed: {str(fetched)[:120]}")
+                print(f"  ⚠️ Row {r}: {fetched!r}")
+                continue
+            res, alt = fetched
             # Same GB, different days. Runs before the out-of-stock and
             # profitability handling below, because its whole purpose is to
             # answer those two verdicts with a package we CAN sell instead of
             # taking the row off the site.
-            alt = await self.find_alternative(it, res, deadline)
             if alt:
                 res = alt['res']
             new_price = res['price']
@@ -1281,6 +1329,7 @@ class ESIMScraper:
             else:
                 put(r, 'stock', '')
 
+        await reads.aclose()                 # cancels reads still in flight after a budget stop
         flush(done)
         mins = (_time.time() - t0) / 60
         print(f"\n📊 Sheet updated for {done} of {len(items)} packages "

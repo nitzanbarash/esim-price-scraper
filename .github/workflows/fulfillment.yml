@@ -23,6 +23,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+          cache: pip            # the site dispatches this on a paid order; every second counts
 
       # No browser any more: the bot reads the supplier's JSON endpoint
       # directly, which cut this job from ~2 minutes to a few seconds. The

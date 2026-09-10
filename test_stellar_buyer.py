@@ -251,8 +251,8 @@ check("the 30-day twin is bought (validity beats a cent)", body == {"plans": [{"
 ful = site.reports("fulfilled")
 check("site told fulfilled once", len(ful) == 1, str(len(ful)))
 e = ful[0]["esim"] if ful else {}
-check("activation code, QR url and SM-DP+ handed over",
-      e.get("activation_code") == LPA and e.get("qr_code") == QR and e.get("smdp") == "smdp.example.net", str(e))
+check("activation code and SM-DP+ handed over; the HTML 'QR' link is not",
+      e.get("activation_code") == LPA and e.get("qr_code") == "" and e.get("smdp") == "smdp.example.net", str(e))
 check("plan string parses for the customer email (PLAN_RE)",
       bool(fb.PLAN_RE.search(e.get("plan", ""))) and e.get("plan") == "10GB - 30 days", e.get("plan"))
 check("networks named from the listing", e.get("networks") == "Telkomsel/XL • 4G + 5G", e.get("networks"))

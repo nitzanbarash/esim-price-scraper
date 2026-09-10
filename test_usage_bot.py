@@ -300,16 +300,36 @@ with mock.patch.object(fulfillment_bot.requests, "get",
 check("a null APN becomes empty, not 'None'", got.get("apn"), "")
 check("the rest of the eSIM is still read", got.get("iccid"), "8948010010087222062")
 
-# And the buyer's own email must not carry the row at all.
-html = fulfillment_bot._esim_copy_html(got, heb=True)
-check("no APN row in the email", "APN" in html, False)
-check("the codes the buyer needs are still there", "smdp.io" in html, True)
-
-# Same guard when the record comes back from the SITE, already poisoned.
+# And the buyer's own email carries NO credentials at all since 2026-09-10 —
+# only the order link (memory: esim-out-of-email). Catch the message at SMTP.
+sent = []
+class _SMTP:
+    def __init__(self, *a, **k): pass
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def starttls(self): pass
+    def login(self, *a): pass
+    def send_message(self, m): sent.append(m)
 poisoned = {"activation_code": "LPA:1$smdp.io$K2-XXXXXX", "smdp": "smdp.io",
             "iccid": "8948010010087222062", "apn": "None"}
-check("a stored 'None' is not mailed either",
-      "APN" in fulfillment_bot._esim_copy_html(poisoned, heb=True), False)
+with mock.patch.object(fulfillment_bot.smtplib, "SMTP", _SMTP), \
+     mock.patch.dict(fulfillment_bot.os.environ, {"GMAIL_APP_PASSWORD": "x"}):
+    fulfillment_bot.send_customer_email("a@b.c", "WR-TEST01", "https://www.waverole.com/?order=abc",
+                                        {"gb": 10, "days": 30, "location": "Greece"}, esim=poisoned)
+    # The HTML part travels base64-encoded; decode it, or every "not in" check passes for free.
+    raw = sent[-1].as_string() if sent else ""
+    body = sent[-1].get_payload()[0].get_payload(decode=True).decode("utf-8") if sent else ""
+    check("the email was sent", bool(sent), True)
+    check("no activation code in the email", "LPA:1" in body or "K2-XXXXXX" in body, False)
+    check("no SM-DP+, ICCID or APN in the email",
+          "smdp.io" in body or "8948010010087222062" in body or "APN" in body, False)
+    check("no QR attachment", "esim-qr-" in raw or "image/png" in raw, False)
+    check("the order link is there", "order=abc" in body, True)
+    try:
+        fulfillment_bot.send_customer_email("a@b.c", "WR-TEST02", "", {"gb": 1, "days": 7}, esim=poisoned)
+        check("no link → refused, not mailed empty", False, True)
+    except ValueError:
+        check("no link → refused, not mailed empty", True, True)
 
 
 # ── the supplier's batch cap ─────────────────────────────────────────────────

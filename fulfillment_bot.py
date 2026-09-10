@@ -45,7 +45,6 @@ from email.mime.text import MIMEText
 from urllib.parse import unquote
 from zoneinfo import ZoneInfo
 
-from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 
 import gspread
@@ -1075,15 +1074,21 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
     Gmail (waverolesupply) — the site's Resend sender (onboarding@resend.dev)
     looked untrustworthy, so this bot owns the customer email now.
 
-    The email carries the FULL activation details (QR inline + manual codes),
-    not just a link: the site's order records expire after 90 days, and this
-    email must stay a working copy of the eSIM forever (new phone, late trip)."""
-    # Only the address is mandatory. A missing order link costs the customer
-    # the QR button, NOT the eSIM — the activation codes below install it on
-    # any phone, so we still send rather than withhold their only copy.
+    LINK ONLY since 2026-09-10 (owner's decision of 09-09): no QR, no
+    activation code, no SM-DP+, ICCID or APN in the mail. An emailed credential
+    is irrevocable — on 2026-09-08 three customers were mailed a second working
+    eSIM by mistake and nothing could take it back; the order page can be
+    blocked in seconds. The customer installs from the order page, where the
+    QR is drawn on the device. `esim` is accepted for the callers' sake and
+    not read."""
     if not to:
         raise ValueError("missing customer email address")
-    esim = esim or {}
+    # With nothing but the link in the mail, a mail without the link would say
+    # "your eSIM is ready" and give no way to reach it. Refuse; the ledger
+    # keeps the order and the site escalates to a person (same rule as the
+    # site's own Resend fallback).
+    if not order_url:
+        raise ValueError("missing order link — a link-only email would be empty")
 
     payload = order_payload(order_url)
     # Explicit values (from the site's own order record) win over whatever we
@@ -1136,22 +1141,14 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
   <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 20px">{L['order']} <strong style="color:{NAVY}">{order_id}</strong></p>
   <table style="width:100%;background:#fff;border-radius:12px;border-collapse:collapse;margin:0 0 20px">{detail_rows}</table>
   {cta}
-  {_esim_copy_html(esim, heb)}
   <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 6px">{L['guide']}</p>
   <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 18px">{L['problem']}
     <a href="mailto:{SUPPORT_EMAIL}" style="color:{ACCENT};font-weight:700;text-decoration:none">{SUPPORT_EMAIL}</a></p>
   {footer}
 </div>"""
 
-    # multipart/related so the QR renders inline (data: URIs are stripped by
-    # Gmail — a real attachment referenced by cid: is the only reliable way).
     msg = MIMEMultipart("related")
     msg.attach(MIMEText(html, "html", "utf-8"))
-    if qr := _qr_bytes(esim):
-        img = MIMEImage(qr, _subtype="png")
-        img.add_header("Content-ID", "<qr>")
-        img.add_header("Content-Disposition", "inline", filename=f"esim-qr-{order_id}.png")
-        msg.attach(img)
     msg["From"] = f"Waverole <{GMAIL_USER}>"
     msg["To"] = to
     msg["Subject"] = L["subject"]
@@ -1160,64 +1157,6 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
         s.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
         s.send_message(msg)
     log.info(f"order {order_id}: customer email sent to {to}")
-
-
-def _qr_bytes(esim: dict) -> bytes | None:
-    """The QR as raw PNG bytes, so it can be attached inline (mail clients
-    strip data: URIs, and a hotlinked image is blocked until the reader
-    clicks 'show images' — this email must work on first open)."""
-    qc = str((esim or {}).get("qr_code", ""))
-    if qc.startswith("data:image/png;base64,"):
-        try:
-            return base64.b64decode(qc.split(",", 1)[1])
-        except Exception:
-            return None
-    if qc.startswith("https://"):
-        try:
-            r = requests.get(qc, timeout=20)
-            r.raise_for_status()
-            return r.content
-        except Exception as e:
-            log.warning(f"could not download the QR image: {e}")
-    return None
-
-
-def _esim_copy_html(esim: dict, heb: bool = False) -> str:
-    """Permanent in-email copy of the eSIM: inline QR + the manual codes.
-    Shown under the CTA; empty string when there is nothing to show."""
-    if not esim:
-        return ""
-    t_keep = ("ה-eSIM שלכם — שמרו את המייל הזה כעותק קבוע" if heb
-              else "Your eSIM — keep this email as your permanent copy")
-    t_scan = ("סרקו את הקוד ממכשיר אחר, או הוסיפו את ה-eSIM ידנית עם הקודים למעלה." if heb
-              else "Scan the QR from another device, or add the eSIM manually with the codes above.")
-    # _sup again, deliberately. This block is also rendered from records the
-    # SITE stored — including ones written before the parser stopped turning a
-    # null into "None" — so the guard has to sit where the buyer's email is
-    # built, not only where the supplier is read.
-    rows = [("Activation Code", _sup(esim.get("activation_code"))),
-            ("SM-DP+ Address", _sup(esim.get("smdp"))),
-            ("ICCID", _sup(esim.get("iccid"))),
-            ("APN", _sup(esim.get("apn")))]
-    code_rows = "".join(
-        f'<tr><td style="padding:6px 12px;color:{BROWN};font-size:12px;white-space:nowrap">{k}</td>'
-        f'<td style="padding:6px 12px;color:{NAVY};font-size:12px;font-family:ui-monospace,Menlo,monospace;'
-        f'word-break:break-all;text-align:right">{v}</td></tr>'
-        for k, v in rows if v)
-    if not code_rows and not _qr_bytes(esim):
-        return ""
-    qr_img = ('<div style="text-align:center;margin:0 0 10px">'
-              # 200 = the supplier QR's own resolution. Mail clients do not
-              # resample kindly, and a scaled QR is a QR that fails to scan.
-              '<img src="cid:qr" alt="eSIM QR code" width="200" height="200" '
-              'style="border-radius:12px;background:#fff;padding:8px"></div>'
-              if _qr_bytes(esim) else "")
-    return f"""<div style="background:#fff;border-radius:12px;padding:16px 10px;margin:0 0 22px">
-  <p style="text-align:center;color:{NAVY};font-size:13px;font-weight:800;margin:0 0 10px">{t_keep}</p>
-  {qr_img}
-  <table style="width:100%;border-collapse:collapse" dir="ltr">{code_rows}</table>
-  <p style="text-align:center;color:#9a7a60;font-size:11px;margin:8px 0 0">{t_scan}</p>
-</div>"""
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
