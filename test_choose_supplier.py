@@ -30,7 +30,7 @@ import day_policy
 from choose_supplier import (
     CARRY, LAST_COL, LOSER_BG, TICK, WINNER_BG, Row, _entered_value,
     cap_switches, decide, eligible, final_usd, money, profit_text, source_of,
-    switch_note, usd,
+    switch_note, usd, usd_outside_parens,
 )
 
 _fails: list[str] = []
@@ -70,13 +70,34 @@ def writes_of(d, key):
     return [(row, text) for row, k, text in d.writes if k == key]
 
 
-print("-- the price cell: dollars first, and a bare number is not a price --")
+print("-- the price cell: the dollars OUTSIDE the brackets, in either order --")
+check("the helper is what usd() is", usd, usd_outside_parens)
 check("plain", usd("$0.58"), 0.58)
-check("two currencies", usd("$0.56 (€0.48)"), 0.56)
+# The owner asked for euro-first on 2026-09-10. The sheet holds both spellings
+# until every row has been rewritten, so BOTH have to read as 5.30 — the whole
+# reason the rule moved off the start of the cell and onto the brackets.
+check("dollars first (yesterday's cells)", usd("$5.30 (€4.55)"), 5.30)
+check("euro first (today's cells)", usd("(€4.55) $5.30"), 5.30)
+check("one currency", usd("$1.65"), 1.65)
+check("two currencies, the old way round", usd("$0.56 (€0.48)"), 0.56)
+check("two currencies, the new way round", usd("(€0.48) $0.56"), 0.56)
 check("em dash", usd("—"), None)
 check("blank", usd(""), None)
+check("prose", usd("לא במלאי"), None)
+# A '$' inside the brackets is a CONVERTED estimate of the euro beside it, not
+# what we paid. Reading it as the price costs money in the direction that
+# hurts: it prices a package against a figure nobody was ever charged.
+check("dollars inside the brackets are refused", usd("€0.48 ($0.56)"), None)
+# memory: stripe-rtl-price-blindness — a bare number parsed as dollars once
+# refused real orders. It is not a price in either order, ever.
 check("bare number is refused", usd("0.56"), None)
-check("euro-first is refused", usd("€0.48 ($0.56)"), None)
+check("bare number, numeric cell, is refused", usd(0.56), None)
+# Sheets sprinkles invisible bidi marks through RTL text; nothing here is
+# anchored, so they cannot hide the price wherever they land.
+check("bidi marks around the new order", usd("‏(€4.55)‎ $5.30"), 5.30)
+check("bidi marks around the old order", usd("‫$5.30 (€4.55)‬"), 5.30)
+check("thousands separator survives", usd("(€1,060.00) $1,234.50"), 1234.50)
+check("nested brackets unwind", usd("(€4.55 (net)) $5.30"), 5.30)
 
 print("\n-- eligibility --")
 check("a stocked, priced, dated row is eligible", eligible(dog(2, "1.1.1", "$1.00")), True)

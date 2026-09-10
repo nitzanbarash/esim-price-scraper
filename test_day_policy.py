@@ -6,7 +6,9 @@ These pin the owner's day rules of 2026-09-10 (quoted in full in the module
 docstring of day_policy.py). Each one is a way of not selling the customer a
 shorter trip than the sheet promised:
 
-    * 30 days does not move for a rounding error (<=1% cheaper stays on 30),
+    * 30 days does not move for a rounding error (<=1% cheaper stays on 30) —
+      from 3GB up; on the 1-2GB band there is no 30-day preference and no
+      tolerance at all, the cheapest in-window candidate simply wins,
     * closest-to-30 wins next, and a tie goes to the LONGER plan (21/25 -> 25),
     * a size that is out of its day window is not a candidate at all, however
       cheap it is — that is the 10GB-at-14-days trap,
@@ -76,6 +78,38 @@ check("1GB takes the cheapest day count",
       days_of(pick(1, ESIMDOG, GERMANY_1GB)), 7)
 check("...and 1GB's floor is 1, so nothing on that curve is excluded",
       day_floor(1, ESIMDOG), 1)
+check("30d $2.99 against 7d $0.65 is not even close",
+      days_of(pick(1, ESIMDOG, [(30, 2.99), (7, 0.65)])), 7)
+
+print("\n-- 1-2GB: no 30-day preference and no tolerance (owner, 2026-09-10) --")
+# "1-2 אין העדפה באמת ל 30 אלא להכי זול" — half a percent is enough here,
+# where from 3GB up it would not be.
+check("1GB: 0.5% cheaper still wins",
+      days_of(pick(1, ESIMDOG, [(30, 1.00), (7, 0.995)])), 7)
+check("2GB: the band runs to 2GB inclusive",
+      days_of(pick(2, ESIMDOG, [(30, 1.00), (7, 0.995)])), 7)
+check("1GB at Stellar too — it is a size rule, not a supplier rule",
+      days_of(pick(1, STELLAR, [(30, 1.00), (7, 0.995)])), 7)
+check("2.5GB: out of the band, so 0.5% leaves it on 30",
+      days_of(pick(2.5, ESIMDOG, [(30, 1.00), (7, 0.995)])), 30)
+check("3GB: out of the band, so 0.5% leaves it on 30",
+      days_of(pick(3, ESIMDOG, [(30, 1.00), (5, 0.995)])), 30)
+check("3GB: more than 1% still moves it",
+      days_of(pick(3, ESIMDOG, [(30, 1.00), (5, 0.98)])), 5)
+# Equal money buys the most validity: the old preference key still breaks ties.
+check("1GB at one price -> the nearer 30",
+      days_of(pick(1, ESIMDOG, [(7, 0.65), (30, 0.65)])), 30)
+check("1GB at one price, 20 or 25 -> the longer",
+      days_of(pick(1, ESIMDOG, [(20, 0.65), (25, 0.65)])), 25)
+check("1GB at one price, order on the page does not decide",
+      days_of(pick(1, ESIMDOG, [(30, 0.65), (25, 0.65), (7, 0.65)])), 30)
+# The window still bounds the band: cheapest means cheapest IN the window.
+check("1GB: a cheaper 40-day plan is past the ceiling and never wins",
+      days_of(pick(1, ESIMDOG, [(30, 2.99), (40, 0.10)])), 30)
+check("1GB at Stellar: 60 days is past the ceiling below 30GB",
+      days_of(pick(1, STELLAR, [(7, 0.65), (60, 0.10)])), 7)
+check("...and out of the window on its own it leaves the row with nothing",
+      pick(1, ESIMDOG, [(40, 0.10)]), None)
 
 print("\n-- a validity below the floor is not a candidate at any price --")
 # The 10GB rows the sheet carried at 14 days: cheap, and not for sale.

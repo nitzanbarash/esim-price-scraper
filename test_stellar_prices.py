@@ -21,8 +21,8 @@ from esim_price_scraper import HEADER_KEYS
 from stellar_prices import (
     stamp_price_direction,
     MARK_GONE, MARK_REGIONAL, MARK_SHORT, RETAIL_OVER_WHOLESALE, FX_FALLBACK,
-    Catalogue, Variant, StellarRow, decide, fetch_fx, is_regional_sku,
-    main, plan_updates, price_cell, read_rows,
+    Catalogue, Variant, StellarRow, _eur, decide, fetch_fx, is_regional_sku,
+    main, plan_updates, price_cell, read_rows, usd_outside_parens,
 )
 
 _fails = []
@@ -204,7 +204,14 @@ check("...but never clears a stock word the owner wrote", "stock" in W[13], Fals
 check("a stale error note is cleared when the row is fine", W[14].get("changed"), "")
 check("a real price note persists while nothing changes", "changed" in W[15], False)
 check("nothing else is written on an unchanged row", sorted(W[15]), ["price", "updated"])
-check("the reversed euro-first cell is rewritten in canonical order",
+# THE ONE-TIME MIGRATION, and it needs no rule of its own: G is rewritten on
+# every priced row, changed or not, so the first --apply after 2026-09-10 turns
+# every dollars-first cell in the sheet round without touching a single price.
+# Row 15 is the proof — its euro did not move and its cell still gets rewritten.
+check("an unchanged price is still rewritten, euro-first", W[15]["price"], price_cell(2.13, FX))
+check("...which is a different string from the one it replaces",
+      W[15]["price"] != "$2.48 (€2.13)", True)
+check("a cell already euro-first is left in that order",
       W[9]["price"], price_cell(2.83, FX))
 
 # the recovery path: our own marker is cleared once the row prices again
@@ -221,7 +228,13 @@ check("a failing fetch falls back to the sheet's own dollars/euros",
 check("an exception is a failure too, not a crash",
       fetch_fx(["$1.16 (€1.00)"], fetch=lambda: 1 / 0)[1], "derived from the sheet's own cells")
 check("with nothing to derive from, the constant", fetch_fx([], fetch=lambda: None), (FX_FALLBACK, "hard-coded fallback"))
-check("price cell format", price_cell(2.21, 1.1614), "$2.57 (€2.21)")
+check("a dollar figure INSIDE the brackets is not the sheet's own rate",
+      fetch_fx(["€0.48 ($0.56)"], fetch=lambda: None), (FX_FALLBACK, "hard-coded fallback"))
+# The owner reads the euro, so the euro leads (2026-09-10). Column G carries a
+# LEFT_TO_RIGHT direction, so this is exactly what he sees: '(€2.21) $2.57'.
+check("price cell format is euro-first", price_cell(2.21, 1.1614), "(€2.21) $2.57")
+check("...and every reader still finds the dollars", usd_outside_parens(price_cell(2.21, 1.1614)), 2.57)
+check("...and the euro", _eur(price_cell(2.21, 1.1614)), 2.21)
 
 print("-- the price column's text direction --")
 

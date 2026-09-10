@@ -20,17 +20,30 @@ THE OWNER'S RULES, verbatim (2026-09-10):
      10-19: החל מ-20; 20-30: החל מ-25; מעל 30: 30 ומעלה;
      50 גיגה: החל ממעל ל-32 ימים."
 
+And the same day, on the 1-2GB band specifically:
+
+    "1-2 אין העדפה באמת ל 30 אלא להכי זול"
+
 THE AGREED READING (this is what the code below does):
 
-    1. 30 days is always first preference, and it is only given up for a price
-       that is MORE than 1% cheaper (DAY_TOL). Equal, dearer, or a rounding
-       error's worth cheaper all leave the row on 30 days.
+    1. 30 days is always first preference — from 3GB up — and it is only given
+       up for a price that is MORE than 1% cheaper (DAY_TOL). Equal, dearer, or
+       a rounding error's worth cheaper all leave the row on 30 days.
+       EXCEPT on the 1-2GB band, where the owner says there is no real 30-day
+       preference at all ("1-2 אין העדפה באמת ל 30 אלא להכי זול"): there the
+       CHEAPEST in-window candidate wins outright and DAY_TOL does not apply,
+       so half an agora is enough to move the row off 30 days. A small plan is
+       a top-up, not a trip, and the owner would rather bank the difference.
+       An exact price tie still falls back to rule 2, so equal money buys the
+       validity closest to 30 (and, on a tie there, the longer plan).
     2. Second preference is whatever sits CLOSEST to 30 — key (|days-30|, -days),
        so the walk order is 30, 31, 29, 28, ... and on a tie the LONGER plan
        wins (21 and 25 at one price -> 25).
     3. A floor per size — the shortest validity the owner will sell that size
-       as. 1-2GB has no real floor (the cheapest day count wins); from 3GB up
-       the floor climbs with the size.
+       as. 1-2GB has no real floor (the cheapest day count wins, per rule 1);
+       from 3GB up the floor climbs with the size. The floors and the ceilings
+       bound the 1-2GB band exactly as they bound every other one: cheapest
+       means cheapest IN THE WINDOW, so a 40-day bargain is still no candidate.
     4. A ceiling per supplier. esim.dog is never asked for more than 31 days.
        Stellar is asked past 31 ONLY from 30GB up, and a longer Stellar plan is
        only taken when it costs no MORE than the incumbent ("באותו מחיר") —
@@ -71,6 +84,11 @@ DAY_FLOOR_BANDS: Tuple[Tuple[float, int], ...] = (
     (19.0, 20),    # 10-19GB : from 20 days
     (30.0, 25),    # 20-30GB : from 25 days
 )
+# The band that has no 30-day preference at all: the one whose floor is 1 day.
+# "1-2 אין העדפה באמת ל 30 אלא להכי זול" — inside it price alone decides and
+# DAY_TOL is not consulted. Read off the first band so the two cannot drift.
+CHEAPEST_ONLY_MAX_GB = DAY_FLOOR_BANDS[0][0]
+
 # "מעל 30: 30 ומעלה" — everything above 30GB starts at 30 days...
 DAY_FLOOR_ABOVE_BANDS = 30
 # ...except that from 50GB up, Stellar starts above 32.
@@ -161,11 +179,22 @@ def pick(gb: float, supplier: str, candidates: Iterable[Any]) -> Optional[Any]:
     chosen candidate is returned as given, so a link or a package code rides
     along untouched. Returns None when nothing is in the window at all: that is
     a row with no sellable validity, not a row to sell at any validity.
+
+    From 3GB up this is the 30-days-first walk of rules 1-2; on the 1-2GB band
+    it is simply the cheapest candidate in the window (rule 1's exception).
     """
     key = _supplier(supplier)
     ordered = in_window_candidates(gb, key, candidates)
     if not ordered:
         return None
+
+    if float(gb) <= CHEAPEST_ONLY_MAX_GB:
+        # "1-2 אין העדפה באמת ל 30 אלא להכי זול": no 30-day preference here and
+        # no tolerance either — the cheapest candidate that is IN THE WINDOW
+        # wins outright. `ordered` is already in preference order and min()
+        # keeps the first of equal keys, so an exact price tie still settles on
+        # the closest-to-30 (and, on a tie there, the longer) plan.
+        return min(ordered, key=candidate_price)
 
     best = ordered[0]
     long_plans_free = key == STELLAR and float(gb) >= STELLAR_UNCAPPED_FROM_GB

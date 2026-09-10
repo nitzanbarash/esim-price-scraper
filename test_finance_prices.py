@@ -46,26 +46,26 @@ class TestSupplierRows(unittest.TestCase):
 
     def test_the_supplier_row_underneath_does_not_win(self):
         p = prices(row("2.49.10", "esim.dog", "$3.12", "6.99"),
-                   row("2.49.10", "Stellar", "$2.57 (€2.21)", ""))
+                   row("2.49.10", "Stellar", "(€2.21) $2.57", ""))
         self.assertEqual(p["2.49.10"]["list"], "6.99")
         self.assertEqual(p["2.49.10"]["buy"], "$3.12")
 
     def test_order_within_the_pair_does_not_matter(self):
         under = prices(row("2.49.10", "esim.dog", "$3.12", "6.99"),
-                       row("2.49.10", "Stellar", "$2.57 (€2.21)", ""))
-        over = prices(row("2.49.10", "Stellar", "$2.57 (€2.21)", ""),
+                       row("2.49.10", "Stellar", "(€2.21) $2.57", ""))
+        over = prices(row("2.49.10", "Stellar", "(€2.21) $2.57", ""),
                       row("2.49.10", "esim.dog", "$3.12", "6.99"))
         self.assertEqual(under, over)
 
     def test_a_supplier_only_sku_stays_priced(self):
         # Dropping it would move real sales into "sold but not in the price
         # sheet" — a louder wrong answer than the one being fixed.
-        p = prices(row("2.0B.5", "Stellar", "$1.59 (€1.37)", ""))
+        p = prices(row("2.0B.5", "Stellar", "(€1.37) $1.59", ""))
         self.assertIn("2.0B.5", p)
-        self.assertEqual(p["2.0B.5"]["buy"], "$1.59 (€1.37)")
+        self.assertEqual(p["2.0B.5"]["buy"], "(€1.37) $1.59")
 
     def test_case_and_padding_in_the_source_cell_still_match(self):
-        p = prices(row("2.49.10", "Stellar", "$2.57 (€2.21)", ""),
+        p = prices(row("2.49.10", "Stellar", "(€2.21) $2.57", ""),
                    row("2.49.10", "  ESIM.DOG ", "$3.12", "6.99"))
         self.assertEqual(p["2.49.10"]["list"], "6.99")
 

@@ -201,8 +201,10 @@ def receipt_row(order_id, status, stellar_id="so-1", route="Stellar JC059"):
 def sheet_row(sku="1.62.10", code="JC059", gb=10.0, days=20, eur=2.12, country="אינדונזיה"):
     # No floor here any more: StellarRow.floor_days is a read-only property and
     # the floor belongs to the SIZE (day_policy's bands). 10GB -> 20..31 days.
+    # The cell is built by the writer itself, so this fixture cannot drift out
+    # of the format the sheet actually holds (euro-first since 2026-09-10).
     return sp.StellarRow(row=83, sku=sku, country=country, code=code, gb=gb, days=days, eur=eur,
-                         price_cell=f"${eur*1.165:.2f} (€{eur:.2f})", changed="", stock="")
+                         price_cell=sp.price_cell(eur, 1.165), changed="", stock="")
 
 
 def token(d=None, gb=10):
@@ -246,6 +248,27 @@ def scenario(orders, stellar: StellarFake, ws: Ws | None = None, rows=None, clai
     finally:
         logging.getLogger().removeHandler(h)
     return site, ws, bought, log.getvalue()
+
+
+# ── 0. the FX the Buy column is written at ───────────────────────────────────
+# The receipts row records what the package COST, and that figure is the row's
+# own euros times the rate hidden in its own price cell. The sheet holds both
+# spellings of that cell while it migrates to euro-first, and the two must give
+# one rate: a reader that took the first number would have divided euros by
+# euros, written 1.00 into the ledger, and made every Stellar package look free.
+print("\n0. the row's own FX reads the same whichever way the price cell is written")
+check("euro-first (what the sheet holds now)",
+      round(sb.fx_of(sp.StellarRow(row=1, sku="x", country="", code="", gb=10.0, days=30,
+                                   eur=2.12, price_cell="(€2.12) $2.47", changed="", stock="")), 4),
+      round(2.47 / 2.12, 4))
+check("dollars-first (what it held until 2026-09-10)",
+      round(sb.fx_of(sp.StellarRow(row=1, sku="x", country="", code="", gb=10.0, days=30,
+                                   eur=2.12, price_cell="$2.47 (€2.12)", changed="", stock="")), 4),
+      round(2.47 / 2.12, 4))
+check("a cell with no dollars outside the brackets falls back, it does not invent a rate",
+      sb.fx_of(sp.StellarRow(row=1, sku="x", country="", code="", gb=10.0, days=30,
+                             eur=2.12, price_cell="€2.12", changed="", stock="")),
+      sb.FX_FALLBACK)
 
 
 # ── 1. the happy path ────────────────────────────────────────────────────────

@@ -141,30 +141,60 @@ function profitFloorPct_(gb) {
 }
 
 // The buy-price cell is written by the scraper as text and can carry more
-// than one figure (a shekel figure beside the dollar one, and in an RTL row
-// they render in either order). The dollar amount is the one we paid, so it
-// is read by its '$' and never by position; a bare number is accepted only
-// when the cell holds nothing else, so "12.90 NIS" can never pass as $12.90.
+// than one figure (a shekel figure beside the dollar one, a euro one on a
+// Stellar row). The dollar amount is the one we paid, so it is read by its
+// '$' and never by position.
 //
-// ANCHORED, and that is the point. The scraper writes the pair as
-// '$0.56 (\u20ac0.48)' - dollars first - but the sheet is right-to-left, so the
-// same cell can arrive as '\u20ac0.48 ($0.56)' with the euro leading. A floating
-// /\$.../ search reads the dollar figure out of EITHER, which sounds helpful
-// and is not: it means a cell whose leading, authoritative amount is not
-// dollars still yields a dollar number, and the profit column is then computed
-// against a price we never paid. Only a cell that OPENS with '$' (after
-// whitespace or the invisible bidi marks Sheets sprinkles into RTL text) is a
-// dollar price. Same rule, same character class, as choose_supplier.py's usd().
-const BIDI_ = '[\\s\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]*';
-const USD_RE_   = new RegExp('^' + BIDI_ + '\\$\\s*(\\d[\\d,]*(?:\\.\\d+)?)');
-const BARE_RE_  = new RegExp('^' + BIDI_ + '(\\d[\\d,]*(?:\\.\\d+)?)' + BIDI_ + '$');
+// PARENTHESES, not position, and that is the point. Until 2026-09-10 the pair
+// was written dollars-first, '$0.56 (\u20ac0.48)', and this helper was ANCHORED
+// so that a cell whose leading amount was not dollars could never yield one.
+// The owner has now asked for the euro first, '(\u20ac0.48) $0.56', and the
+// sheet holds BOTH spellings until every row has been rewritten - so an
+// anchored read would be right about half the sheet and blind to the rest,
+// and a blind row loses its profit figure and its unprofitable marker.
+//
+// So the rule moved from the start of the cell to the brackets. The dollars
+// OUTSIDE them are what we paid; a '$' INSIDE them is a converted estimate of
+// some other currency ('\u20ac0.48 ($0.56)'), and computing profit against
+// that prices the row on money nobody spent. Every (...) group is dropped
+// first - innermost outwards, so nesting unwinds too - and only then is a '$'
+// amount looked for. Nothing is anchored any more, which is also how the
+// invisible bidi marks Sheets sprinkles into RTL text stopped mattering.
+//
+// A bare number is NOT a price, so "12.90 NIS" can never pass as $12.90 and a
+// naked "0.56" is read as nothing at all - the same rule, and now the same
+// shape, as choose_supplier.py's usd_outside_parens().
+const PARENS_ = /\([^()]*\)/g;
+const USD_RE_ = /\$\s*(\d[\d,]*(?:\.\d+)?)/;
 
 function firstDollar_(v) {
-  const s = String(v === null || v === undefined ? '' : v);
-  const m = USD_RE_.exec(s) || BARE_RE_.exec(s);
+  let s = String(v === null || v === undefined ? '' : v);
+  for (let prev = null; prev !== s; ) { prev = s; s = s.replace(PARENS_, ' '); }
+  const m = USD_RE_.exec(s);
   if (!m) return null;
   const n = parseFloat(m[1].replace(/,/g, ''));
   return isNaN(n) ? null : n;
+}
+
+// Runnable from the Apps Script editor (Run > checkPriceReading), because
+// nothing else here can be: this file has no test runner, and the one rule it
+// shares with three Python bots is the rule that decides what a package cost.
+// The cases are the same six pinned in test_choose_supplier.py.
+function checkPriceReading() {
+  const cases = [
+    ['$5.30 (\u20ac4.55)', 5.30],   // yesterday's order, still in the sheet
+    ['(\u20ac4.55) $5.30', 5.30],   // today's order
+    ['$1.65', 1.65],                // an esim.dog row: one currency
+    ['\u20ac0.48 ($0.56)', null],   // dollars in brackets are an estimate
+    ['0.56', null],                 // a bare number is not a price
+    ['', null], ['\u2014', null], ['\u05dc\u05d0 \u05d1\u05de\u05dc\u05d0\u05d9', null],
+    ['\u200f(\u20ac4.55)\u200e $5.30', 5.30]   // with the bidi marks Sheets adds
+  ];
+  const bad = cases.filter(function (c) { return firstDollar_(c[0]) !== c[1]; });
+  Logger.log(bad.length === 0 ? 'firstDollar_: all ' + cases.length + ' cases pass'
+    : 'firstDollar_ FAILED on ' + JSON.stringify(bad.map(function (c) {
+        return { cell: c[0], want: c[1], got: firstDollar_(c[0]) };
+      })));
 }
 
 // The leading emoji is not decoration: it stops Sheets parsing "+$0.03 (..."

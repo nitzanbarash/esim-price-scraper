@@ -805,7 +805,77 @@ class ESIMScraper:
                     else ("" if price else "Could not read price"),
         }
 
+    async def expand_region_plans(self, page: Page, rounds: int = 5) -> None:
+        """Reveal the plan cards a /regions page hides behind its own button.
+
+        The list is TRUNCATED on first paint. Asia 5GB paints three cards and
+        keeps eight more behind "+ Show 8 more plans" — and the 12-country plan
+        the sheet asks for is one of those eight, so the row came back with
+        "choose a variant" naming three packages that did not include the one
+        it wanted. The plan was never missing; it was one click away.
+
+        Two things this deliberately does NOT do:
+          * test for "show more" the way expand_routes() does. The plans button
+            reads "+ Show 8 more plans" and contains no "show more" at all,
+            while the VALIDITY chip row DOES say "+ Show more options" — so
+            that test clicks the wrong button and still never opens the plans.
+            "more plan" is the test that separates them.
+          * stop after one click. One was enough on Asia, but the 8 in that
+            label is the site's number, not ours; a page that hands its plans
+            over a page at a time gets up to `rounds` clicks and no more, so a
+            button that never goes away costs a bounded wait, not the run.
+        Once expanded the button becomes "- Show less plans", which the same
+        test leaves alone — the loop ends on its own instead of re-collapsing
+        what it just opened. A page with no such button is untouched.
+        """
+        for _ in range(rounds):
+            target = None
+            for b in await page.query_selector_all("button"):
+                text = (await b.text_content() or "").strip().lower()
+                if "more plan" in text and await b.is_visible():
+                    target = b
+                    break
+            if target is None:
+                return
+            try:
+                await target.click()
+            except Exception:
+                return
+            await page.wait_for_timeout(1200)
+
+    async def open_region_plan(self, page: Page, chosen: Dict) -> None:
+        """Click the card for `chosen` — the one at ITS price, not merely the
+        first with that country count.
+
+        Expanding the list is what makes this matter: Asia 5GB carries TWO
+        12-country cards, $5.49 and $15.99. A count alone therefore does not
+        name a card, and picking the wrong one would read a real price off a
+        package we did not choose. The count is matched exactly (an unquoted
+        Playwright text= is a substring test, where "2 countries" also finds
+        "12 countries") and the card's own price has to agree.
+        """
+        loc = page.locator(f'text="{chosen["countries"]} countries"')
+        if not await loc.count():
+            loc = page.locator(f'text={chosen["countries"]} countries')
+        want = f"${chosen['price']:.2f}"
+        for i in range(await loc.count()):
+            el = loc.nth(i)
+            try:
+                card = await el.evaluate(
+                    "el => { let c = el;"
+                    "  for (let d = 0; d < 4 && c.parentElement; d++) {"
+                    "    c = c.parentElement;"
+                    "    if ((c.innerText || '').includes('$')) return c.innerText;"
+                    "  } return el.innerText || ''; }")
+            except Exception:
+                card = ""
+            if want in card:
+                await el.click()
+                return
+        await loc.first.click()
+
     async def scrape_region(self, page: Page, info: Dict, variant: str) -> Dict:
+        await self.expand_region_plans(page)
         text = await page.inner_text("body")
         plans = parse_region_plans(text)
         if not plans:
@@ -831,7 +901,7 @@ class ESIMScraper:
 
         price = f"${chosen['price']:.2f}"
         try:
-            await page.locator(f"text={chosen['countries']} countries").first.click()
+            await self.open_region_plan(page, chosen)
             await page.wait_for_timeout(2500)
             real_price = await self.extract_price(page)
             if real_price:

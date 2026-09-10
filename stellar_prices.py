@@ -90,6 +90,7 @@ from typing import Callable, Optional
 import requests
 
 import day_policy
+from choose_supplier import usd_outside_parens
 from esim_price_scraper import HEADER_KEYS, SHEET_ID, col_letter
 
 FEED_URL = "https://stellarsecurity.com/assets/esim/products.index.json"   # retail; fallback only
@@ -264,7 +265,7 @@ class StellarRow:
     code: str                   # column 'Route' holds Stellar's package code
     gb: Optional[float]
     days: Optional[int]
-    eur: Optional[float]        # parsed out of '$2.57 (€2.21)'
+    eur: Optional[float]        # parsed out of '(€2.21) $2.57'
     price_cell: str
     changed: str
     stock: str
@@ -423,10 +424,18 @@ def sanity(decisions) -> str:
 # ── money ───────────────────────────────────────────────────────────────────
 
 def price_cell(eur: float, fx: float) -> str:
-    """'$2.57 (€2.21)'. Column G carries a LEFT_TO_RIGHT text direction so this
-    reads as written inside the RTL sheet — keep the format and the cell format
-    in step (see memory: rtl-sheet-price-direction)."""
-    return f"${eur * fx:.2f} (€{eur:.2f})"
+    """'(€2.21) $2.57' — euro first, dollar last, as the owner asked on
+    2026-09-10.
+
+    Column G carries a LEFT_TO_RIGHT text direction so this reads as written
+    inside the RTL sheet — keep the format and the cell format in step (see
+    memory: rtl-sheet-price-direction). The euro is the number the owner
+    checks, so it now opens the cell instead of trailing it.
+
+    Nothing downstream reads the ORDER: every reader takes the dollars from
+    outside the parentheses (choose_supplier.usd_outside_parens), which is why
+    the sheet can hold both spellings while it migrates."""
+    return f"(€{eur:.2f}) ${eur * fx:.2f}"
 
 
 def _frankfurter() -> Optional[float]:
@@ -452,10 +461,13 @@ def fetch_fx(existing_cells, fetch: Callable[[], Optional[float]] = _frankfurter
         pass
     ratios = []
     for cell in existing_cells:
-        usd = re.search(r"\$\s*([\d.]+)", str(cell or ""))
-        eur = re.search(r"€\s*([\d.]+)", str(cell or ""))
-        if usd and eur and float(eur.group(1)) > 0:
-            ratios.append(float(usd.group(1)) / float(eur.group(1)))
+        # Both spellings of the pair are in the sheet while it migrates, so the
+        # dollars are taken from outside the parentheses and the euros from
+        # anywhere — position says nothing about which number is which.
+        usd = usd_outside_parens(cell)
+        eur = _eur(cell)
+        if usd and eur and eur > 0:
+            ratios.append(usd / eur)
     if ratios:
         return round(statistics.median(ratios), 4), "derived from the sheet's own cells"
     return FX_FALLBACK, "hard-coded fallback"
@@ -555,9 +567,11 @@ def read_sheet(svc) -> list[list[str]]:
 def stamp_price_direction(svc, col: dict[str, int]) -> int:
     """Make the money columns render left-to-right; report how many needed it.
 
-    The sheet is right-to-left, so '$2.57 (€2.21)' renders euro-first unless the
-    cell says otherwise — the owner reads €2.21 as the price. The string is not
-    the price; the string PLUS this format is.
+    The sheet is right-to-left, so a cell that does not say otherwise renders
+    its two currencies in the reverse of the order they were written in. The
+    string is not the price; the string PLUS this format is. Since 2026-09-10
+    the string is euro-first, '(€2.21) $2.57', and this stamp is what makes it
+    reach the owner's eye that way round instead of flipped back to dollars.
 
     Both money columns get it, not just the buy price: on a price move the OLD
     two-currency string is copied verbatim into 'מחיר קודם', so a column that
@@ -612,7 +626,7 @@ def write_updates(svc, col: dict[str, int], updates) -> int:
     data = [{"range": f"{col_letter(col[k])}{row}", "values": [[v]]}
             for row, k, v in updates if k in col]
     # RAW: nothing written here is a formula or a number for Sheets to
-    # interpret, and RAW is the one mode that cannot turn '$2.57 (€2.21)'
+    # interpret, and RAW is the one mode that cannot turn '(€2.21) $2.57'
     # into something else.
     for i in range(0, len(data), 200):
         svc.spreadsheets().values().batchUpdate(

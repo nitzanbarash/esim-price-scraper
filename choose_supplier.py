@@ -22,8 +22,10 @@ What "eligible" means (all four, or the row cannot win):
                      (blank source defaults to esim.dog) reads it as, and what
                      both buy bots buy on. Reading blank as "unknown"
                      let a Stellar rival win a SKU at any price at all.
-    G  מחיר קנייה    parses as a leading USD amount — '—', blank or prose is not
-                     a price, and a row with no price is not for sale
+    G  מחיר קנייה    holds a USD amount OUTSIDE any parentheses — '—', blank or
+                     prose is not a price, and a row with no price is not for
+                     sale. Either order reads the same: '(€0.48) $0.56' and
+                     '$0.56 (€0.48)' both cost 56 cents
     Q  במלאי/רווחי   is EMPTY. Anything there — לא רווחי, לא זמין, the owner's
                      own note — means do not sell this row
     F  זמן חבילה     parses as days
@@ -146,7 +148,7 @@ class Row:
     row: int                       # 1-based sheet row
     sku: str = ""
     source: object = ""            # D — blank means esim.dog
-    price: object = ""             # G — '$0.58' or '$0.56 (€0.48)'
+    price: object = ""             # G — '$0.58' or '(€0.48) $0.56'
     validity: object = ""          # F — '7d'
     stock: object = ""             # Q — non-empty means: do not sell
     chosen: object = ""            # W
@@ -176,18 +178,45 @@ def source_key(r: Row) -> str:
     return source_of(r).lower()
 
 
-# A price cell is '$0.56 (€0.48)' and the dollars come first — but the sheet is
-# right-to-left and renders that string backwards (memory:
-# rtl-sheet-price-direction), so the '$' is read, never the position on screen.
-# A bare number is NOT a price: memory stripe-rtl-price-blindness is the whole
-# reason that rule exists.
-_USD = re.compile(r"^[\s\u200e\u200f\u202a-\u202e\u2066-\u2069]*\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)")
+# A price cell carries the money twice, and since 2026-09-10 the owner reads it
+# euro-first: '(€0.48) $0.56'. The sheet still holds cells in yesterday's order,
+# '$0.56 (€0.48)', until the next run rewrites them — so a reader that trusted
+# POSITION would be right about half the sheet and wrong about the other half.
+# Position is not the rule any more, and neither is the leading character.
+#
+# The rule is the parentheses. The dollars OUTSIDE them are what we pay; a '$'
+# INSIDE them is a converted estimate of something else ('€0.48 ($0.56)'), and
+# reading that as our cost prices a package against money nobody spent. So
+# every (...) group is dropped first, and only then is a '$' amount looked for.
+#
+# A bare number is NOT a price, in either order: memory
+# stripe-rtl-price-blindness is the whole reason that rule exists, and
+# '12.90 NIS' must never pass as $12.90.
+_PARENS = re.compile(r"\([^()]*\)")
+_USD = re.compile(r"\$\s*([0-9][0-9,]*(?:\.[0-9]+)?)")
 
 
-def usd(cell) -> Optional[float]:
-    """The leading USD amount of a price cell; None for '—', blank or prose."""
-    m = _USD.match(text(cell))
+def usd_outside_parens(cell) -> Optional[float]:
+    """The USD amount outside any parentheses; None for '—', blank or prose.
+
+    The one money-reader every bot shares — stellar_prices, stellar_buyer and
+    waverole_sync.gs's firstDollar_ all hold this same rule, because a price
+    cell read two different ways is how a sheet ends up charging a price it
+    never quoted. Nothing is anchored to the start of the cell, so the bidi
+    marks Sheets sprinkles into RTL text are tolerated wherever they land.
+    """
+    s = text(cell)
+    while True:                  # innermost first, so nested groups unwind too
+        stripped = _PARENS.sub(" ", s)
+        if stripped == s:
+            break
+        s = stripped
+    m = _USD.search(s)
     return float(m.group(1).replace(",", "")) if m else None
+
+
+# The chooser's own short name for it: every call site below reads a price.
+usd = usd_outside_parens
 
 
 # מחיר סופי is the owner's own number, typed by hand or computed by his ladder:

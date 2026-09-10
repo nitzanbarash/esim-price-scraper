@@ -62,6 +62,7 @@ import requests
 
 import fulfillment_bot as fb
 import stellar_prices as sp
+from choose_supplier import usd_outside_parens
 
 log = logging.getLogger("stellar-buyer")
 
@@ -124,7 +125,7 @@ def reached_stellar(ex: Exception) -> bool:
 class Blocked(Exception):
     """The world is wrong, not the order. Nothing is bought this run and every
     order keeps its place in the queue."""
-FX_FALLBACK = 1.16       # only when the sheet's own '$x (€y)' cell cannot say
+FX_FALLBACK = 1.16       # only when the sheet's own '(€y) $x' cell cannot say
 
 # Receipts 'סטטוס - Status' values this bot writes. The sheet is the ledger,
 # so these words are state, not decoration: run() reads them back.
@@ -323,12 +324,17 @@ def stellar_rows() -> dict[str, sp.StellarRow]:
 
 
 def fx_of(row: sp.StellarRow) -> float:
-    """USD per EUR, read off the row's own '$2.47 (€2.12)' so the Buy column
+    """USD per EUR, read off the row's own '(€2.12) $2.47' so the Buy column
     agrees with the price sheet to the cent. The fallback only rounds a
-    receipt, never a decision -- decisions are made in EUR."""
-    m = re.search(r"\$\s*([\d.]+)", row.price_cell or "")
-    if m and row.eur:
-        return float(m.group(1)) / row.eur
+    receipt, never a decision -- decisions are made in EUR.
+
+    The dollars are taken from OUTSIDE the parentheses, so both spellings of
+    the pair read the same while the sheet migrates to euro-first: a reader
+    that took the first number would have divided euros by euros and written
+    a Buy price of 1.00 into the ledger."""
+    usd = usd_outside_parens(row.price_cell or "")
+    if usd and row.eur:
+        return usd / row.eur
     return FX_FALLBACK
 
 

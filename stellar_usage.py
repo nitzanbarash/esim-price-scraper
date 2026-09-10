@@ -10,12 +10,28 @@ portal link the buyer wrote on its receipts row,
 
     https://wholesale.stellarsecurity.com/orders/<order_id>
 
-which gives GET /orders/<id> -> data.esims[] -> GET /esims/<sim_id>.
+which gives GET /orders/<id> -> data.esims[] -> GET /esims/<sim_id>/usage.
+
+THE METER IS ITS OWN ENDPOINT. /esims/<sim_id> carries no figures at all --
+only the flag `usage_available` and `lifecycle.last_usage_update_at`. The
+'usage endpoint hunt' step of .github/workflows/stellar-smoke.yml asked the
+API for five candidate paths on a live order (2026-09-10) and got exactly one:
+
+    GET /esims/<sim_id>/usage  -> 200   data.{used_bytes,total_bytes,
+                                        remaining_bytes,usage_percent},
+                                        expires_at, status, lifecycle.*
+    GET /esims/<sim_id>/data         -> 404
+    GET /esims/<sim_id>/consumption  -> 404
+    GET /orders/<order_id>/usage     -> 404
+
+Note which payload holds the package's own `expires_at`: the meter's. The eSIM
+record has none -- its only expiry is `vpn.expires_at`, which belongs to the
+VPN Stellar bundles alongside the data, hence NOT_USAGE_SUBTREES below.
 
 WHAT THIS MODULE REFUSES TO DO IS THE POINT OF IT.
 
-We have never read a live Stellar usage payload -- nothing has been sold
-through Stellar yet -- so the field names below are an educated list, not a
+The names above were read as NAMES, never as values, and no Stellar package
+has yet been metered end to end -- so the tables below are still a list, not a
 contract. A mapper that guesses would be worse than no mapper: a wrong reading
 becomes a customer's meter, and a wrongly-zero 'total' becomes a package
 RETIRED as used up while it still works. So the mapping is strict:
@@ -65,6 +81,15 @@ ENVELOPE = {"data", "meta", "links", "message", "success", "status", "errors", "
 NOT_USAGE = ("price", "cost", "amount", "currency", "cents", "eur", "usd",
              "wallet", "balance", "fee", "tax", "discount", "quantity")
 
+# Whole SUBTREES that describe something other than this package. Stellar sells
+# a VPN alongside the data plan and carries it inside the same eSIM payload, so
+# `data.vpn.expires_at` is the VPN's expiry -- read as the package's, it tells a
+# customer their data dies on the wrong day, and the retirement rule agrees.
+# This is matched on a path SEGMENT, not as a substring like NOT_USAGE: 'vpn'
+# is three letters that a legitimate key could contain, and only a key that IS
+# 'vpn' opens a subtree that is not ours.
+NOT_USAGE_SUBTREES = ("vpn",)
+
 # Leaf names, most specific first. The first one present wins, so adding a new
 # name to the top of a list is how this module learns a shape.
 USED_LEAVES = (
@@ -83,7 +108,17 @@ EXPIRY_LEAVES = (
 )
 STATUS_LEAVES = ("esim_status", "sim_status", "usage_status", "state", "status")
 
+# The three payloads a reading can come out of, written the way they are asked
+# for and never with a real id in them: this name is logged, and the log is
+# public. Which of them answered is the one fact that separates "the account
+# has the meter endpoint" from "it has not, and every row degraded to Unknown".
+EP_USAGE = "/esims/<sim_id>/usage"
+EP_ESIM = "/esims/<sim_id>"
+EP_ORDER = "/orders/<order_id>"
+
 _logged_shape = False        # the key-path log line is worth exactly once a run
+_logged_endpoint = False     # ...and so is the name of whichever one answered
+_stale_rows = 0              # readings the supplier itself flagged as not fresh
 
 
 @dataclass
@@ -105,8 +140,17 @@ def _norm(name) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")
 
 
+def _segments(path: str) -> list[str]:
+    return [_norm(p) for p in str(path).replace("[]", "").split(".")]
+
+
 def _leaf(path: str) -> str:
     return _norm(path.replace("[]", "").rsplit(".", 1)[-1])
+
+
+def _foreign_subtree(path: str) -> bool:
+    """True if this path runs through a subtree that is not this data package."""
+    return any(seg in NOT_USAGE_SUBTREES for seg in _segments(path))
 
 
 def key_paths(obj, prefix: str = "") -> list[str]:
@@ -190,6 +234,8 @@ def _pick(scalars: dict, leaves: tuple, numeric: bool):
                 continue
             if any(w in _norm(path) for w in NOT_USAGE):
                 continue
+            if _foreign_subtree(path):
+                continue
             v = _number(value) if numeric else (str(value).strip() or None)
             if v is None:
                 continue
@@ -214,11 +260,18 @@ def map_usage(blob) -> Result:
     scalars = _scalars(blob)
     used = _pick(scalars, USED_LEAVES, numeric=True)
     total = _pick(scalars, TOTAL_LEAVES, numeric=True)
+    expiry = _pick(scalars, EXPIRY_LEAVES, numeric=False)
+    status = _pick(scalars, STATUS_LEAVES, numeric=False)
     if not _logged_shape:
         _logged_shape = True
         log.info("stellar esim fields (names only): " + ", ".join(key_paths(blob)))
+        # All four PATHS, never their values. The expiry path is the one worth
+        # reading twice: 'vpn.expires_at' appearing here would mean a customer
+        # is being told their data dies on the VPN's day.
         log.info(f"stellar usage mapped from: used={used[0] if used else None} "
-                 f"total={total[0] if total else None}")
+                 f"total={total[0] if total else None} "
+                 f"expires={expiry[0] if expiry else None} "
+                 f"status={status[0] if status else None}")
     if used is None or total is None:
         return Unknown(keys=key_paths(blob))
     used_gb = to_gb(used[1], used[0])
@@ -228,8 +281,6 @@ def map_usage(blob) -> Result:
         # Unknown on purpose: usage_bot leaves those rows alone, where a
         # 'total 0' reading would retire a live package as used up.
         return Unknown(keys=key_paths(blob))
-    expiry = _pick(scalars, EXPIRY_LEAVES, numeric=False)
-    status = _pick(scalars, STATUS_LEAVES, numeric=False)
     return {
         "used_gb": round(used_gb, 3),
         "total_gb": round(total_gb, 3),
@@ -272,6 +323,46 @@ def _get(s, url) -> dict:
         return {}
 
 
+def _freshness(blob) -> list[str]:
+    """The freshness flags the payload states about ITSELF -- relayed, never
+    acted on.
+
+    The meter answers with `stale` and `refreshed` alongside the figures. This
+    module has no live sample of a stale one, so it invents no rule out of
+    them: a flagged reading is still returned, still written, still pushed to
+    the customer's page. All that happens is that the run says so, so that a
+    fleet whose meters have quietly stopped refreshing is a visible number in
+    the log rather than a set of figures that simply stopped moving.
+
+    `status` is deliberately NOT judged here. Whether a status word means the
+    figure is out of date is a policy, and the only place a policy about
+    status belongs is usage_bot.decide_status, which already reads the word
+    this module passes through untouched.
+    """
+    blob = _unwrap(blob)
+    if not isinstance(blob, dict):
+        return []
+    notes = []
+    if blob.get("stale") is True:
+        notes.append("stale")
+    if blob.get("refreshed") is False:
+        notes.append("not refreshed")
+    return notes
+
+
+def _note_endpoint(endpoint: str, blob) -> list[str]:
+    """Say once a run which endpoint the meter came out of. Names only."""
+    global _logged_endpoint, _stale_rows
+    notes = _freshness(blob)
+    if notes:
+        _stale_rows += 1
+    if not _logged_endpoint:
+        _logged_endpoint = True
+        log.info(f"stellar meter read from {endpoint}"
+                 + (f" (the supplier flags this one: {', '.join(notes)})" if notes else ""))
+    return notes
+
+
 def _one(s, url) -> Result:
     oid = order_id_from_url(url)
     if not oid:
@@ -294,18 +385,42 @@ def _one(s, url) -> Result:
         detail = None
         sim_id = str(e.get("sim_id") or e.get("id") or "").strip()
         if sim_id:
+            # The meter is its OWN endpoint, and only this one exists: the
+            # 'usage endpoint hunt' step of stellar-smoke.yml asked for five
+            # and got 200 here and 404 for /data, /consumption and
+            # /orders/<id>/usage. /esims/<sim_id> carries no figures at all.
+            try:
+                meter = _get(s, f"{BASE}/esims/{sim_id}/usage")
+            except Exception as ex:
+                # Not an outage on its own: an eSIM whose usage_available is
+                # false may simply have no meter yet. The eSIM record below is
+                # tried next, and a real outage fails there too.
+                log.info(f"stellar meter for an esim of order {oid}: "
+                         f"{type(ex).__name__} -- trying the esim record")
+            else:
+                got = map_usage(meter)
+                if isinstance(got, dict):
+                    got["sim_id"] = sim_id
+                    _note_endpoint(EP_USAGE, meter)
+                    return got
+                seen.extend(got.keys)
             try:
                 detail = _get(s, f"{BASE}/esims/{sim_id}")
             except Exception as ex:
                 log.warning(f"stellar esim of order {oid}: {type(ex).__name__} "
                             "-- left untouched")
                 return None
-        for blob in (detail, e):
+        # Only if the meter did not answer. The eSIM record carries no figures
+        # on our account, so this pair is the degrade path: on an account
+        # without the endpoint it produces Unknown, which usage_bot leaves
+        # alone -- never a retirement.
+        for endpoint, blob in ((EP_ESIM, detail), (EP_ORDER, e)):
             if not blob:
                 continue
             got = map_usage(blob)
             if isinstance(got, dict):
                 got["sim_id"] = sim_id
+                _note_endpoint(endpoint, blob)
                 return got
             seen.extend(got.keys)
     return Unknown(keys=sorted(set(seen)))
@@ -318,6 +433,8 @@ def fetch_usage(order_urls, session=None, key: Optional[str] = None) -> dict:
     the url, and handing back anything else would make the caller re-derive the
     id and re-introduce every parsing trap this module already handles.
     """
+    global _logged_endpoint, _stale_rows
+    _logged_endpoint, _stale_rows = False, 0     # one sweep, one endpoint line
     urls = [u for u in (order_urls or [])]
     if not urls:
         return {}
@@ -342,5 +459,8 @@ def fetch_usage(order_urls, session=None, key: Optional[str] = None) -> dict:
     ok = sum(1 for v in out.values() if isinstance(v, dict))
     unknown = sum(1 for v in out.values() if isinstance(v, Unknown))
     log.info(f"stellar: {ok} of {len(out)} package(s) read"
-             + (f" - {unknown} in an unrecognised shape (left untouched)" if unknown else ""))
+             + (f" - {unknown} in an unrecognised shape (left untouched)" if unknown else "")
+             # Written, pushed and counted like any other -- see _freshness.
+             + (f" - {_stale_rows} the supplier flagged as not fresh (still written)"
+                if _stale_rows else ""))
     return out
