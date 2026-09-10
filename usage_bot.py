@@ -26,10 +26,26 @@ When to stop checking a package (the Status column, R):
 A blank Status means "never checked yet", so existing rows join in on their
 own with no migration.
 
+Two suppliers, one sweep (since 2026-09-10):
+  Each row names its supplier in 'מקור - source', and its Route proves it.
+  esim.dog rows are asked by ICCID, fifty to a request. Stellar rows have no
+  ICCID at all, so they are asked through the portal link on the row
+  (stellar_usage.py). Both answers meet again in the same write-back and the
+  same push to the site, so nothing downstream knows there are two suppliers.
+  Where the two columns DISAGREE the row is skipped and you get one mail: the
+  wrong supplier answers "never heard of it", and this bot reads that as
+  "finished" — a live package would go dark over a mis-clicked dropdown. (A
+  'מקור' still holding the old payment word — 'paypal', 'bot - manually' — is
+  not a disagreement: it names no supplier, so the Route fills it in.)
+  For the same reason a Stellar row is only ever judged on a reading we
+  actually got: no key, an error, or an unfamiliar shape all leave the row
+  exactly as it was, because "we could not ask" is not "the package is over".
+
 Required environment (GitHub Secrets):
   GOOGLE_CREDENTIALS_JSON  service account with Editor on the receipts sheet
   ORDERS_TOKEN             bearer token of waverole.com/api/orders
   GMAIL_APP_PASSWORD       only used to email you if the run itself breaks
+  STELLAR_API_KEY          Stellar Wholesale; absent = Stellar rows untouched
 """
 
 import logging
@@ -40,6 +56,7 @@ from datetime import datetime, timedelta, timezone
 import gspread
 import requests
 
+import stellar_usage
 from fulfillment_bot import (
     ORDERS_URL, RECEIPTS_SHEET_ID, TZ, alert, env, fetch_esim_details,
     fetch_usage, sheet_client, _redact, _row_time,
@@ -74,6 +91,7 @@ UNKNOWN_MAX_DAYS = 90   # cap for rows with no plan length (we sell max 30 days)
 USAGE_CHUNK = 50        # eSIMs per supplier request
 SITE_CHUNK = 100        # orders per site request
 MAX_ICCID_LOOKUPS = 25  # repairs of rows missing an ICCID, per run
+MISMATCH_LIST = 20      # order ids named in the mismatch mail before "and N more"
 
 COL_ICCID = "מס סידורי -ICCID"
 COL_STATUS = "סטטוס - Status"
@@ -89,6 +107,21 @@ COL_SALE = "הנחה - Sale"
 COL_SOURCE = "מקור - source"
 COL_SELL = "מכירה - Sell"
 COL_SKU = 'מק"ט - SUK'
+COL_ROUTE = "Route"
+
+# The two suppliers, spelled exactly as the sheet's 'מקור - source' dropdown
+# spells them. Compared case-insensitively everywhere: a strict dropdown still
+# lets a row typed before it existed say 'ESIM.DOG'.
+SRC_ESIMDOG = "esim.dog"
+SRC_STELLAR = "Stellar"
+# What 'מקור - source' held until today: the payment RAIL, not the supplier.
+# The column was re-purposed on 2026-09-10 and hundreds of rows still carry the
+# old vocabulary. Those words are not a claim about a supplier at all, so they
+# cannot disagree with one — the row is simply not migrated yet, and is healed
+# from Route exactly like a blank. Read case-insensitively and with runs of
+# whitespace collapsed, because they were typed by hand for a year.
+LEGACY_SOURCE_WORDS = {"bot - manually", "paypal", "payme", "icount", "manual"}
+
 ACTIVATED_YES = "Activated"
 ACTIVATED_NO = "no"
 # The owner's mark for "this customer paid full price". A blank cell is not
@@ -185,6 +218,51 @@ def _plan_days(row_plan: str) -> int | None:
     """Days out of a plan label like '1GB - 30 days — Cellcom'."""
     m = re.search(r"[-–]\s*(\d+)\s*(?:days?|d\b|ימים)", str(row_plan or ""), re.I)
     return int(m.group(1)) if m else None
+
+
+def inferred_source(route: str) -> str:
+    """Which supplier a row's Route proves it came from.
+
+    Route is written by the buyer that placed the order and nothing else edits
+    it: stellar_buyer stamps 'Stellar <plan code>' (ROUTE_PREFIX), every
+    esim.dog row carries the network route or nothing at all. So Route is
+    evidence, where 'מקור - source' is a dropdown a person can mis-click.
+    """
+    return SRC_STELLAR if str(route or "").strip().startswith(SRC_STELLAR) else SRC_ESIMDOG
+
+
+def decide_source(source: str, route: str) -> tuple[str, str]:
+    """(supplier, verdict) for one row. verdict is 'ok' | 'heal' | 'mismatch'.
+
+    'מקור - source' is being back-filled by hand across hundreds of rows, so
+    the sweep must cope with three states and treat them differently:
+
+      blank      -> believe the Route and WRITE IT BACK ('heal'). Self-healing
+                    a blank states something nobody had stated; it is the same
+                    rule the discount column follows.
+      a payment
+      rail       -> 'heal' too. Until today this column recorded how we PAID
+                    ('paypal', 'bot - manually', 'icount'...). Such a word
+                    names no supplier, so it cannot contradict one: the row is
+                    un-migrated, not wrong. Reading it as a mismatch would have
+                    frozen the meter of every package sold before today and
+                    mailed their order numbers as a fault.
+      agrees     -> 'ok'.
+      disagrees  -> 'mismatch', and ONLY here: a value that is a supplier's
+                    name naming the other supplier. NOT resolved either way:
+                    one of the two is wrong and we cannot know which, and
+                    asking the wrong supplier about a package returns "never
+                    heard of it" — which this bot reads as "retire it", so a
+                    customer's live package would go dark over a typo. The row
+                    is skipped whole and a person is told once.
+    """
+    inferred = inferred_source(route)
+    v = str(source or "").strip()
+    if not v or re.sub(r"\s+", " ", v.lower()) in LEGACY_SOURCE_WORDS:
+        return inferred, "heal"
+    if v.lower() != inferred.lower():
+        return inferred, "mismatch"
+    return inferred, "ok"
 
 
 def decide_status(usage: dict | None, bought_at, plan_days: int | None, now=None) -> str:
@@ -448,15 +526,37 @@ def main() -> int:
         return 0
 
     # ── who is still worth checking ──
-    todo = []
+    # No Route column at all (the owner renamed it, or an old copy of the
+    # sheet)? Then there is nothing to cross-check against and every row would
+    # "disagree" with an empty string — an alert naming every Stellar package
+    # in the sheet, about a fault that is neither. Fall back to believing the
+    # source column on its own and say so once.
+    route_known = COL_ROUTE in idx
+    if not route_known:
+        log.warning(f"no {COL_ROUTE!r} column — supplier read from "
+                    f"{COL_SOURCE!r} alone, and nothing is cross-checked")
+    todo, mismatched = [], []
     for n, r in enumerate(rows[1:], start=2):
         if not cell(r, COL_ORDER):
             continue
         if cell(r, COL_STATUS) not in STILL_CHECK:
             continue                                  # finished — never again
+        if route_known:
+            source, verdict = decide_source(cell(r, COL_SOURCE), cell(r, COL_ROUTE))
+        else:
+            source, verdict = (
+                SRC_STELLAR if cell(r, COL_SOURCE).strip().lower() == SRC_STELLAR.lower()
+                else SRC_ESIMDOG), "ok"
+        if verdict == "mismatch":
+            # Skipped whole: see decide_source. The row keeps every figure it
+            # had until a person settles which of the two columns is wrong.
+            mismatched.append(cell(r, COL_ORDER))
+            continue
         todo.append({
             "row": n,
             "order_id": cell(r, COL_ORDER),
+            "source": source,
+            "heal_source": verdict == "heal",
             "iccid": re.sub(r"\D", "", cell(r, COL_ICCID)),
             "link": cell(r, COL_LINK),
             "qr": cell(r, COL_QR),
@@ -467,8 +567,32 @@ def main() -> int:
             "waverole": cell(r, COL_WAVEROLE),
             "activated": cell(r, COL_ACTIVATED),
         })
+    n_stellar = sum(1 for t in todo if t["source"] == SRC_STELLAR)
     log.info(f"{len(todo)} package(s) still being checked "
+             f"({n_stellar} of them Stellar) "
              f"(out of {len(rows) - 1} row(s) in the sheet)")
+    # ONE mail for the lot. A per-row alert here is the 47-email flood again
+    # (memory: stuck-claim-watchdog), and this is a data question, not an
+    # outage: nothing is broken, two columns simply disagree.
+    if mismatched:
+        log.warning(f"מקור vs Route mismatch on {len(mismatched)} row(s): "
+                    + ", ".join(mismatched[:MISMATCH_LIST]))
+        # The list is capped for the same reason the mail is one mail: a
+        # dropdown edited badly across a whole sheet would otherwise arrive as
+        # hundreds of order numbers, which nobody reads. The COUNT is the
+        # actionable part; the first few name where to start looking.
+        shown = mismatched[:MISMATCH_LIST]
+        extra = len(mismatched) - len(shown)
+        alert("מקור vs Route mismatch",
+              f"{len(mismatched)} receipts row(s) name one supplier in "
+              f"'{COL_SOURCE}' and another in '{COL_ROUTE}':\n\n"
+              + "\n".join(f"  · {o}" for o in shown)
+              + (f"\n  ... and {extra} more" if extra else "")
+              + "\n\nEach of those rows was SKIPPED this run — no usage, no "
+                "status, nothing retired — because asking the wrong supplier "
+                "about a package gets 'never heard of it', and this bot reads "
+                "that as 'finished'. Fix whichever column is wrong and they "
+                "rejoin the sweep on the next run (every 4 hours).")
     if not todo:
         return 0
 
@@ -476,7 +600,11 @@ def main() -> int:
     # Both from the supplier link and from the QR column, because rows written
     # before the columns were straightened out keep their order link there.
     # Anything we learn is written back, so a row is only ever repaired once.
-    repairs = [t for t in todo if not (t["iccid"] and t["plan_days"])
+    # esim.dog rows only: fetch_esim_details reads an esim.dog success page,
+    # and a Stellar row's link is a portal order page that has no ICCID on it
+    # at all (Stellar never issues one — stellar_buyer.site_payload).
+    repairs = [t for t in todo if t["source"] == SRC_ESIMDOG
+               and not (t["iccid"] and t["plan_days"])
                and (t["link"] or t["qr"])][:MAX_ICCID_LOOKUPS]
     for t in repairs:
         got = fetch_esim_details([u for u in (t["link"], t["qr"]) if u])
@@ -500,18 +628,78 @@ def main() -> int:
                 t["new_waverole"] = link
                 log.info(f"row {t['row']}: recovered the customer's page link")
 
-    # ── one supplier request per 50 packages ──
+    # ── ask each supplier in its own way ──
+    # esim.dog takes a LIST of ICCIDs, so a fleet is one request per 50.
+    # Stellar has no such endpoint and no ICCID: each package costs two calls,
+    # keyed by the portal link on its own row. Both answers land in the same
+    # write-back below, which knows nothing about who answered.
     usage = {}
-    known = [t["iccid"] for t in todo if t["iccid"]]
+    known = [t["iccid"] for t in todo if t["source"] == SRC_ESIMDOG and t["iccid"]]
     for i in range(0, len(known), USAGE_CHUNK):
         usage.update(fetch_usage(known[i:i + USAGE_CHUNK]))
-    log.info(f"the supplier reported on {len(usage)} of {len(known)} package(s)")
+    log.info(f"esim.dog reported on {len(usage)} of {len(known)} package(s)")
+
+    st_usage = stellar_usage.fetch_usage(
+        [t["link"] for t in todo if t["source"] == SRC_STELLAR and t["link"]])
 
     # ── decide, then write the sheet ONCE ──
     cells, site_items, counts = [], [], {ACTIVE: 0, USED_UP: 0, EXPIRED: 0}
-    skipped = 0
+    skipped = unmetered = 0
+
+    # ── self-heal the source column ──
+    # The migration of 'מקור - source' from a payment rail to a supplier name,
+    # done by the sweep itself: a blank and a legacy word both mean "nobody has
+    # stated which supplier this is", and the Route states it. This is its own
+    # pass, before anything can `continue` past it, so a row left unmetered
+    # below still learns which supplier it came from — that fact is not in
+    # doubt whatever the supplier did or did not answer.
+    if COL_SOURCE in idx:
+        healed = [t for t in todo if t.get("heal_source")]
+        for t in healed:
+            cells.append(gspread.Cell(t["row"], idx[COL_SOURCE] + 1, t["source"]))
+        if healed:
+            log.info(f"source column: {len(healed)} cell(s) (blank, or holding "
+                     "the old payment word) named from Route")
+
     for t in todo:
-        u = usage.get(t["iccid"]) if t["iccid"] else None
+        if t["source"] == SRC_STELLAR:
+            # THE RULE FOR THIS SUPPLIER: a Stellar row reaches decide_status
+            # only holding a real reading. Everything else that can come back
+            # here means one single thing — WE DID NOT MANAGE TO ASK:
+            #
+            #   · no portal link on the row (a Stellar package has no ICCID to
+            #     fall back on, so the link is the only way in)
+            #   · no STELLAR_API_KEY — the PC copy of this repo has none, by
+            #     design (memory: stellar-key-placement)
+            #   · a network error, a timeout, a 5xx, junk instead of JSON
+            #   · an order Stellar names no eSIM for
+            #   · an answer in a shape stellar_usage has never mapped
+            #
+            # stellar_usage reports the first five as None and the last as
+            # Unknown, but the DANGER is identical and only Unknown used to be
+            # caught. None fell through into decide_status(None, ...), which
+            # reads silence as "the supplier never heard of this eSIM" — a
+            # sound rule for esim.dog, where silence follows a real query, and
+            # a disaster here: plan_days + 1 day after the sale it RETIRES the
+            # package. A month-old Stellar order, on a run with no key or one
+            # dropped connection, would go 'הסתיים' with a frozen meter and
+            # nobody told. So neither None nor Unknown may pass: the row keeps
+            # every figure it had, is not pushed to the site, and is counted.
+            u = st_usage.get(t["link"]) if t["link"] else None
+            if not isinstance(u, dict):
+                unmetered += 1
+                if not t["link"]:
+                    log.warning(f"row {t['row']} ({t['order_id']}): a Stellar "
+                                "row with no portal link — left untouched")
+                else:
+                    log.info(f"row {t['row']} ({t['order_id']}): Stellar "
+                             + ("answered in an unrecognised shape"
+                                if isinstance(u, stellar_usage.Unknown)
+                                else "was not reached (no key, or the call failed)")
+                             + " — left untouched")
+                continue
+        else:
+            u = usage.get(t["iccid"]) if t["iccid"] else None
         # One package must never take the sweep down with it. A single
         # unreadable date from the supplier used to raise out of the whole
         # run, so NOBODY's meter was updated — the blast radius of one bad
@@ -578,25 +766,18 @@ def main() -> int:
         if n_sale:
             log.info(f"discount column: {n_sale} row(s) corrected")
 
-    # ── source: the one column no bot can honestly fill ──
-    # It records how WE paid the supplier. The purchase bot stamps the rows it
-    # creates; a package bought by hand never reaches that code, so the owner
-    # fills those. Guessing here would invent a payment method, so this only
-    # names the rows waiting on a person — deliberately a log line and not an
-    # alert, because a blank the owner has chosen to leave must not nag.
-    if COL_SOURCE in idx:
-        blank = [cell(r, COL_ORDER) for r in rows[1:]
-                 if cell(r, COL_ORDER) and not cell(r, COL_SOURCE)]
-        if blank:
-            log.info(f"source column: {len(blank)} row(s) still blank, for the "
-                     f"owner to fill — {', '.join(blank[:10])}"
-                     + (" ..." if len(blank) > 10 else ""))
-
+    if unmetered:
+        # One line, with the count first: this is the number that says how much
+        # of the Stellar fleet went unmeasured this run, and a run where it
+        # equals the whole fleet is a missing key, not a fleet of dead eSIMs.
+        log.info(f"{unmetered} Stellar row(s) unmetered: no key / error / "
+                 "unknown shape — every one of them left exactly as it was")
     if cells:
         ws.update_cells(cells, value_input_option="USER_ENTERED")
     log.info(f"sheet: {len(cells)} cell(s) updated · still active {counts[ACTIVE]} · "
              f"used up {counts[USED_UP]} · finished {counts[EXPIRED]}"
-             + (f" · SKIPPED {skipped}" if skipped else ""))
+             + (f" · SKIPPED {skipped}" if skipped else "")
+             + (f" · Stellar unmetered {unmetered}" if unmetered else ""))
     if skipped:
         alert("Usage bot skipped some packages",
               f"{skipped} of {len(todo)} package(s) could not be read this run "

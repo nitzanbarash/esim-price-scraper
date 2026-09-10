@@ -204,7 +204,17 @@ def read_receipts(gc: gspread.Client) -> list[dict]:
         # Optional. Add a column named e.g. "אמצעי תשלום" to the receipts
         # sheet and per-order fees start being counted from that instead of
         # the account-wide default.
-        "provider": find("אמצעי תשלום", "תשלום דרך", "provider", "payment"),
+        #
+        # 'רכישה - Purchase' (column U) is that column and has been all along:
+        # it names the RAIL the money came in on — 'paypal', 'bot - manually',
+        # 'icount'. Not being in this list is why every PayPal sale was booked
+        # with Bit's fee of exactly nothing, and PayPal takes 3.4%. The two
+        # hand rails are not payment providers at all, and FeeModel.provider
+        # answers for them the way it answers for any name it does not know:
+        # the account default (Bit, no fee). That is the right answer — an
+        # order settled by hand never went through a processor.
+        "provider": find("אמצעי תשלום", "תשלום דרך", "רכישה",
+                         "provider", "payment", "purchase"),
         "fee_actual": find("עמלה בפועל", "עמלת סליקה"),
     }
     required = [k for k, v in cols.items()

@@ -50,7 +50,6 @@ activation code, a delivery link, a customer address or a key. Order ids only.
 """
 from __future__ import annotations
 
-import dataclasses
 import logging
 import os
 import re
@@ -76,6 +75,16 @@ ROUTE_PREFIX = "Stellar "            # receipts Route: 'Stellar JC059'
 MAX_EUR = float(os.getenv("STELLAR_MAX_EUR", "25"))       # one order
 MAX_ORDERS_PER_RUN = int(os.getenv("STELLAR_MAX_PER_RUN", "5"))
 PRICE_TOL = 0.005        # a rounding cent over the sheet is not a price rise
+# How far the listing we are about to buy may sit ABOVE the euros the sheet
+# priced the row at before this bot refuses to buy. It is a MONEY-safety bar,
+# not the day rule: the sheet is refreshed on its own schedule, so a cell can
+# legitimately be a run behind the catalogue (a longer validity held for a few
+# cents, a supplier's own small move), and 5% is what the owner will absorb
+# without being asked. Past it the price ROSE, and the margin the customer was
+# quoted at is gone -- the order waits for a human instead. This used to be
+# spelled sp.LONGER_TOL, which read as though it were the validity tolerance;
+# the day rules now live in day_policy and have nothing to do with this number.
+PRICE_RISE_TOL = 0.05
 SETTLE_WAIT_S = int(os.getenv("STELLAR_SETTLE_WAIT_S", "90"))   # one run's patience
 POLL_EVERY_S = 10
 REPLAY_WAIT_S = float(os.getenv("STELLAR_REPLAY_WAIT_S", "3"))  # before re-asking the same key
@@ -131,7 +140,28 @@ H_ACT, H_SMDP, H_APN = "Activation Code", "SM-DP+ Address", "גישה - APN"
 H_LINK_SUP, H_LINK_WR = "Link - esim.dog", "Link - waverole"
 H_REGION, H_PLAN, H_ROUTE = "אזור - Region", "חבילה - Plan", "Route"
 H_STATUS, H_SOURCE = "סטטוס - Status", "מקור - source"
+H_PURCHASE = "רכישה - Purchase"
 H_BUY, H_SALE, H_SELL = "קנייה - Buy", "הנחה - Sale", "מכירה - Sell"
+
+# Two columns, two questions. They were one column until 2026-09-10, and the
+# one column answered the wrong one:
+#   'מקור - source'   WHO the package came from -- the SUPPLIER. This bot buys
+#                     from Stellar and only from Stellar, so it is a constant
+#                     here; the PC bot writes 'esim.dog' in the same cell.
+#   'רכישה - Purchase' HOW the customer paid US -- the rail, source_text().
+# The owner reconciles PayPal's deposits against 'רכישה', and asks 'מקור' which
+# supplier to chase when an eSIM misbehaves. Written into one cell, neither
+# question could be answered: every Stellar row said "paypal" about its
+# supplier and no row said anything at all about the rail.
+SUPPLIER_NAME = "Stellar"
+
+# Paid on a rail whose money is already in an account we can see. Those rows
+# get the Mail cell painted green, which is the mark the owner has always put
+# there by hand. 'manual' and 'bot - manually' are NOT here on purpose: they
+# are the rows whose money still has to be chased, and green is what says a
+# row needs no chasing.
+PAID_RAILS = {"paypal", "payme"}
+PAID_BG = {"red": 217 / 255, "green": 234 / 255, "blue": 211 / 255}   # #d9ead3
 
 TERMINAL_BAD = {"failed", "refunded"}
 NON_TERMINAL = {"processing", "vpn_processing"}
@@ -346,9 +376,18 @@ def append_row(ws, values: dict) -> int:
     """
     hdr = _hdr(ws)
     row = [""] * len(hdr)
+    unplaced = []
     for k, v in values.items():
-        if k in hdr and v not in (None, ""):
+        if v in (None, ""):
+            continue
+        if k in hdr:
             row[hdr.index(k)] = str(v)
+        else:
+            unplaced.append(k)
+    if unplaced:
+        # A renamed or not-yet-added column must not cost the purchase row --
+        # the row is the proof the money moved. It loses a cell and says so.
+        log.warning(f"receipts sheet has no column for {unplaced} -- values skipped")
     stamp, col = str(values.get(H_ORDER) or ""), hdr.index(H_ORDER)
     for last in (False, True):
         n = len(ws.get_all_values()) + 1
@@ -361,6 +400,44 @@ def append_row(ws, values: dict) -> int:
             return n
         log.warning(f"receipts row {n} was taken by another writer -- appending again")
     return n
+
+
+def mail_cell(ws, n: int) -> str:
+    """The A1 address of row n's Mail cell, found by HEADER NAME.
+
+    Every other read and write in this file finds its column by header text
+    because the owner reorders the receipts columns (memory: receipts-sheet) --
+    this one used to be the exception, hard-coded A{n}. The day 'מייל - Mail'
+    stops being first, that paints the green "no money to chase" mark onto
+    whatever column moved into A instead. Column A is the fallback only when
+    the header is genuinely absent, and reading the header is best-effort like
+    the paint itself: a failure here must not cost a purchase.
+    """
+    try:
+        hdr = _hdr(ws)
+        if H_MAIL in hdr:
+            return f"{sp.col_letter(hdr.index(H_MAIL))}{n}"
+    except Exception as e:                                  # noqa: BLE001
+        log.warning(f"could not read the receipts header to place the paint: {e}")
+    return f"A{n}"
+
+
+def paint_paid(ws, n: int, rail: str) -> bool:
+    """Green the Mail cell of a row the customer paid on a real rail.
+
+    Best-effort by contract: the row is the receipt, the colour is a
+    convenience, and a Sheets formatting call that fails (quota, a gspread
+    without .format, a permissions edge) must never turn a bought package
+    into a failed buy. Returns whether it painted, for the tests.
+    """
+    if (rail or "").strip().lower() not in PAID_RAILS or n < 2:
+        return False
+    try:
+        ws.format(mail_cell(ws, n), {"backgroundColor": PAID_BG})
+        return True
+    except Exception as e:                                  # noqa: BLE001
+        log.warning(f"could not paint receipts row {n} green: {e}")
+        return False
 
 
 def update_row(ws, n: int, values: dict):
@@ -443,8 +520,12 @@ def promised_days(order: dict) -> int:
 
 
 def choose(cat: sp.Catalogue, row: sp.StellarRow, order: dict) -> sp.Variant:
-    floor = max(row.floor_days or 0, promised_days(order))
-    d = sp.decide(cat, dataclasses.replace(row, floor_days=floor))
+    # The size's own day band is day_policy's business and decide() applies it;
+    # what this bot adds is the promise in the order token, which can only make
+    # the floor longer. Never fewer days than the customer was shown.
+    promised = promised_days(order)
+    floor = max(row.floor_days or 0, promised)
+    d = sp.decide(cat, row, min_days=promised)
     if d is None:
         raise Refused(f"sheet row {row.row} ({row.sku}) has no code or size")
     if d.pick is None:
@@ -455,11 +536,11 @@ def choose(cat: sp.Catalogue, row: sp.StellarRow, order: dict) -> sp.Variant:
         raise Refused(f"{row.sku}: listing has no plan id (feed instead of API?)")
     if row.eur is None:
         raise Refused(f"{row.sku}: sheet row carries no wholesale price")
-    # The chooser may hold a LONGER listing for up to LONGER_TOL over the
-    # cheapest (memory: validity-beats-pennies), and the sheet's cell can be
-    # a day behind that choice -- the same tolerance is allowed here. Past it
-    # the price ROSE since the row was priced, and that is refused, not absorbed.
-    if v.wholesale_eur > row.eur * (1 + sp.LONGER_TOL) + PRICE_TOL:
+    # The sheet's cell can be a run behind the catalogue -- the chooser holds a
+    # longer listing for a few cents (memory: validity-beats-pennies) and the
+    # row is repriced later. PRICE_RISE_TOL is how much of that gap is absorbed;
+    # past it the price ROSE since the row was priced, and that is refused.
+    if v.wholesale_eur > row.eur * (1 + PRICE_RISE_TOL) + PRICE_TOL:
         raise Refused(f"{row.sku}: price rose EUR {row.eur:.2f} -> {v.wholesale_eur:.2f} "
                       f"since the sheet was priced -- not absorbing it")
     if v.wholesale_eur > MAX_EUR:
@@ -651,7 +732,8 @@ class Run:
                 H_SKU: row.sku, H_GB: f"{v.gb:g}GB", H_USAGE: f"0 / {v.gb:g}", H_ORDER: oid,
                 H_LINK_WR: o.get("order_url") or "", H_ROUTE: f"{ROUTE_PREFIX}{row.code}",
                 H_REGION: region, H_PLAN: f"{v.gb:g}GB - {v.days} days — {networks}".rstrip(" —"),
-                H_SOURCE: source_text(o.get("source") or ""),
+                H_SOURCE: SUPPLIER_NAME,
+                H_PURCHASE: source_text(o.get("source") or ""),
                 H_BUY: f"{v.wholesale_eur * fx_of(row):.2f}$",
                 H_SELL: (f"{float(o['paid_usd']):.2f}$" if o.get("paid_usd") not in (None, "") else ""),
                 H_SALE: discount_text(o.get("list_usd"), o.get("paid_usd"))}
@@ -660,6 +742,7 @@ class Run:
             sid = str(data["id"])
             n = append_row(self.ws, {**base, H_LINK_SUP: PORTAL_ORDER.format(id=sid),
                                      H_STATUS: ST_PROCESSING})
+            paint_paid(self.ws, n, (o.get("source") or ""))
             log.info(f"{oid}: Stellar order {sid} placed ({v.gb:g}GB/{v.days}d), row {n}")
             return n, sid
         if code == 402:
@@ -672,6 +755,7 @@ class Run:
             # the review row is what stops the next run from doing so.
             n = append_row(self.ws, {**base, H_LINK_SUP: "https://wholesale.stellarsecurity.com/orders",
                                      H_STATUS: ST_REVIEW})
+            paint_paid(self.ws, n, (o.get("source") or ""))
             alert_now(f"{oid} needs a look: idempotency conflict",
                       f"Stellar already holds an order under key {idem} but answered 409 to a replay. "
                       f"Find it in the portal, deliver by hand or settle, then clear row {n} of the receipts sheet.")
@@ -726,6 +810,7 @@ class Run:
         # settles it from the portal.
         n = append_row(self.ws, {**base, H_LINK_SUP: "https://wholesale.stellarsecurity.com/orders",
                                  H_STATUS: ST_REVIEW})
+        paint_paid(self.ws, n, (o.get("source") or ""))
         alert_now(f"{oid} needs a look: Stellar would not say what it did",
                   f"Stellar: {msg}\n\nThe order for {oid} ({sku}, {v.gb:g}GB/{v.days}d, "
                   f"EUR {v.wholesale_eur:.2f}) may or may not exist under key {idem} -- the first "

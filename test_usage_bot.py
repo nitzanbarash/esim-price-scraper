@@ -590,6 +590,383 @@ check("column letters", [usage_bot._a1_col(i) for i in (0, 18, 25, 26, 27)],
       ["A", "S", "Z", "AA", "AB"])
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Two suppliers in one sweep
+#
+# The danger is asymmetric and worth naming. Reading a Stellar package WRONG
+# gives a customer a wrong meter. Failing to read one, and letting that count
+# as "the supplier never heard of it", RETIRES a package the customer is still
+# using — the meter freezes, the order page says finished, and nobody is told.
+# So every test below is really the same test: an answer we do not understand
+# must leave the row exactly as it was.
+# ═════════════════════════════════════════════════════════════════════════════
+
+import stellar_usage
+from stellar_usage import Unknown, map_usage, to_gb
+
+print("\n-- which supplier a row belongs to --")
+check("Route proves Stellar",
+      usage_bot.decide_source("Stellar", "Stellar JC059"), ("Stellar", "ok"))
+check("Route proves esim.dog",
+      usage_bot.decide_source("esim.dog", "Cellcom"), ("esim.dog", "ok"))
+check("no Route at all is an esim.dog row",
+      usage_bot.decide_source("esim.dog", ""), ("esim.dog", "ok"))
+# The column is being back-filled by hand right now: most rows are still blank.
+check("blank source is healed from Route (Stellar)",
+      usage_bot.decide_source("", "Stellar JC059"), ("Stellar", "heal"))
+check("blank source is healed from Route (esim.dog)",
+      usage_bot.decide_source("", "Pelephone"), ("esim.dog", "heal"))
+check("blank source, blank Route: esim.dog, the only supplier we had",
+      usage_bot.decide_source("", ""), ("esim.dog", "heal"))
+check("a row typed before the dropdown existed still agrees",
+      usage_bot.decide_source("  ESIM.DOG  ", "Cellcom"), ("esim.dog", "ok"))
+# The mis-click. Neither column is believed — asking esim.dog about a Stellar
+# package gets silence, and silence retires the package.
+check("source says esim.dog, Route says Stellar",
+      usage_bot.decide_source("esim.dog", "Stellar JC059"), ("Stellar", "mismatch"))
+check("source says Stellar, Route says otherwise",
+      usage_bot.decide_source("Stellar", "Cellcom"), ("esim.dog", "mismatch"))
+check("'Stellarium' is not the prefix",
+      usage_bot.decide_source("esim.dog", "Stellarium")[1], "mismatch")
+
+# Until today this column held the payment RAIL. Hundreds of rows still do.
+# Such a word names no supplier, so it cannot disagree with one: it is an
+# un-migrated row, healed from Route exactly like a blank. Read as a mismatch
+# it would have skipped — and mailed — every package sold before 2026-09-10.
+for legacy in ("bot - manually", "PayPal", "payme", "iCount", "Manual",
+               "  BOT  -  MANUALLY  "):
+    check(f"legacy payment word {legacy!r} is healed, not a mismatch",
+          usage_bot.decide_source(legacy, "Cellcom"), ("esim.dog", "heal"))
+check("a legacy word on a Stellar row is healed to Stellar",
+      usage_bot.decide_source("paypal", "Stellar JC059"), ("Stellar", "heal"))
+check("a supplier name that disagrees is still a mismatch",
+      usage_bot.decide_source("esim.dog", "Stellar JC059")[1], "mismatch")
+
+print("\n-- units: the megabyte/byte trap --")
+# 'megabytes' contains the letters of 'bytes'. Read as bytes, a 5GB package is
+# 5 millionths of a gigabyte — instantly "used up", instantly retired.
+check("megabytes", to_gb(5120, "data.megabytes"), 5.0)
+check("used_mb", to_gb(1024, "used_mb"), 1.0)
+check("used_bytes", to_gb(3 * GB, "usage.used_bytes"), 3.0)
+check("total_gb stays as it is", to_gb(5, "total_gb"), 5.0)
+check("a key naming no unit is megabytes", to_gb(2048, "data_used"), 2.0)
+
+print("\n-- the mapper: two shapes it knows --")
+SHAPE_MB = {
+    "sim_id": "sim_a", "status": "active",
+    "data": {"megabytes": 5120},
+    "data_used": 1024,
+    "expires_at": "2026-10-01T09:00:00+0000",
+    "installation": {"activation_code": "LPA:1$smdp.example$SECRET"},
+}
+got = map_usage(SHAPE_MB)
+check("megabyte shape reads", isinstance(got, dict), True)
+check("used", got["used_gb"], 1.0)
+check("total", got["total_gb"], 5.0)
+check("expiry", got["expires"], "2026-10-01T09:00:00+0000")
+check("status", got["status"], "active")
+
+SHAPE_BYTES = {
+    "sim_id": "sim_b", "esim_status": "expired",
+    "usage": {"used_bytes": 3 * GB, "total_bytes": 5 * GB},
+    "expiry_date": "2026-09-01T00:00:00Z",
+}
+got = map_usage(SHAPE_BYTES)
+check("byte shape reads", isinstance(got, dict), True)
+check("used", got["used_gb"], 3.0)
+check("total", got["total_gb"], 5.0)
+check("expiry", got["expires"], "2026-09-01T00:00:00Z")
+check("status", got["status"], "expired")
+
+# Straight through decide_status, which is the only reason any of this is read.
+check("a spent Stellar package retires",
+      decide_status(map_usage({"data": {"megabytes": 1024}, "data_used": 1024}),
+                    None, 30, now=NOW), USED_UP)
+check("a half-used one keeps being checked",
+      decide_status(map_usage(SHAPE_MB), None, 30,
+                    now=datetime(2026, 9, 10, tzinfo=timezone.utc)), ACTIVE)
+
+print("\n-- the mapper: a shape it does NOT know --")
+# The real /esims payload before an order has moved any data — this is what
+# stellar_buyer sees today, and it says nothing about consumption.
+SHAPE_UNKNOWN = {"sim_id": "sim_c", "plan_id": "p1",
+                 "installation": {"activation_code": "LPA:1$x$y", "apn": "internet"}}
+got = map_usage(SHAPE_UNKNOWN)
+check("unknown shape is Unknown, not a reading", isinstance(got, Unknown), True)
+check("and it hands back the key NAMES to fix it with", got.keys,
+      ["installation", "installation.activation_code", "installation.apn",
+       "plan_id", "sim_id"])
+check("an Unknown is never mistaken for a reading", isinstance(got, dict), False)
+check("half a shape is still unknown",
+      isinstance(map_usage({"data_used": 500}), Unknown), True)
+check("a size of zero is not a reading (it would retire a live package)",
+      isinstance(map_usage({"data": {"megabytes": 0}, "data_used": 0}), Unknown), True)
+
+# Money is not consumption. An invoice line called 'total_mb' outranks
+# 'megabytes' by name alone, and a meter measured in euros is worse than none.
+PRICED = {"price": {"total_mb": 99, "used_mb": 12},
+          "data": {"megabytes": 2048}, "data_used": 512}
+got = map_usage(PRICED)
+check("the priced fields are ignored", (got["used_gb"], got["total_gb"]), (0.5, 2.0))
+
+# The envelope. An eSIM carries its OWN 'data' block, so unwrapping every dict
+# with a 'data' key would throw the whole payload away.
+check("the {data: ...} envelope is unwrapped",
+      map_usage({"data": {"sim_id": "s", "data": {"megabytes": 1024},
+                          "data_used": 512}})["total_gb"], 1.0)
+check("an eSIM's own data block is NOT unwrapped",
+      map_usage(SHAPE_MB)["total_gb"], 5.0)
+
+print("\n-- the portal link on the row --")
+for raw, want in [
+    ("https://wholesale.stellarsecurity.com/orders/71fa53ce-6dad", "71fa53ce-6dad"),
+    ("https://wholesale.stellarsecurity.com/orders/71fa53ce-6dad/", "71fa53ce-6dad"),
+    ("https://wholesale.stellarsecurity.com/orders/71fa/?tab=esims", "71fa"),
+    ("https://wholesale.stellarsecurity.com/orders/71fa#top", "71fa"),
+    ("71fa53ce-6dad-435f", "71fa53ce-6dad-435f"),
+    ("", ""), ("https://esim.dog/success?session_id=abc", ""),
+]:
+    check(f"order id from {raw!r}", stellar_usage.order_id_from_url(raw), want)
+
+print("\n-- nothing Stellar does may reach the sweep as an exception --")
+URL = "https://wholesale.stellarsecurity.com/orders/o1"
+
+
+class _Resp:
+    def __init__(self, body, code=200):
+        self._b, self.status_code = body, code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._b
+
+
+class _Session:
+    """Just enough of requests.Session, so the module's own auth header code
+    runs. The key never leaves this object."""
+
+    def __init__(self, handler):
+        self.headers, self.get = {}, handler
+
+
+check_no_raise("the whole call dies", lambda: stellar_usage.fetch_usage(
+    [URL], session=_Session(mock.Mock(side_effect=OSError("no route to host"))), key="k"))
+check("a dead network is None, never a reading",
+      stellar_usage.fetch_usage(
+          [URL], session=_Session(mock.Mock(side_effect=OSError("boom"))), key="k"),
+      {URL: None})
+check("a 500 on the order is None",
+      stellar_usage.fetch_usage(
+          [URL], session=_Session(lambda u, **k: _Resp({}, 502)), key="k"),
+      {URL: None})
+check("junk instead of JSON is None, not a crash",
+      stellar_usage.fetch_usage(
+          [URL], session=_Session(lambda u, **k: _Resp("<html>maintenance</html>")),
+          key="k"),
+      {URL: None})
+
+
+def _two_step(order_body, esim_body, esim_code=200):
+    def get(url, **kw):
+        if "/orders/" in url:
+            return _Resp({"data": order_body})
+        return _Resp({"data": esim_body}, esim_code)
+    return _Session(get)
+
+
+check("a Stellar package is read end to end",
+      stellar_usage.fetch_usage(
+          [URL], session=_two_step({"esims": [{"sim_id": "sim_a"}]}, SHAPE_MB),
+          key="k")[URL]["total_gb"], 5.0)
+check("an order Stellar names no eSIM for is None",
+      stellar_usage.fetch_usage([URL], session=_two_step({"esims": []}, {}),
+                                key="k"), {URL: None})
+check("a 500 on the eSIM leaves the row untouched, not retired",
+      stellar_usage.fetch_usage(
+          [URL], session=_two_step({"esims": [{"sim_id": "s"}]}, {}, 500),
+          key="k"), {URL: None})
+res = stellar_usage.fetch_usage(
+    [URL], session=_two_step({"esims": [{"sim_id": "sim_c"}]}, SHAPE_UNKNOWN),
+    key="k")[URL]
+check("an unreadable shape comes back as Unknown", isinstance(res, Unknown), True)
+# The PC copy of this repo has no Stellar key, on purpose (memory:
+# stellar-key-placement). That is a quiet no-op, not a failure.
+with mock.patch.dict(os.environ, {"STELLAR_API_KEY": ""}):
+    check("no key: every row untouched, nothing raised",
+          stellar_usage.fetch_usage([URL]), {URL: None})
+check("nothing asked, nothing answered", stellar_usage.fetch_usage([]), {})
+
+
+print("\n-- one sweep, two suppliers: what actually lands in the sheet --")
+
+U_HEAD = ["תאריך - Date", 'מק"ט - SUK', "מס׳ הזמנה", "מס סידורי -ICCID", "QR",
+          "Link - esim.dog", "Link - waverole", "חבילה - Plan", "Route",
+          "סטטוס - Status", "GB (0/X) - ניצול", "מקור - source",
+          "הופעל - Activated", "הנחה - Sale", "מכירה - Sell"]
+UC = {name: i for i, name in enumerate(U_HEAD)}
+O2 = "https://wholesale.stellarsecurity.com/orders/o2"
+O3 = "https://wholesale.stellarsecurity.com/orders/o3"
+O4 = "https://wholesale.stellarsecurity.com/orders/o4"
+
+
+OLD_DATE = (datetime.now(timezone.utc) - timedelta(days=35)).strftime("%d/%m/%Y %H:%M")
+
+
+def u_row(order, iccid="", link="", route="", source="", date="01/09/2026 10:00",
+          status=""):
+    r = [""] * len(U_HEAD)
+    r[UC["תאריך - Date"]] = date
+    r[UC["סטטוס - Status"]] = status
+    r[UC['מק"ט - SUK']] = "2.49.10"
+    r[UC["מס׳ הזמנה"]] = order
+    r[UC["מס סידורי -ICCID"]] = iccid
+    r[UC["Link - esim.dog"]] = link
+    r[UC["Link - waverole"]] = "https://www.waverole.com/o/" + order
+    r[UC["חבילה - Plan"]] = "5GB - 30 days"
+    r[UC["Route"]] = route
+    r[UC["מקור - source"]] = source
+    r[UC["הופעל - Activated"]] = "no"
+    r[UC["הנחה - Sale"]] = "-"
+    r[UC["מכירה - Sell"]] = "6.99"
+    return r
+
+
+U_ROWS = [
+    U_HEAD,
+    u_row("WR-1", iccid="8972011", link="https://esim.dog/x", route="Cellcom",
+          source="esim.dog"),                                   # row 2
+    u_row("WR-2", link=O2, route="Stellar JC059", source="Stellar"),   # row 3
+    u_row("WR-3", link=O3, route="Stellar JC060", source=""),          # row 4
+    u_row("WR-4", link="", route="Stellar JC061", source="esim.dog"),  # row 5
+    u_row("WR-5", link="", route="Stellar JC062", source="Stellar"),   # row 6
+    # The one that used to go dark. A live 30-day package sold 35 days ago,
+    # still running, on a run where Stellar could not be reached at all — no
+    # key, a timeout, a 502, an order it names no eSIM for. All of those are a
+    # per-row None, and None used to fall into decide_status, whose "the
+    # supplier never heard of it" timer expired four days ago.
+    u_row("WR-6", link=O4, route="Stellar JC063", source="Stellar",
+          date=OLD_DATE, status=usage_bot.ACTIVE),                     # row 7
+    # An un-migrated row: 'מקור' still holds the payment rail it held for a
+    # year. Not a mismatch — a row waiting to be told which supplier it is.
+    u_row("WR-7", iccid="8972099", link="https://esim.dog/y", route="Pelephone",
+          source="bot - manually"),                                    # row 8
+]
+
+
+class _WS:
+    def __init__(self, rows):
+        self._rows, self.written, self.id = rows, [], 0
+        self.sheet1, self.spreadsheet = self, mock.MagicMock()
+
+    def open_by_key(self, key):
+        return self
+
+    def get_all_values(self):
+        return self._rows
+
+    def update_cells(self, cells, **kw):
+        self.written.extend(cells)
+
+
+ws = _WS(U_ROWS)
+alerts, pushed = [], []
+with mock.patch.object(usage_bot, "sheet_client", lambda: ws), \
+     mock.patch.object(usage_bot, "ensure_status_colours", lambda *a: None), \
+     mock.patch.object(usage_bot, "list_prices", dict), \
+     mock.patch.object(usage_bot, "push_to_site",
+                       lambda items: pushed.extend(items) or len(items)), \
+     mock.patch.object(usage_bot, "alert", lambda su, bo: alerts.append((su, bo))), \
+     mock.patch.object(usage_bot, "fetch_usage", lambda ic: {
+         "8972011": {"used_gb": 0.5, "total_gb": 5.0, "expires": "", "status": ""},
+         "8972099": {"used_gb": 2.0, "total_gb": 5.0, "expires": "", "status": ""}}), \
+     mock.patch.object(usage_bot.stellar_usage, "fetch_usage", lambda urls: {
+         O2: Unknown(keys=["installation.activation_code", "sim_id"]),
+         O3: {"used_gb": 1.0, "total_gb": 5.0, "expires": "", "status": ""},
+         O4: None}):
+    rc = usage_bot.main()
+
+written = {(c.row, c.col): c.value for c in ws.written}
+check("the run finished", rc, 0)
+
+# The mismatch: one mail, not one per row, and the row itself is untouched.
+check("exactly one alert", len(alerts), 1)
+check("and it names the two columns", "מקור vs Route" in alerts[0][0], True)
+check("naming the order", "WR-4" in alerts[0][1], True)
+check("the mismatched row is not written to",
+      [k for k in written if k[0] == 5], [])
+
+# The Unknown row. THIS is the one that matters: not retired, not metered,
+# not stamped — a live package Stellar described in words we do not know yet.
+check("the unreadable Stellar row is not written to",
+      [k for k in written if k[0] == 3], [])
+check("and its customer's meter is not touched either",
+      [i for i in pushed if i["order_id"] == "WR-2"], [])
+
+# The readable one, whose source column was blank and is now filled from Route.
+check("the blank source cell is healed",
+      written.get((4, UC["מקור - source"] + 1)), "Stellar")
+check("its meter is written", written.get((4, UC["GB (0/X) - ניצול"] + 1)), "1 / 5")
+check("it is still running", written.get((4, UC["סטטוס - Status"] + 1)),
+      usage_bot.ACTIVE)
+check("and the customer's page is told",
+      [i["used_gb"] for i in pushed if i["order_id"] == "WR-3"], [1.0])
+
+# No portal link, and no ICCID exists for a Stellar package. "We cannot ask"
+# is not "it is finished": the row keeps its place in the sweep.
+check("a Stellar row with no link is not written to",
+      [k for k in written if k[0] == 6], [])
+
+# The unreachable Stellar row, 35 days into a 30-day package. Nothing is
+# written to it AT ALL — and the status it keeps is the live one.
+check("a Stellar row Stellar did not answer for is not written to",
+      [k for k in written if k[0] == 7], [])
+check("so it is still running, four days past a timer that never applied to it",
+      written.get((7, UC["סטטוס - Status"] + 1), U_ROWS[6][UC["סטטוס - Status"]]),
+      usage_bot.ACTIVE)
+check("and its meter is not touched either",
+      [i for i in pushed if i["order_id"] == "WR-6"], [])
+
+# The un-migrated row: healed to the supplier its Route proves, and metered
+# normally in the same run.
+check("the payment word is replaced by the supplier",
+      written.get((8, UC["מקור - source"] + 1)), "esim.dog")
+check("and the row was swept, not skipped",
+      written.get((8, UC["GB (0/X) - ניצול"] + 1)), "2 / 5")
+check("still exactly one alert — a legacy word is not a fault", len(alerts), 1)
+
+# esim.dog is unaffected by any of it.
+check("the esim.dog row still reads normally",
+      written.get((2, UC["GB (0/X) - ניצול"] + 1)), "0.5 / 5")
+check("activation followed the data",
+      written.get((2, UC["הופעל - Activated"] + 1)), "Activated")
+
+
+print("\n-- a mis-edited dropdown must not arrive as a wall of order numbers --")
+# One bad drag down the 'מקור' column mismatches the whole sheet. The COUNT is
+# what a person acts on; a mail naming 300 orders is a mail nobody opens.
+MANY = [U_HEAD] + [u_row(f"WR-M{i}", link=O2, route="Stellar JC0%02d" % i,
+                         source="esim.dog") for i in range(33)]
+ws2 = _WS(MANY)
+alerts2 = []
+with mock.patch.object(usage_bot, "sheet_client", lambda: ws2), \
+     mock.patch.object(usage_bot, "ensure_status_colours", lambda *a: None), \
+     mock.patch.object(usage_bot, "list_prices", dict), \
+     mock.patch.object(usage_bot, "push_to_site", lambda items: 0), \
+     mock.patch.object(usage_bot, "alert", lambda su, bo: alerts2.append((su, bo))), \
+     mock.patch.object(usage_bot, "fetch_usage", lambda ic: {}), \
+     mock.patch.object(usage_bot.stellar_usage, "fetch_usage", lambda urls: {}):
+    check("the run finished", usage_bot.main(), 0)
+body = alerts2[0][1]
+check("one mail for the lot", len(alerts2), 1)
+check("it states the true count", "33 receipts row(s)" in body, True)
+check("but names at most 20", body.count("  · WR-M"), 20)
+check("and says how many it did not name", "and 13 more" in body, True)
+check("nothing was written to any of them", ws2.written, [])
+
+
 if _fails:
     print(f"{len(_fails)} FAILED: " + ", ".join(_fails))
     sys.exit(1)

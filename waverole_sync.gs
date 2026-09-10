@@ -37,6 +37,15 @@
  *  3. In the editor pick `setupTriggers` in the function dropdown -> Run >
  *     -> authorize when prompted. Done.
  *
+ * Install / re-install, every time (the short version):
+ *     paste over Code.gs -> run setupTriggers -> authorize
+ *
+ * AFTER EVERY PASTE, RUN setupTriggers ONCE. Pasting only replaces the
+ * code; the triggers are separate objects and an older paste's triggers
+ * keep firing the old handlers (or none at all, if a handler was renamed).
+ * setupTriggers deletes every trigger this project owns and installs the
+ * current set, so running it is what makes the paste take effect.
+ *
  * Manual actions (function dropdown -> Run >):
  *   previewLog     - log the exact JSON that would be sent (dry run)
  *   fullSync       - push all packages to the site now
@@ -73,6 +82,8 @@ const HEADERS = {
   my_price:    ['\u05de\u05d7\u05d9\u05e8 \u05e9\u05dc\u05d9'],                // what actually lands, after the real cut
   price:       ['\u05de\u05d7\u05d9\u05e8 \u05e1\u05d5\u05e4\u05d9', '\u05db\u05d5\u05dc\u05dc \u05de\u05e2\u05de'],    // FINAL customer price (incl. VAT + fee)
   sale:        ['\u05de\u05d1\u05e2\u05e6\u05e2\u05d9\u05dd (\u05d0\u05d7\u05d5\u05d6\u05d9\u05dd)'],         // empty/0 cancels the sale
+  buy:         ['\u05de\u05d7\u05d9\u05e8 \u05e7\u05e0\u05d9\u05d9\u05d4'],               // what the SUPPLIER charges us (scraper writes it)
+  profit:      ['\u05e8\u05d5\u05d5\u05d7 (\u05db\u05d3\u05d0\u05d9\u05d5\u05ea)'],           // derived: net minus buy, in $ and %
 };
 // Fields the sync cannot work without - missing => loud email, not silence.
 const REQUIRED_FIELDS = ['sku', 'price'];
@@ -113,39 +124,238 @@ function realFee_(price) {
   return Math.round((price * REAL_FEE_RATE + REAL_FEE_FIXED) * 100) / 100;
 }
 
-// Final price typed -> ladder fee and real net follow.
+// -- profitability, the same arithmetic the scraper does --------------
 //
-// Runs on any edit that touches the final-price column, one row or a pasted
-// block. Clearing the price clears both derived cells: a row with no sell
-// price is not for sale, and a stale net beside an empty price reads as one.
-// Programmatic writes do not fire onEdit, so writing these two cells here
-// cannot re-enter.
+// The scraper writes this pair (profit text + the unprofitable marker) every
+// morning off the fresh buy price. When the OWNER types a new sell price the
+// buy price has not moved, but the profit has - so the same two cells have to
+// follow the edit, or the sheet shows a profit computed against a price that
+// is no longer on the row. Mirrors esim_price_scraper.py's profitability
+// check, floor included.
+const PROFIT_MIN_PCT     = 20;    // a package has to clear 20% ...
+const PROFIT_MIN_PCT_1GB = -20;   // ... except 1GB, the loss leader
+const UNPROFITABLE = '\u05dc\u05d0 \u05e8\u05d5\u05d5\u05d7\u05d9';
+
+function profitFloorPct_(gb) {
+  return (gb !== null && gb <= 1) ? PROFIT_MIN_PCT_1GB : PROFIT_MIN_PCT;
+}
+
+// The buy-price cell is written by the scraper as text and can carry more
+// than one figure (a shekel figure beside the dollar one, and in an RTL row
+// they render in either order). The dollar amount is the one we paid, so it
+// is read by its '$' and never by position; a bare number is accepted only
+// when the cell holds nothing else, so "12.90 NIS" can never pass as $12.90.
+//
+// ANCHORED, and that is the point. The scraper writes the pair as
+// '$0.56 (\u20ac0.48)' - dollars first - but the sheet is right-to-left, so the
+// same cell can arrive as '\u20ac0.48 ($0.56)' with the euro leading. A floating
+// /\$.../ search reads the dollar figure out of EITHER, which sounds helpful
+// and is not: it means a cell whose leading, authoritative amount is not
+// dollars still yields a dollar number, and the profit column is then computed
+// against a price we never paid. Only a cell that OPENS with '$' (after
+// whitespace or the invisible bidi marks Sheets sprinkles into RTL text) is a
+// dollar price. Same rule, same character class, as choose_supplier.py's usd().
+const BIDI_ = '[\\s\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069]*';
+const USD_RE_   = new RegExp('^' + BIDI_ + '\\$\\s*(\\d[\\d,]*(?:\\.\\d+)?)');
+const BARE_RE_  = new RegExp('^' + BIDI_ + '(\\d[\\d,]*(?:\\.\\d+)?)' + BIDI_ + '$');
+
+function firstDollar_(v) {
+  const s = String(v === null || v === undefined ? '' : v);
+  const m = USD_RE_.exec(s) || BARE_RE_.exec(s);
+  if (!m) return null;
+  const n = parseFloat(m[1].replace(/,/g, ''));
+  return isNaN(n) ? null : n;
+}
+
+// The leading emoji is not decoration: it stops Sheets parsing "+$0.03 (..."
+// as a formula, and it is how the owner reads the column at a glance.
+function profitText_(net, buy) {
+  const abs = net - buy;
+  const pct = (abs / buy) * 100;
+  return {
+    pct: pct,
+    text: (abs >= 0 ? '\ud83d\udfe2 +' : '\ud83d\udd34 -') + '$' + Math.abs(abs).toFixed(2) +
+          ' (' + (pct >= 0 ? '+' : '-') + Math.abs(pct).toFixed(1) + '%)'
+  };
+}
+
+// One setValues per group of neighbouring cells, instead of one call per cell.
+//
+// The catch is column R, '<---- ' + do-not-touch: it sits between Q and S, so
+// the derived cells fall into TWO blocks, P..Q and S..V, and they are written
+// by two separate calls on purpose. A single block from P to V would cover R
+// and overwrite it on every edit - value-preserving or not, that column is
+// spoken for.
+//
+// Inside a block, a cell we are not changing is written back with the value
+// already in it; that write-back is what lets four cells go out in one call.
+// The block is skipped entirely when nothing in it actually differs.
+//
+// The contiguity check is the safety rail: if a group's own columns ever stop
+// being adjacent (a header moved, a column was inserted), the span would cover
+// somebody else's column, so that case drops back to one write per changed
+// cell rather than writing back a cell we do not own - which would destroy a
+// formula living there.
+function writeGroup_(sheet, row, dataRow, cols, want) {
+  const owned = cols.filter(function (c) { return c !== undefined; });
+  if (!owned.length) return;
+  const differs = function (c) {
+    return Object.prototype.hasOwnProperty.call(want, c) && dataRow[c] !== want[c];
+  };
+  if (!owned.some(differs)) return;                    // nothing to write
+  const lo = Math.min.apply(null, owned);
+  const hi = Math.max.apply(null, owned);
+  if (hi - lo + 1 !== owned.length) {                  // not adjacent - per cell
+    owned.forEach(function (c) {
+      if (differs(c)) sheet.getRange(row, c + 1).setValue(want[c]);
+    });
+    return;
+  }
+  const out = [];
+  for (let c = lo; c <= hi; c++) {
+    out.push(Object.prototype.hasOwnProperty.call(want, c) ? want[c] : dataRow[c]);
+  }
+  sheet.getRange(row, lo + 1, 1, out.length).setValues([out]);
+}
+
+// Final price typed -> ladder fee, real net, profit and the twin rows follow.
+//
+// Runs on any edit that touches the final-price column OR the sale-percentage
+// column, one row or a pasted block. Clearing the price clears every derived
+// cell: a row with no sell price is not for sale, and a stale net beside an
+// empty price reads as one. Programmatic writes do not fire onEdit, so writing
+// these cells here cannot re-enter.
+//
+// TWINS: one SKU can occupy several rows - one per supplier - but there is
+// only ONE customer price for a package; which supplier we buy from is our
+// business and never changes what the buyer pays. So the typed price, its
+// sale percentage and the two derived fee cells are copied to every row that
+// carries the same SKU. Before this, pricing a package meant typing the same
+// number twice, and a tick moved to the other supplier's row could publish
+// the price the owner had NOT updated.
+//
+// A SALE-ONLY edit counts. V is a column the owner edits on its own all the
+// time - a discount goes on, a discount comes off, the price itself does not
+// move - and while this function only watched U, that edit reached the twin
+// rows never. The site then sold the same package at two different discounts
+// depending on which supplier row carried the tick. So V alone fires it too,
+// and propagates V alone: with U untouched the fee, the net and the profit
+// are all still correct, and recomputing them would only invite a rounding
+// difference against what the scraper wrote this morning.
+//
+// The whole sheet is read once (A .. last mapped column) rather than the
+// edited block alone, because a twin can sit anywhere; the writes are per row
+// and per block, and only where a value actually changes.
+//
+// Returns the sheet rows this function reached - every row carrying one of
+// the edited SKUs, the edited rows included. onEditPush pushes that set on
+// top of e.range, because the row whose cells just changed need not be the
+// row the site sells: edit the price on the unticked supplier's row and it
+// is the TICKED twin, outside e.range entirely, that now has a new price to
+// publish. Without this the sheet was right and the shop was a day behind.
 function applyFee_(sheet, map, e) {
-  if (map.price === undefined) return;
-  if (map.fee === undefined && map.my_price === undefined) return;
-  const col = map.price + 1;
-  if (e.range.getColumn() > col || e.range.getLastColumn() < col) return;
+  const reached = [];
+  if (map.price === undefined) return reached;
+  const c1 = e.range.getColumn(), c2 = e.range.getLastColumn();
+  const hits = function (idx) { return idx !== undefined && idx + 1 >= c1 && idx + 1 <= c2; };
+  const hitU = hits(map.price);          // the final price was typed
+  const hitV = hits(map.sale);           // the sale percentage was typed
+  if (!hitU && !hitV) return reached;
   const first = Math.max(2, e.range.getRow());
   const last  = e.range.getLastRow();
-  if (last < first) return;
+  if (last < first) return reached;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return reached;
   const width = Math.max.apply(null, Object.values(map)) + 1;
-  const data  = sheet.getRange(first, 1, last - first + 1, width).getValues();
+  const data  = sheet.getRange(2, 1, lastRow - 1, width).getValues();   // one read
+
+  // What was just typed, per SKU. With no SKU column there are no twins to
+  // find, so each edited row answers only for itself.
+  const keyOf = function (i, row) {
+    return map.sku === undefined ? '#' + row : String(data[i][map.sku] || '').trim();
+  };
+  const typed = {};
+  for (let row = first; row <= Math.min(last, lastRow); row++) {
+    const i = row - 2;
+    const key = keyOf(i, row);
+    if (!key) continue;                       // spacer row, not a package
+    typed[key] = {
+      price: data[i][map.price],
+      sale:  map.sale === undefined ? null : data[i][map.sale]
+    };
+  }
+
   for (let i = 0; i < data.length; i++) {
-    const row = first + i;
-    const sku = map.sku === undefined ? 'x' : String(data[i][map.sku] || '').trim();
-    if (!sku) continue;                       // spacer row, not a package
-    const price = num_(data[i][map.price]);
-    if (map.fee !== undefined) {
-      sheet.getRange(row, map.fee + 1)
-           .setValue(price === null ? '' : tableFee_(price));
+    const row = i + 2;
+    const key = keyOf(i, row);
+    if (!key || !typed.hasOwnProperty(key)) continue;
+    const src = typed[key];
+    reached.push(row);          // every row of an edited SKU, written or not
+
+    // Sale-only edit: carry V across the twins and stop. Nothing else on the
+    // row was derived from V, so nothing else on the row is stale.
+    if (!hitU) {
+      if (map.sale === undefined || map.sku === undefined) continue;
+      const wantV = {};
+      wantV[map.sale] = src.sale;
+      writeGroup_(sheet, row, data[i], [map.sale], wantV);
+      continue;
     }
-    if (map.my_price !== undefined) {
-      sheet.getRange(row, map.my_price + 1)
-           .setValue(price === null ? '' :
-                     Math.round((price - realFee_(price)) * 100) / 100);
+
+    const price = num_(src.price);
+    const net = price === null ? null
+              : Math.round((price - realFee_(price)) * 100) / 100;
+
+    // S..V, one call. U is the customer price, verbatim as typed - copied,
+    // never re-formatted: these are text cells and re-writing one as a number
+    // changes what the sheet renders and what every reader parses back out.
+    // V, the sale percentage, belongs to the package and not to the supplier.
+    // T is the ladder fee the customer is shown, S what actually lands after
+    // the processor's real cut.
+    const wantA = {};
+    if (map.sku !== undefined) {
+      wantA[map.price] = src.price;
+      if (map.sale !== undefined) wantA[map.sale] = src.sale;
     }
+    if (map.fee !== undefined)      wantA[map.fee] = price === null ? '' : tableFee_(price);
+    if (map.my_price !== undefined) wantA[map.my_price] = net === null ? '' : net;
+    writeGroup_(sheet, row, data[i],
+                [map.my_price, map.fee, map.price, map.sale], wantA);
+
+    // P / Q, one call. Profit against THIS row's buy price: each supplier row
+    // keeps its own, because the two rows cost different money at the same
+    // sell price, and that difference is the whole point of the comparison.
+    const buy = map.buy === undefined ? null : firstDollar_(data[i][map.buy]);
+    const judged = !!net && !!buy;
+    const wantB = {};
+    if (map.profit !== undefined) {
+      wantB[map.profit] = judged ? profitText_(net, buy).text : '';
+    }
+    if (map.stock !== undefined) {
+      const gb = num_(data[i][map.gb]);        // '5gb' -> 5
+      const bad = judged && profitText_(net, buy).pct < profitFloorPct_(gb);
+      const now = String(data[i][map.stock] || '').trim();
+      // An unpriced or unquoted row is not called unprofitable - it has not
+      // been judged.
+      //
+      // And this column is SHARED. The scraper parks its own words here
+      // (out-of-stock, fewer-days-than-promised, regional-only - all Hebrew,
+      // none of them ours) and the owner takes a row off sale by hand, in his
+      // own words. Every one of those means the row is already not for sale
+      // for a reason more specific than ours, so the marker goes in only
+      // where the cell is EMPTY - never over a word somebody else put there.
+      // Clearing stays as narrow as it always was: the only word this
+      // function erases is the one it wrote itself.
+      if (bad) {
+        if (now === '') wantB[map.stock] = UNPROFITABLE;
+      } else if (now === UNPROFITABLE) {
+        wantB[map.stock] = '';
+      }
+    }
+    writeGroup_(sheet, row, data[i], [map.profit, map.stock], wantB);
   }
   SpreadsheetApp.flush();   // the sync below reads these cells back
+  return reached;
 }
 
 function setupTriggers() {
@@ -443,10 +653,16 @@ function onEditPush(e) {
     const watched = Object.values(map).map(i => i + 1);
     const c1 = e.range.getColumn(), c2 = e.range.getLastColumn();
     if (!watched.some(c => c >= c1 && c <= c2)) return;   // not a synced column
-    applyFee_(sheet, map, e);
+    const reached = applyFee_(sheet, map, e) || [];
     enforceChoice_(sheet, map, e);
     const rows = [];
     for (let r = Math.max(2, e.range.getRow()); r <= e.range.getLastRow(); r++) rows.push(r);
+    // The twin rows applyFee_ just rewrote. buildPackages_ turns a row into
+    // its SKU and then picks the ticked half of the pair, so it is enough
+    // that ONE row of each touched SKU is in here - but sending them all
+    // costs nothing (they collapse to one package per SKU) and leaves no
+    // room for the pick to land on a row nobody queued.
+    reached.forEach(function (r) { if (r >= 2 && rows.indexOf(r) < 0) rows.push(r); });
     if (!rows.length) return;
     queueRows_(rows);
     flushPendingRows_();
@@ -888,10 +1104,17 @@ function dailyScrape() {
   } else {
     Logger.log('GH_TOKEN not set \u2014 skipping dispatch (GitHub cron handles the scrape).');
   }
-  // Full site sync 45 min later - after the scraper wrote fresh data to the
+  // Full site sync 70 min later - after the scraper wrote fresh data to the
   // sheet. Programmatic writes don't fire onEdit, so this sync is the ONLY
   // path that gets the daily price changes to the site.
-  ScriptApp.newTrigger('fullSyncOnce').timeBased().after(45 * 60 * 1000).create();
+  //
+  // 45 minutes was measured against the old scrape. The job now runs up to
+  // ~68 minutes on its own budget and is followed by the Stellar pass and
+  // the supplier chooser, so a 45-minute wait would sync the sheet halfway
+  // through the rewrite - yesterday's prices for whatever had not landed
+  // yet. Syncing late costs nothing; syncing early publishes a half-written
+  // catalogue.
+  ScriptApp.newTrigger('fullSyncOnce').timeBased().after(70 * 60 * 1000).create();
 }
 
 function fullSyncOnce() {

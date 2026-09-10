@@ -72,3 +72,16 @@ jobs:
       # A duplicate eSIM email is money and trust, both already spent.
       - name: Delivery dedup
         run: python test_delivery_dedup.py
+
+      # Which VALIDITY each size is sold at. The owner's day rules (2026-09-10)
+      # are the difference between 30 days and 25 for a few agorot, and between
+      # a Stellar 60-day plan taken for free and one bought by mistake — the
+      # customer is promised the number of days the sheet carries.
+      - name: Day policy
+        run: python test_day_policy.py
+
+      # Which SUPPLIER a row is bought from. Two rows sit under one SKU and only
+      # one of them is the one we pay; picking the wrong one spends money at the
+      # wrong place under the right price.
+      - name: Choose supplier
+        run: python test_choose_supplier.py

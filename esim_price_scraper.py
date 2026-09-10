@@ -44,6 +44,7 @@ from googleapiclient.discovery import build
 from esim_country_data import (
     country_from_slug, make_country_code, make_region_code, hebrew_name,
 )
+import day_policy
 
 # ── Google Sheets ────────────────────────────────────────────────
 SHEET_ID = "108D3BUV-MNcIuRZuKUgb-E-b1Ra8moxWZZyI5JxnyRo"
@@ -112,32 +113,28 @@ BLOCKED_ROUTES = {'Amber'}
 MIN_SELLABLE_GB = 1.0
 BELOW_MIN_LABEL = 'מתחת ל-1GB'
 
-# ── Cheapest-validity search (owner's policy, 2026-09-07) ─────────────────
-# Supersedes the 2026-09-01 "keep it on 30 days" rule. That one asked which
-# validity still WORKS and stopped at the first one that did; this one asks
-# which validity is CHEAPEST, and has to price them all to answer.
+# The one thing the day search cannot fix by itself. When the day a row already
+# holds is outside its size's window AND nothing inside the window can be sold,
+# the row keeps that day — there is no better answer to write. Until now it kept
+# it in total silence: no price change, no stock change, nothing in J, so a 30GB
+# package sold as 14 days looked exactly like a healthy row. This note is the
+# owner's only signal that the SKU needs a hand.
+OUT_OF_WINDOW_NOTE = '⚠️ מחוץ לטווח הימים ({current}d, אין חלופה)'
+
+# ── Cheapest-validity search (owner's day rules, 2026-09-10) ─────────
+# Supersedes the 2026-09-07 "cheapest day in the band wins" rule, which in turn
+# superseded "keep it on 30 days". The bands and the winner both live in
+# day_policy.py now — one module, two suppliers, the owner's words quoted in
+# full at the top of it — and this file only says WHICH days to go and read.
 #
-# The reason it has to is that esim.dog's prices do not rise with days. Germany
-# 1GB, read off the live page 2026-09-07:
-#
-#       1d $1.99      7d $0.65      15d $1.07      30d $2.99
-#
-# The cheapest is neither the shortest nor the longest, and 30d — the day the
-# old rule would have preferred and stopped at — costs 4.6x the 7d price for
-# exactly the same gigabyte. Stopping early on a curve shaped like that buys
-# the dearest option in the band.
-#
-# The owner's bands (his numbers). A larger package needs more days to be a
-# credible product, so the floor climbs with size:
-#
-#       1-2GB  → from  1 day        ≤10GB  → from 14 days       21GB+ → from 25 days
-#       ≤5GB   → from  7 days        ≤20GB  → from 21 days
-#
-# The ceiling is 31 everywhere: 45/60/90d are dearer by construction and we
-# would never sell them at a monthly price.
-DAY_BANDS = ((2.0, 1), (5.0, 7), (10.0, 14), (20.0, 21))
-DAY_FLOOR_ABOVE_BANDS = 25          # 21GB and up
-DAY_CEILING = 31
+# What changed here on 2026-09-10 is that cheapest stopped being the verdict.
+# esim.dog's prices do not rise with days (Germany 1GB: $1.99/1d, $0.65/7d,
+# $1.07/15d, $2.99/30d), so a plain cheapest-first search kept finding real
+# savings — and kept paying for them in VALIDITY, selling a 20-day trip a few
+# agorot under the 30-day one. The owner's answer: 30 days is the product, it
+# only moves for more than 1%, and after that the day CLOSEST to 30 wins.
+# day_policy.pick() is that judgement; nothing in this file second-guesses it.
+DAY_SUPPLIER = day_policy.ESIMDOG
 
 # Which days are worth asking for. esim.dog's visible validity chips are only
 # 1/7/15/30/90, but the URL accepts any number and a package exists at whatever
@@ -156,7 +153,42 @@ DAY_SCAN_CONCURRENCY = int(os.environ.get('DAY_SCAN_CONCURRENCY', 4))
 # the verdicts stay sequential. 149 rows one at a time overran a 62-minute
 # budget on 2026-09-08..10 (memory: scrape-workflow-budget said "concurrency,
 # not another timeout").
-SCRAPE_CONCURRENCY = int(os.environ.get('SCRAPE_CONCURRENCY', 3))
+SCRAPE_CONCURRENCY = int(os.environ.get('SCRAPE_CONCURRENCY', 4))
+
+# How many Chromiums may exist AT ONCE, across the whole process.
+#
+# The two knobs above multiply. SCRAPE_CONCURRENCY packages are in flight, each
+# of them running its own DAY_SCAN_CONCURRENCY-wide ladder, so 4 x 8 is 32
+# browsers on a 2-core runner — a number nobody chose and nobody measured. The
+# per-row and per-run queues are about ORDER; this is the only line about total
+# cost, and it is the one the machine actually feels. Raising either knob above
+# now buys a deeper queue, not more processes.
+BROWSER_SLOTS = int(os.environ.get('BROWSER_SLOTS', 6))
+
+# A comma-separated list of package codes. Empty (the normal case) means the
+# whole sheet. Set, it is the only way to re-price ONE row without waiting an
+# hour for the other 148 — the difference between checking a fix and hoping.
+# It filters, it never widens: a code that is not in the sheet is simply not
+# found, and a run with a typo in it checks nothing rather than everything.
+SCRAPE_ONLY_SKUS = [c.strip() for c in
+                    os.environ.get('SCRAPE_ONLY_SKUS', '').split(',') if c.strip()]
+
+# Built on first use, never at import. An asyncio.Semaphore belongs to the loop
+# that first awaits it, and awaiting it from a second loop raises "bound to a
+# different event loop" — so the loop it was built for is remembered and a new
+# loop gets a new semaphore. The run has exactly one loop; the tests do not.
+_browser_slots = None
+_browser_slots_loop = None
+
+
+def browser_slots():
+    """The process-wide cap on simultaneous Chromiums, for the running loop."""
+    global _browser_slots, _browser_slots_loop
+    loop = asyncio.get_running_loop()
+    if _browser_slots is None or _browser_slots_loop is not loop:
+        _browser_slots = asyncio.Semaphore(max(1, BROWSER_SLOTS))
+        _browser_slots_loop = loop
+    return _browser_slots
 
 
 async def prefetched(items, fetch, n):
@@ -295,29 +327,33 @@ def is_profitable(my_price: Optional[float], buy: Optional[float],
 
 
 def fallback_day_floor(gb: float) -> int:
-    """Shortest validity the owner is willing to sell this size as."""
-    for max_gb, floor in DAY_BANDS:
-        if gb <= max_gb:
-            return floor
-    return DAY_FLOOR_ABOVE_BANDS
+    """Shortest validity the owner will sell this size as, on esim.dog.
+
+    A thin name over day_policy.day_floor() — the bands themselves moved out of
+    this file on 2026-09-10 so that the scraper and Stellar cannot drift apart
+    on what a 10GB package IS.
+    """
+    return day_policy.day_floor(gb, DAY_SUPPLIER)
 
 
 def fallback_days(gb: Optional[float], current: Optional[int] = None) -> List[int]:
     """Every validity worth pricing for a `gb` package. [] = leave it alone.
 
-    The order carries no preference any more — the caller reads all of them and
-    keeps the cheapest — so this returns them in plain ascending order.
+    The order carries no preference — day_policy.pick() decides the winner once
+    the prices are in — so this returns plain ascending order.
 
-    `current` is always included, even when it sits below its own floor: the
-    owner hand-picked 21 days for the 30GB Greece row, and the day we already
-    hold has to be in the comparison or a "cheapest" verdict is being reached
-    without pricing the incumbent.
+    `current` is included ONLY when it is inside the window. This is the reversal
+    of 2026-09-07, and it is deliberate: back then the day we already held was
+    always priced, so a hand-set 21d on a 30GB row could keep itself. But the
+    bands ARE the product — a 30GB customer is promised 25 days — so a current
+    day below the floor is not a cheaper option to weigh, it is a row that is
+    being sold wrong. Leaving it out is what lets the search climb back up.
     """
     if gb is None:
         return []
-    floor = fallback_day_floor(gb)
-    days = [d for d in DAY_LADDER if floor <= d <= DAY_CEILING]
-    if current and current not in days and current <= DAY_CEILING:
+    days = [d for d in DAY_LADDER if day_policy.in_window(gb, DAY_SUPPLIER, d)]
+    if current and current not in days \
+            and day_policy.in_window(gb, DAY_SUPPLIER, current):
         days.append(current)
     return sorted(days)
 
@@ -833,34 +869,44 @@ class ESIMScraper:
             print(f"  🔐 Normalised link: {clean_url}")
         info = parse_url(clean_url)
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await (await browser.new_context()).new_page()
-            try:
-                await page.goto(clean_url, wait_until='domcontentloaded', timeout=30000)
-                if info['type'] == 'region':
-                    await page.wait_for_timeout(5000)
-                    return await self.scrape_region(page, info, variant)
-                else:
-                    try:
-                        await page.wait_for_selector("text=Payment Summary", timeout=15000)
-                    except Exception:
-                        pass
-                    await page.wait_for_timeout(2000)
-                    if info['type'] == 'country':
-                        return await self.scrape_country(page, info)
-                    price = await self.extract_price(page)
-                    return {'price': price, 'countries': '', 'gb': '', 'validity': '',
+        # Every simultaneous Chromium in this process passes through here.
+        #
+        # The slot is taken BEFORE async_playwright(), not between it and
+        # launch(). Entering that context manager is what spawns the node
+        # driver subprocess, so with the two the other way round every one of
+        # the SCRAPE_CONCURRENCY x DAY_SCAN_CONCURRENCY in-flight reads had a
+        # driver of its own the whole time it queued for a slot, and the cap
+        # only ever counted the browsers behind them. Held across
+        # launch..close, so a slot is a live driver+browser, not a page load.
+        async with browser_slots():
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await (await browser.new_context()).new_page()
+                try:
+                    await page.goto(clean_url, wait_until='domcontentloaded', timeout=30000)
+                    if info['type'] == 'region':
+                        await page.wait_for_timeout(5000)
+                        return await self.scrape_region(page, info, variant)
+                    else:
+                        try:
+                            await page.wait_for_selector("text=Payment Summary", timeout=15000)
+                        except Exception:
+                            pass
+                        await page.wait_for_timeout(2000)
+                        if info['type'] == 'country':
+                            return await self.scrape_country(page, info)
+                        price = await self.extract_price(page)
+                        return {'price': price, 'countries': '', 'gb': '', 'validity': '',
+                                'code': '', 'network': '', 'breakout_ip': '', 'route': '',
+                                'out_of_stock': False,
+                                'note': 'Partial link — add data/validity params'}
+                except Exception as e:
+                    print(f"  ❌ {e}")
+                    return {'price': None, 'countries': '', 'gb': '', 'validity': '',
                             'code': '', 'network': '', 'breakout_ip': '', 'route': '',
-                            'out_of_stock': False,
-                            'note': 'Partial link — add data/validity params'}
-            except Exception as e:
-                print(f"  ❌ {e}")
-                return {'price': None, 'countries': '', 'gb': '', 'validity': '',
-                        'code': '', 'network': '', 'breakout_ip': '', 'route': '',
-                        'out_of_stock': False, 'note': f'Error: {e}'}
-            finally:
-                await browser.close()
+                            'out_of_stock': False, 'note': f'Error: {e}'}
+                finally:
+                    await browser.close()
 
     async def scrape_confirmed(self, link: str, variant: str, expected: str) -> Dict:
         """
@@ -914,24 +960,26 @@ class ESIMScraper:
     # ── alternative validity ─────────────────────────────────────
     async def find_alternative(self, it: Dict, primary: Dict,
                                deadline: float) -> Optional[Dict]:
-        """Price the same package over every validity in its band; keep the cheapest.
+        """Price the same package over every validity in its window; let the
+        owner's day policy pick the winner.
 
         Called for every row, not only the broken ones, because the policy runs
-        both ways: it moves a row onto a cheaper day, and moves it back the
-        moment the day it left becomes the cheaper one again.
+        both ways: it moves a row off the day it holds, and moves it back the
+        moment 30 days is the right answer again.
 
-        Two things changed here on 2026-09-07, and they are the same change:
-        the search no longer stops at the first day that works, so it can no
-        longer be fooled by a price curve that dips in the middle (Germany 1GB:
-        $1.99/1d, $0.65/7d, $1.07/15d, $2.99/30d). Reading the whole ladder is
-        what makes "cheapest" mean anything — and the reads go out together,
-        because twelve sequential page loads per row would cost more than the
-        whole run has.
+        The reads are still the 2026-09-07 design — the whole window priced at
+        once, because a preference you cannot price is not a preference, and
+        twelve sequential page loads per row would cost more than the run has.
+        What changed on 2026-09-10 is the sentence at the end of it. This method
+        used to sort by price and take the cheapest; now it hands the sellable
+        reads to day_policy.pick(), which knows that 30 days is the product and
+        that a 1% saving is not worth ten days of somebody's holiday.
 
-        Only the winner is confirmed. The old code confirmed every candidate it
-        liked, which across a twelve-rung ladder would have doubled the run for
-        nothing: one repeat read of the single link about to be written into the
-        sheet is what actually protects the purchase bot from a flicker.
+        Only the winner is confirmed. Confirming every candidate would have
+        doubled the run for nothing: one repeat read of the single link about to
+        be written into the sheet is what actually protects the purchase bot
+        from a flicker. A flicker drops that candidate and the policy is asked
+        again — the runner-up is whatever pick() names, not the next-cheapest.
 
         Returns the winning read plus the link that produces it, or None to keep
         whatever the primary read found.
@@ -971,17 +1019,45 @@ class ESIMScraper:
         if not primary.get('price') and not primary.get('out_of_stock'):
             return None
 
-        # The day we already hold is the incumbent — but only if today's read of
-        # it is something we could actually sell.
+        # The day we already hold is a candidate like any other — but only if
+        # today's read of it is something we could actually sell, AND only if it
+        # is inside the owner's window for this size. A 30GB row sitting on 14
+        # days is not a cheap incumbent to be beaten; it is a row being sold
+        # wrong, and putting it in the comparison is how it would defend itself.
+        held_in_window = bool(current and req_gb is not None
+                              and day_policy.in_window(req_gb, DAY_SUPPLIER, current))
         best = ({'days': current, 'price': val(primary.get('price')),
-                 'res': primary, 'link': it['link']} if primary_ok else None)
+                 'res': primary, 'link': it['link']}
+                if primary_ok and held_in_window
+                else None)
+
+        def nothing_to_adopt():
+            """Give up the search — and, if the day we are giving up on is
+            outside this size's window, say so where the owner will see it.
+
+            Returning None here means the row keeps the day it has. That is the
+            right answer when the day is a legitimate one; it is a package
+            being sold wrong when the day is below the floor or above the
+            ceiling, and that case has no other voice. The note rides back on
+            the read the caller already holds rather than through the return
+            value, because every caller of this method treats a return of None
+            as 'nothing to write to the link'.
+            """
+            if current and not held_in_window:
+                primary['day_window_note'] = OUT_OF_WINDOW_NOTE.format(current=current)
+            return None
 
         probe = [d for d in days if d != current]
         if not probe:
             return None
+        why = ("" if best is not None
+               else " (which we cannot sell today)" if primary_ok is False
+               else " (which is outside this size's day window)")
+        # A link with no validity param has no incumbent day to price against,
+        # and "against Noned" is not a day.
+        held = f"{current}d" if current else "(no validity)"
         print(f"  🔎 {req_gb:g}GB — pricing {', '.join(str(d) + 'd' for d in probe)}"
-              f" against {current}d"
-              + ("" if primary_ok else " (which we cannot sell today)"))
+              f" against {held}" + why)
 
         sem = asyncio.Semaphore(DAY_SCAN_CONCURRENCY)
 
@@ -1005,34 +1081,47 @@ class ESIMScraper:
                           'link': with_validity(it['link'], d)})
             print(f"    {d}d: {cand['price']}")
 
-        # Cheapest first. The day we already hold is the floor: once the list
-        # reaches a price that does not beat it, nothing further down can.
-        floor = best['price'] if best else None
-        for cand in sorted(found, key=lambda c: c['price']):
-            if floor is not None and cand['price'] >= floor - 0.001:
-                break
+        # The verdict is day_policy.pick()'s, not this file's. Everything above
+        # is legwork: which days to open, which reads came back sellable. The
+        # rules about 30 days, the 1% tolerance and closest-to-30 live in one
+        # module so that Stellar cannot be judged by a different set.
+        candidates = list(found)
+        if best is not None:
+            candidates.append(best)
+
+        while candidates:
+            winner = day_policy.pick(req_gb, DAY_SUPPLIER, candidates)
+            if winner is None:
+                return nothing_to_adopt()
+            if best is not None and winner is best:
+                # The day we already hold won on its merits. Nothing to write.
+                return None
             if _time.time() > deadline:
                 print("  ⏳ out of time — keeping the day we hold")
-                break
+                return None
 
             # One confirming read, on the candidate we are about to adopt. This
             # link is what the purchase bot buys from tomorrow, so a price that
-            # will not repeat is a flicker, not a saving. A flicker drops us to
-            # the next-cheapest rather than ending the search — the whole ladder
-            # has already been paid for by this point.
-            again = await self.scrape(cand['link'], it['variant'])
+            # will not repeat is a flicker, not a saving. A flicker drops that
+            # candidate and the policy runs again over what is left — the whole
+            # ladder has already been paid for by this point, and the runner-up
+            # is whatever pick() says it is, not whatever is next cheapest.
+            again = await self.scrape(winner['link'], it['variant'])
             if not (again.get('price')
-                    and abs((val(again['price']) or -1) - cand['price']) < 0.001):
-                print(f"    ✋ {cand['days']}d at {cand['res']['price']} did not "
+                    and abs((val(again['price']) or -1) - winner['price']) < 0.001):
+                print(f"    ✋ {winner['days']}d at {winner['res']['price']} did not "
                       f"repeat ({again.get('price')}) — not taken")
+                candidates = [c for c in candidates if c is not winner]
                 continue
 
-            print(f"  ✅ {cand['days']}d at {cand['res']['price']} — "
+            print(f"  ✅ {winner['days']}d at {winner['res']['price']} — "
                   f"switching from {current}d")
-            return {'res': cand['res'], 'link': cand['link'],
-                    'days': cand['days'], 'from_days': current}
+            return {'res': winner['res'], 'link': winner['link'],
+                    'days': winner['days'], 'from_days': current}
 
-        return None
+        # Every day in the window was unsellable, or flickered on the confirming
+        # read. Nothing to adopt.
+        return nothing_to_adopt()
 
     # ── sheet I/O ────────────────────────────────────────────────
     def read_rows(self):
@@ -1088,6 +1177,16 @@ class ESIMScraper:
                     # Only read to order the work below; never written back.
                     'old_updated': _get('updated'),
                 })
+
+        if SCRAPE_ONLY_SKUS:
+            wanted = set(SCRAPE_ONLY_SKUS)
+            kept = [it for it in items if (it.get('old_code') or '').strip() in wanted]
+            print(f"🎯 SCRAPE_ONLY_SKUS: {len(kept)} of {len(items)} rows kept "
+                  f"({', '.join(SCRAPE_ONLY_SKUS)})")
+            missing = wanted - {(it.get('old_code') or '').strip() for it in kept}
+            if missing:
+                print(f"   ⚠️  not found in the sheet: {', '.join(sorted(missing))}")
+            items = kept
         return items, col_index
 
     async def run(self):
@@ -1306,6 +1405,12 @@ class ESIMScraper:
                     f"↔ {alt['from_days']}d → {alt['days']}d ({new_price})")
                 put(r, 'last_change', datetime.now().strftime("%Y-%m-%d"))
                 print(f"  🔗 Row {r}: link now {alt['link']}")
+            elif res.get('day_window_note'):
+                # The row is on a day it should not be sold at and the search
+                # came back empty-handed, so it stays exactly as it is. Said
+                # out loud in J, this is the row the owner has to look at.
+                put(r, 'changed', res['day_window_note'])
+                print(f"  ⚠️  Row {r}: {res['day_window_note']}")
 
             # ── Profitability check ──
             my_price_val = to_val(it['my_price'])

@@ -154,12 +154,19 @@ class StellarFake:
 HDR = ["מייל - Mail", "תאריך - Date", 'מק"ט - SUK', "איחסון - GB", "GB (0/X) - ניצול", "מס׳ הזמנה",
        "QR", "Activation Code", "SM-DP+ Address", "", "Link - esim.dog", "Link - waverole",
        "מס סידורי -ICCID", "גישה - APN", "אזור - Region", "חבילה - Plan", "Route", "הופעל - Activated",
-       "סטטוס - Status", "", "מקור - source", "", "קנייה - Buy", "הנחה - Sale", "מכירה - Sell"]
+       "סטטוס - Status", "רכישה - Purchase", "מקור - source", "", "קנייה - Buy", "הנחה - Sale", "מכירה - Sell"]
 
 
 class Ws:
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, format_raises=False):
         self.rows = [list(HDR)] + [list(r) for r in (rows or [])]
+        self.formats: list[tuple[str, dict]] = []
+        self.format_raises = format_raises
+
+    def format(self, a1, fmt):
+        if self.format_raises:
+            raise RuntimeError("Sheets said no")
+        self.formats.append((a1, fmt))
 
     def row_values(self, i):
         return list(self.rows[i - 1])
@@ -191,9 +198,11 @@ def receipt_row(order_id, status, stellar_id="so-1", route="Stellar JC059"):
     return r
 
 
-def sheet_row(sku="1.62.10", code="JC059", gb=10.0, days=20, eur=2.12, floor=14, country="אינדונזיה"):
+def sheet_row(sku="1.62.10", code="JC059", gb=10.0, days=20, eur=2.12, country="אינדונזיה"):
+    # No floor here any more: StellarRow.floor_days is a read-only property and
+    # the floor belongs to the SIZE (day_policy's bands). 10GB -> 20..31 days.
     return sp.StellarRow(row=83, sku=sku, country=country, code=code, gb=gb, days=days, eur=eur,
-                         price_cell=f"${eur*1.165:.2f} (€{eur:.2f})", changed="", stock="", floor_days=floor)
+                         price_cell=f"${eur*1.165:.2f} (€{eur:.2f})", changed="", stock="")
 
 
 def token(d=None, gb=10):
@@ -266,8 +275,12 @@ check("status ends פעיל, credentials in the row",
 check("Buy is EUR x the row's own FX, Sell is what the customer paid",
       ws.col(n, "קנייה - Buy") == "2.48$" and ws.col(n, "מכירה - Sell") == "6.99$",
       f"{ws.col(n, 'קנייה - Buy')} / {ws.col(n, 'מכירה - Sell')}")
-check("source is the rail, spelled as the PC bot spells it", ws.col(n, "מקור - source") == "paypal", ws.col(n, "מקור - source"))
+check("'מקור - source' names the SUPPLIER, not the rail", ws.col(n, "מקור - source") == "Stellar", ws.col(n, "מקור - source"))
+check("'רכישה - Purchase' is the rail, spelled as the PC bot spells it",
+      ws.col(n, "רכישה - Purchase") == "paypal", ws.col(n, "רכישה - Purchase"))
 check("no rail on the order -> the PC bot's old constant", sb.source_text("") == "bot - manually")
+check("a paypal row has its Mail cell painted green",
+      ws.formats == [(f"A{n}", {"backgroundColor": sb.PAID_BG})], str(ws.formats))
 check("no discount given -> '-'", ws.col(n, "הנחה - Sale") == "-", ws.col(n, "הנחה - Sale"))
 check("nothing secret in the log", LPA not in logtxt and QR not in logtxt and "buyer@example.com" not in logtxt)
 check("no alert on a clean purchase", not alerts, str(alerts))
@@ -305,9 +318,12 @@ fl = site.reports("failed")
 check("site told failed with the reason", len(fl) == 1 and "price rose" in fl[0].get("reason", ""), str(fl))
 check("owner alerted at once", alerts and "refused" in alerts[0][0], str(alerts))
 
-print("\n   the 5% validity tolerance is allowed (sheet 2.12, listing 2.13)")
+print("\n   PRICE_RISE_TOL absorbs a stale cell (sheet 2.12, listing 2.13)")
 site, _, _, _ = scenario([order()], (f5b := StellarFake()))
 check("2.13 against a 2.12 cell is bought", len(f5b.creates) == 1)
+check("the bar is a named 5%, and it belongs to this bot, not to the day rules",
+      sb.PRICE_RISE_TOL == 0.05 and not hasattr(sp, "LONGER_TOL"),
+      f"{sb.PRICE_RISE_TOL} / LONGER_TOL still on stellar_prices")
 
 print("\n   the customer's own token outranks the sheet floor")
 only20 = [plan("p-20d", "JC059", 10, 20, 212)]
@@ -315,6 +331,35 @@ site, _, _, _ = scenario([order(d=30)], (f5c := StellarFake()), plans=only20)
 check("promised 30 days, only 20 on sale -> refused as short",
       len(f5c.creates) == 0 and site.reports("failed") and "short" in site.reports("failed")[0]["reason"],
       str(site.reports("failed")))
+
+print("\n   ...and it outranks the day rules' own answer, not just the floor")
+# 20 days is inside 10GB's band (20..31) and here it is a quarter cheaper, so
+# day_policy on its own buys it -- correctly: no promise says otherwise. The
+# moment the order token says the customer was SHOWN 30 days, the cheap twin
+# stops being a candidate at all. min_days raises the floor; it never lowers it.
+cheap20 = [plan("p-20d", "JC059", 10, 20, 200), plan("p-30d", "JC059", 10, 30, 250)]
+row250 = [sheet_row(eur=2.50, days=30)]
+site, _, _, _ = scenario([order()], (f5f := StellarFake()), plans=cheap20, rows=row250)
+check("no promise: the cheaper 20-day twin is what the day rules buy",
+      [b for _, b in f5f.creates] == [{"plans": [{"plan_id": "p-20d", "quantity": 1}]}], str(f5f.creates))
+site, _, _, _ = scenario([order(d=30)], (f5g := StellarFake()), plans=cheap20, rows=row250)
+check("promised 30 days: the dearer 30-day plan is bought instead",
+      [b for _, b in f5g.creates] == [{"plans": [{"plan_id": "p-30d", "quantity": 1}]}], str(f5g.creates))
+check("   ...and 50 cents of validity is not a 'price rose' refusal",
+      site.reports("failed") == [], str(site.reports("failed")))
+
+print("\n   a promise longer than the size's ceiling is refused, never rounded down")
+# 10GB is capped at 31 days. A token promising 45 cannot be honoured by any
+# listing we are allowed to sell, and 'short' is the only honest answer.
+site, _, _, _ = scenario([order(d=45)], (f5h := StellarFake()))
+check("promised 45 days at a 31-day ceiling -> short, nothing bought",
+      len(f5h.creates) == 0 and site.reports("failed")
+      and "short" in site.reports("failed")[0]["reason"], str(site.reports("failed")))
+
+print("\n   a promise shorter than the size's own floor changes nothing")
+site, _, _, _ = scenario([order(d=7)], (f5i := StellarFake()))
+check("promised 7 days, the band still buys the 30-day plan",
+      [b for _, b in f5i.creates] == [{"plans": [{"plan_id": "p-30d", "quantity": 1}]}], str(f5i.creates))
 
 print("\n   the per-order cap")
 sb.MAX_EUR = 2.0
@@ -707,6 +752,96 @@ if _key is not None:
 check("no key in the environment -> not ready, and named", ok is False and len(alerts) == 1)
 check("   ...and the alert says which secret is missing",
       "STELLAR_API_KEY" in alerts[0][1], str(alerts[:1]))
+
+
+# ── the two columns, and the green Mail cell ────────────────────────────────
+print("\nthe supplier column, the rail column and the paid-row colour")
+
+check("a rail we bank -> green", sb.paint_paid(_w := Ws([[""] * len(HDR)]), 2, "paypal") is True
+      and _w.formats == [("A2", {"backgroundColor": sb.PAID_BG})], str(_w.formats))
+check("payme too", sb.paint_paid(_w := Ws([[""] * len(HDR)]), 2, "PayMe ") is True and len(_w.formats) == 1)
+check("a rail whose money still has to be chased is left white",
+      sb.paint_paid(_w := Ws([[""] * len(HDR)]), 2, "manual") is False and _w.formats == [])
+check("no rail at all -> left white",
+      sb.paint_paid(_w := Ws([[""] * len(HDR)]), 2, "") is False and _w.formats == [])
+check("the header row is never painted", sb.paint_paid(Ws(), 1, "paypal") is False)
+check("a formatting failure is swallowed: the receipt stands, the colour does not",
+      sb.paint_paid(Ws([[""] * len(HDR)], format_raises=True), 2, "paypal") is False)
+
+class WsNoFormat(Ws):
+    """An older gspread, where a worksheet has no .format at all."""
+    format = property(lambda self: (_ for _ in ()).throw(AttributeError("format")))
+
+
+check("a gspread with no .format cannot fail a buy either",
+      sb.paint_paid(WsNoFormat([[""] * len(HDR)]), 2, "paypal") is False)
+
+# The Mail cell is found by HEADER, like every other cell this bot touches.
+# It happens to be column A today; the owner reorders these columns, and the
+# green mark must follow the header rather than whatever lands in A.
+class WsMoved(Ws):
+    """'מייל - Mail' has been dragged to the third column."""
+    def __init__(self):
+        super().__init__([[""] * len(HDR)])
+        hdr = [h for h in HDR if h != "מייל - Mail"]
+        self.rows[0] = hdr[:2] + ["מייל - Mail"] + hdr[2:]
+
+
+check("the paint follows the Mail header, it does not assume column A",
+      sb.paint_paid(_w := WsMoved(), 4, "paypal") is True
+      and _w.formats == [("C4", {"backgroundColor": sb.PAID_BG})], str(_w.formats))
+
+
+class WsNoMail(Ws):
+    """A sheet with no Mail header at all -- column A is the fallback."""
+    def __init__(self):
+        super().__init__([[""] * len(HDR)])
+        self.rows[0] = ["" if h == "מייל - Mail" else h for h in HDR]
+
+
+check("with no Mail header at all, column A is the fallback",
+      sb.paint_paid(_w := WsNoMail(), 2, "paypal") is True
+      and _w.formats == [("A2", {"backgroundColor": sb.PAID_BG})], str(_w.formats))
+
+
+class WsNoHeader(Ws):
+    """Reading row 1 fails. The paint is best-effort; a buy is not."""
+    def row_values(self, i):
+        raise RuntimeError("Sheets said no")
+
+
+check("a header read that fails still paints, at the fallback",
+      sb.paint_paid(_w := WsNoHeader([[""] * len(HDR)]), 2, "paypal") is True
+      and _w.formats == [("A2", {"backgroundColor": sb.PAID_BG})], str(_w.formats))
+
+# The columns are looked up BY NAME, and a sheet that has not grown the new
+# column yet keeps its receipt -- minus that cell, plus a warning.
+_no_col = [h for h in HDR]
+_no_col[_no_col.index("רכישה - Purchase")] = ""
+
+
+class WsNoPurchase(Ws):
+    def __init__(self):
+        super().__init__()
+        self.rows = [list(_no_col)]
+
+
+_w = WsNoPurchase()
+_log = io.StringIO()
+_h = logging.StreamHandler(_log)
+logging.getLogger().addHandler(_h)
+logging.getLogger().setLevel(logging.INFO)
+try:
+    _n = sb.append_row(_w, {"מייל - Mail": "b@example.com", "מס׳ הזמנה": "WR-X",
+                            "מקור - source": "Stellar", "רכישה - Purchase": "paypal"})
+finally:
+    logging.getLogger().removeHandler(_h)
+check("a receipts sheet without the new column still gets its row",
+      _n == 2 and _w.rows[1][_no_col.index("מס׳ הזמנה")] == "WR-X" and
+      _w.rows[1][_no_col.index("מקור - source")] == "Stellar", str(_w.rows[1]))
+check("   ...and the value that had nowhere to go is logged, not raised",
+      "רכישה - Purchase" in _log.getvalue(), _log.getvalue()[-200:])
+
 
 
 # ── summary (last, so it gates the exit code) ────────────────────────────────

@@ -16,12 +16,13 @@ jobs:
     runs-on: ubuntu-latest
     # Backstop only. Every step below carries its own limit, so the job limit
     # should never be what stops us — if it is, a step is missing a timeout.
-    # It must therefore stay above the sum of those limits (6 + 8 + 68 + 6 = 88),
-    # or a step gets cut by the job instead of by its own cap. Raised 75 -> 90 on
-    # 2026-09-09 with the Stellar step: at 75 a slow scraper would have eaten the
-    # 6 minutes the Stellar refresh needs, and 'if: always()' cannot save a step
-    # from a job timeout — the job kills everything, including the run's log.
-    timeout-minutes: 90
+    # It must therefore stay above the sum of those limits (6 + 8 + 68 + 6 + 5 =
+    # 93), or a step gets cut by the job instead of by its own cap. Raised 75 ->
+    # 90 on 2026-09-09 with the Stellar step and 90 -> 95 on 2026-09-10 with the
+    # supplier choice: at 90 a slow scraper would have eaten the 5 minutes that
+    # last step needs, and 'if: always()' cannot save a step from a job timeout —
+    # the job kills everything, including the run's log.
+    timeout-minutes: 95
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -88,7 +89,15 @@ jobs:
           # saves what it has and names what it skipped, the step cap kills
           # the run between two saves and explains nothing.
           SCRAPE_BUDGET_MIN: "62"
-          SCRAPE_CONCURRENCY: "3"   # packages read at once; each is its own Chromium
+          # 3 -> 4 on 2026-09-10. This is now an ORDER knob, not a cost one:
+          # BROWSER_SLOTS below is what caps the actual number of Chromiums, so
+          # raising this deepens the queue instead of the process count.
+          SCRAPE_CONCURRENCY: "4"   # packages read at once
+          # The real ceiling: how many Chromiums may be alive AT ONCE, anywhere
+          # in the process. Without it these two knobs multiplied — 4 packages
+          # x 8 validities is 32 browsers on a 2-core runner, a number nobody
+          # chose. 6 is what the runner can actually keep busy.
+          BROWSER_SLOTS: "6"
           # How many validities of ONE row are priced at once. Each scrape()
           # launches its own browser and shares nothing, so these are safe to
           # overlap; the runner has 2 cores, which is what keeps this off 12.
@@ -110,21 +119,61 @@ jobs:
       # its rows cost seconds where esim.dog's cost an hour of browser driving.
       # That is the entire reason this is a separate step and not more scraper work.
       #
-      # It runs AFTER the scraper, and that order matters: stellar_prices.py
-      # picks a Stellar listing against the days the customer is promised, and
-      # the promise is whatever the esim.dog row says AFTER the scraper's
-      # cheapest-day search has rewritten it. Running first would price today's
-      # rows against yesterday's promise.
+      # It no longer picks its listing against the esim.dog row's days. As of
+      # 2026-09-10 both suppliers answer to the SAME source of truth: the size
+      # bands in day_policy.py. stellar_prices.py picks the best Stellar
+      # listing inside the band for that size, the scraper's cheapest-day
+      # search picks esim.dog's inside the same band, and choose_supplier.py
+      # compares the two afterwards. Neither step reads the other's validity,
+      # so this step's ORDER is now only about freshness - both prices have to
+      # be today's before the chooser runs - and not about the days.
       #
       # always() because the scraper exits 1 when its budget cuts rows short,
       # which is a normal outcome, not a reason to leave the Stellar rows a day
       # stale. STELLAR_READ_KEY is the plans:read-only key (memory:
-      # stellar-key-placement). Without it the script falls back to the public
-      # RETAIL feed and estimates wholesale, and says so in this log.
+      # stellar-key-placement). Without it the script will not write anything:
+      # its only remaining source is the public RETAIL feed, and it refuses to
+      # write estimates off it - it says so in this log and exits 3.
       - name: Refresh Stellar prices
+        id: stellar
         if: always()
         timeout-minutes: 6
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           STELLAR_READ_KEY: ${{ secrets.STELLAR_READ_KEY }}
         run: python stellar_prices.py --apply
+
+      # The sheet now carries two priced rows per SKU — esim.dog's and
+      # Stellar's — and the tick in 'נבחר' is what the site sells from. Neither
+      # step above writes it: the scraper only knows esim.dog's prices and the
+      # Stellar refresh only knows Stellar's, so the comparison has to happen
+      # after both of them have written. Running it any earlier would choose a
+      # supplier from one fresh price and one that is a day old.
+      #
+      # It runs only if the Stellar step SUCCEEDED, and that is the whole
+      # condition worth reading twice. stellar_prices.py exits 3 on 'no
+      # wholesale key / estimate refused': with no way to read the real
+      # wholesale price it would have to ESTIMATE Stellar's cost off the public
+      # retail feed, and it refuses to write those estimates. They are ~1.22x
+      # off (memory: stellar-vs-esimdog-list-price) and they would go into the
+      # very column a real price goes in - so a chooser running behind them
+      # would compare esim.dog's real cost against a guess, and move live SKUs
+      # on it. Exit 3 leaves yesterday's Stellar prices in place instead, and
+      # this gate keeps the chooser off them.
+      # A failed Stellar step means the same thing: yesterday's Stellar prices
+      # against today's esim.dog ones. Neither is a comparison; both are
+      # skipped, and the ticks simply stay where the owner last had them.
+      #
+      # always() && ... , not a bare condition: an `if` with no status function
+      # is implicitly wrapped in success(), and the scraper exits 1 whenever its
+      # budget cuts rows short - a NORMAL outcome (memory:
+      # scrape-workflow-budget). A bare condition would therefore skip this step
+      # on most days, which is the opposite of what the Stellar gate is for.
+      # always() keeps the scraper's exit code out of it; steps.stellar.outcome
+      # is the only thing that decides.
+      - name: Choose supplier
+        if: always() && steps.stellar.outcome == 'success'
+        timeout-minutes: 5
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python choose_supplier.py --apply

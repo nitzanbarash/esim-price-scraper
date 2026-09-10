@@ -11,6 +11,7 @@ lost their 'מחיר סופי' and 21 sales reported a discount of zero.
 import unittest
 
 import finance_bot as fb
+import finance_core as fc
 
 HEAD = ["מק\"ט", "מדינות", "GB", "מקור", "קישור", "זמן חבילה",
         "מחיר קנייה", "עמלת סליקה", "מחיר סופי"]
@@ -78,6 +79,87 @@ class TestSupplierRows(unittest.TestCase):
         p = prices(row("", "esim.dog", "$1", "2"),
                    row("2.49.10", "esim.dog", "$3.12", "6.99"))
         self.assertEqual(list(p), ["2.49.10"])
+
+
+# ── the payment rail ─────────────────────────────────────────────────────────
+# 'רכישה - Purchase' is the receipts column that names how the money arrived.
+# It was never in read_receipts' provider search, so every order came out with
+# provider '' — which FeeModel answers with the account default, Bit, whose fee
+# is zero. Result: every PayPal sale was booked as costing nothing to collect,
+# and PayPal takes 3.4%. These pin the wiring end to end.
+
+RECEIPTS_HEAD = ["תאריך - Date", 'מק"ט - SUK', "איחסון - GB", "מס׳ הזמנה",
+                 "אזור - Region", "מייל - Mail", "Route", "סטטוס - Status",
+                 "מקור - source", "קנייה - Buy", "הנחה - Sale",
+                 "מכירה - Sell", "רכישה - Purchase"]
+
+
+def receipt(rail):
+    return ["2026-09-10", "2.49.10", "10gb", "WR-1", "גרמניה", "a@b.c",
+            "Cellcom", "פעיל", "esim.dog", "$3.12", "-", "6.99", rail]
+
+
+def receipts(*rails):
+    return fb.read_receipts(FakeClient([RECEIPTS_HEAD,
+                                        *[receipt(r) for r in rails]]))
+
+
+class TestPaymentRailColumn(unittest.TestCase):
+
+    def test_the_purchase_column_is_found_as_the_provider(self):
+        got = receipts("paypal")
+        self.assertEqual(got[0]["provider"], "paypal")
+
+    def test_every_rail_the_dropdown_offers_survives_the_read(self):
+        got = receipts("paypal", "bot - manually", "icount")
+        self.assertEqual([r["provider"] for r in got],
+                         ["paypal", "bot - manually", "icount"])
+
+    def test_the_other_columns_did_not_move(self):
+        # A substring search is easy to widen too far. 'רכישה' must not have
+        # stolen the buy/sell columns on its way in.
+        r = receipts("paypal")[0]
+        self.assertEqual(r["buy"], "$3.12")
+        self.assertEqual(r["sell"], "6.99")
+        self.assertEqual(r["order_id"], "WR-1")
+        self.assertEqual(r["discount"], "-")
+
+    def test_a_sheet_without_the_column_still_reads(self):
+        head = RECEIPTS_HEAD[:-1]
+        got = fb.read_receipts(FakeClient([head, receipt("paypal")[:-1]]))
+        self.assertEqual(got[0]["provider"], "")
+
+
+class TestRailToFee(unittest.TestCase):
+    """What each rail costs to collect. The rails are not all processors."""
+
+    def setUp(self):
+        self.model = fc.FeeModel()
+
+    def test_paypal_resolves_to_the_paypal_fee(self):
+        p = self.model.provider("paypal")
+        self.assertEqual(p.name, "PayPal")
+        self.assertGreater(p.rate, 0)
+        self.assertEqual(p.fee(100.0), round(100.0 * p.rate, 4))
+
+    def test_paypal_is_matched_case_and_space_insensitively(self):
+        self.assertEqual(self.model.provider(" PayPal ").name, "PayPal")
+
+    def test_a_hand_bought_order_falls_to_the_default(self):
+        # 'bot - manually' and 'icount' are how WE bought or invoiced, not a
+        # card processor. No processing fee was ever incurred, so the default
+        # (Bit, zero) is the true answer, not a stand-in for a missing one.
+        for rail in ("bot - manually", "icount", "", None):
+            with self.subTest(rail=rail):
+                p = self.model.provider(rail)
+                self.assertEqual(p.name, "Bit")
+                self.assertEqual(p.fee(100.0), 0.0)
+
+    def test_the_fee_actually_reaches_the_order(self):
+        paypal, _ = fc.processing_fee(100.0, "0.50", self.model, provider="paypal")
+        bit, _ = fc.processing_fee(100.0, "0.50", self.model, provider="bot - manually")
+        self.assertGreater(paypal, 0)
+        self.assertEqual(bit, 0.0)
 
 
 if __name__ == "__main__":

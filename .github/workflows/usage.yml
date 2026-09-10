@@ -38,4 +38,9 @@ jobs:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          # The second supplier. Stellar has no batch usage endpoint and no
+          # ICCID, so those rows are read one portal order at a time
+          # (stellar_usage.py). Absent or wrong, every Stellar row is left
+          # exactly as it was — nothing is retired on a missing key.
+          STELLAR_API_KEY: ${{ secrets.STELLAR_API_KEY }}
         run: python usage_bot.py

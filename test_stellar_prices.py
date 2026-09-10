@@ -9,14 +9,20 @@ product page) and the package-code family are reproduced from real listings.
 Run:  python test_stellar_prices.py
 """
 
+import contextlib
+import io
+import json
+import os
 import sys
+import tempfile
 
+import stellar_prices
 from esim_price_scraper import HEADER_KEYS
 from stellar_prices import (
     stamp_price_direction,
     MARK_GONE, MARK_REGIONAL, MARK_SHORT, RETAIL_OVER_WHOLESALE, FX_FALLBACK,
     Catalogue, Variant, StellarRow, decide, fetch_fx, is_regional_sku,
-    plan_updates, price_cell, read_rows,
+    main, plan_updates, price_cell, read_rows,
 )
 
 _fails = []
@@ -144,16 +150,18 @@ by_sku = {r.sku: r for r in rows}
 print("-- reading the sheet --")
 check("only Stellar rows come back", sorted(r.row for r in rows), [3, 5, 7, 8, 9, 10, 11, 13, 14, 15, 16])
 check("columns are found by header, wherever they sit", col["route"], IX["route"])
-check("the promise is the esim.dog row's days", by_sku["2.49.10"].floor_days, 30)
-check("a Stellar-only SKU is promised its own days", by_sku["2.0B.10"].floor_days, 30)
+check("the day floor is the size's band, not the esim.dog twin's days",
+      (by_sku["2.49.10"].floor_days, by_sku["2.49.10"].ceiling_days), (20, 31))
+check("a Stellar-only SKU gets the same band, not its own days",
+      (by_sku["2.0B.10"].floor_days, by_sku["2.0B.10"].window_text), (20, "20-31"))
 check("euros are parsed whichever side of the dollars they sit", by_sku["2.0B.10"].eur, 2.83)
 check("a short row is padded rather than crashing", by_sku["2.49.12"].code, "")
 
 print("-- choosing the listing --")
 d = {r.sku: decide(cat, r) for r in rows}
-check("same price, longer product wins: 20d twin → 30d",
+check("30 days is first preference: the same-price 20d twin never wins",
       (d["2.49.10"].pick.days, d["2.49.10"].pick.wholesale_eur), (30, 2.21))
-check("fewer days than promised is refused, and says what exists",
+check("a size whose only listing is under its floor is refused, and says what exists",
       (d["2.49.20"].reason, d["2.49.20"].have_days), ("short", (20,)))
 check("the cheaper 750MB plan never stands in for 1GB",
       (d["2.49.1"].pick.gb, d["2.49.1"].pick.wholesale_eur), (1.0, 0.43))
@@ -162,7 +170,7 @@ check("the same regional code under a regional SKU is priced",
       (d["2.0B.10"].reason, d["2.0B.10"].pick.wholesale_eur), ("", 2.83))
 check("a vanished code is reported gone", d["2.49.5"].reason, "gone")
 check("a '—' row is not a decision at all", d["2.49.40"], None)
-check("cheapest among what qualifies, even when a longer one exists",
+check("more than 1% cheaper DOES take a row off 30 days",
       (d["2.49.3"].pick.days, d["2.49.3"].pick.wholesale_eur), (20, 1.15))
 check("a row with no code is left alone", d["2.49.12"], None)
 
@@ -173,15 +181,15 @@ W = {}
 for r, k, v in ups:
     W.setdefault(r, {})[k] = v
 
-check("the 20d twin's days are corrected to 30d", W[3].get("validity"), "30d")
+check("the 20d twin's days are corrected to the window's 30d", W[3].get("validity"), "30d")
 check("...and the correction is noted without inventing a price change",
       (W[3].get("changed"), "prev" in W[3]), ("↔ 20d → 30d", False))
 check("price cell is dollars then euros", W[3]["price"], price_cell(2.21, FX))
 check("every decided row gets a timestamp", all("updated" in W[r] for r in (3, 5, 7, 8, 9, 10, 13, 14, 15)), True)
 
 check("too short: our marker goes in the stock column", W[5].get("stock"), MARK_SHORT)
-check("too short: the note names the code, the size and what exists",
-      W[5]["changed"], "אין 20GB ל-30+ ימים בקוד CKH1013 (יש: 20d)")
+check("too short: the note names the code, the size and the WINDOW",
+      W[5]["changed"], "אין 20GB ל-25-31 ימים בקוד CKH1013 (יש: 20d)")
 check("too short: the price is NOT rewritten", "price" in W[5], False)
 
 check("regional: marker + note", (W[8].get("stock"), W[8]["changed"]),
@@ -324,43 +332,156 @@ print()
 
 print("-- validity is not for sale --")
 
+# The rules themselves live in day_policy.py (and are pinned by
+# test_day_policy.py); what is pinned here is that stellar_prices ASKS them --
+# the window, the tie-break, and the two numbers the dry run prints.
 # Variant(code, gb, days, wholesale_eur, slug, name)
 IDN20 = ("JC900", 10.0, 20, 2.12, "indonesia", "Indonesia 10GB 20Days")
 IDN30 = ("JC900", 10.0, 30, 2.13, "indonesia", "Indonesia 10GB 30Days")
 CUT20 = ("JC900", 10.0, 20, 2.00, "s", "20Days")
 
 
-def _row(floor, days=None):
-    return StellarRow(1, "1.60.10", "INDONESIA", "JC900", 10.0, days or floor,
-                      None, "", "", "", floor)
+def _row(gb=10.0, days=30):
+    return StellarRow(1, "1.60.10", "INDONESIA", "JC900", gb, days, None, "", "", "")
 
 
-def _pick(floor, *vs):
-    """(days, EUR, days won back, cents paid for them) for a 10GB Indonesia row."""
-    d = decide(Catalogue([Variant(*v) for v in vs], set()), _row(floor))
+def _pick(gb, *vs):
+    """(days, EUR, days won back, cents paid for them) for one Stellar row."""
+    d = decide(Catalogue([Variant(*v) for v in vs], set()), _row(gb))
     return (d.pick.days, d.pick.wholesale_eur, d.won_days, round(d.paid_up * 100))
 
 
+check("the window is the owner's band for the SIZE, uncapped from 30GB up",
+      (_row(10.0).window_text, _row(30.0).window_text, _row(31.0).window_text,
+       _row(50.0).window_text), ("20-31", "25+", "30+", "33+"))
 check("an agora never buys back ten days of validity",
-      _pick(20, IDN20, IDN30), (30, 2.13, 10, 1))
-check("at exactly 5% over the cheapest the longer plan still wins",
-      _pick(20, CUT20, ("JC900", 10.0, 30, 2.10, "s", "30Days")), (30, 2.10, 10, 10))
-check("one cent past 5% and thrift takes it back",
-      _pick(20, CUT20, ("JC900", 10.0, 30, 2.11, "s", "30Days")), (20, 2.00, 0, 0))
+      _pick(10.0, IDN20, IDN30), (30, 2.13, 10, 1))
+check("at exactly 1% under 30 days' price the row stays on 30 days",
+      _pick(10.0, CUT20, ("JC900", 10.0, 30, 2.02, "s", "30Days")), (30, 2.02, 10, 2))
+check("one agora past 1% and thrift takes it back",
+      _pick(10.0, CUT20, ("JC900", 10.0, 30, 2.03, "s", "30Days")), (20, 2.00, 0, 0))
 check("a genuinely dearer long plan is still refused",
-      _pick(20, CUT20, ("JC900", 10.0, 30, 2.50, "s", "30Days")), (20, 2.00, 0, 0))
-check("the promise outranks the bargain: a cheap 15d listing cannot win",
-      _pick(20, ("JC900", 10.0, 15, 0.50, "s", "15Days"), IDN20, IDN30), (30, 2.13, 10, 1))
+      _pick(10.0, CUT20, ("JC900", 10.0, 30, 2.50, "s", "30Days")), (20, 2.00, 0, 0))
+check("the floor outranks the bargain: at 10GB a cheap 15d listing cannot win",
+      _pick(10.0, ("JC900", 10.0, 15, 0.50, "s", "15Days"), IDN20, IDN30), (30, 2.13, 10, 1))
 check("a row with nothing longer to buy reports no upgrade",
-      _pick(30, IDN30), (30, 2.13, 0, 0))
+      _pick(10.0, IDN30), (30, 2.13, 0, 0))
+check("second preference is closest to 30, and a tie goes to the longer plan",
+      _pick(10.0, ("JC900", 10.0, 21, 2.20, "s", "21Days"),
+            ("JC900", 10.0, 25, 2.20, "s", "25Days")), (25, 2.20, 0, 0))
+check("30GB: 60 days at the same money is free validity, so it wins",
+      _pick(30.0, ("JC900", 30.0, 30, 4.00, "s", "30Days"),
+            ("JC900", 30.0, 60, 4.00, "s", "60Days")), (60, 4.00, 0, 0))
+check("30GB: 60 days for half a percent more is not free, so 30 days holds",
+      _pick(30.0, ("JC900", 30.0, 30, 4.00, "s", "30Days"),
+            ("JC900", 30.0, 60, 4.02, "s", "60Days")), (30, 4.00, 0, 0))
+check("10GB: a 60-day plan at half the price is not a candidate at all",
+      _pick(10.0, IDN30, ("JC900", 10.0, 60, 1.06, "s", "60Days")), (30, 2.13, 0, 0))
+check("nothing inside the window is 'short' -- not a sale at any validity",
+      (lambda x: (x.reason, x.have_days))(decide(Catalogue(
+          [Variant("JC900", 10.0, 60, 1.06, "s", "60Days")], set()), _row(10.0))),
+      ("short", (60,)))
+print()
+print("-- a promise from outside the catalogue (min_days) --")
+
+# stellar_buyer passes the days written into the paid order's own token. It can
+# only ever RAISE the floor; the ceiling, and every other rule, stay put.
+CHEAP20 = ("JC900", 10.0, 20, 2.00, "s", "20Days")
+DEAR30 = ("JC900", 10.0, 30, 2.50, "s", "30Days")
+
+
+def _pick_min(min_days, gb, *vs):
+    d = decide(Catalogue([Variant(*v) for v in vs], set()), _row(gb), min_days=min_days)
+    return (d.reason, d.pick.days if d.pick else None)
+
+
+check("without a promise the day rules take the quarter-cheaper 20d",
+      _pick_min(None, 10.0, CHEAP20, DEAR30), ("", 20))
+check("a promise of 30 days puts the cheap 20d out of the window entirely",
+      _pick_min(30, 10.0, CHEAP20, DEAR30), ("", 30))
+check("promised 30 days with only 20 on sale is 'short', not a cheap sale",
+      _pick_min(30, 10.0, CHEAP20), ("short", None))
+check("a promise under the size's own band floor changes nothing",
+      _pick_min(7, 10.0, ("JC900", 10.0, 15, 0.50, "s", "15Days"), IDN20, IDN30), ("", 30))
+check("min_days=0 is no promise at all",
+      _pick_min(0, 10.0, CHEAP20, DEAR30), ("", 20))
+check("the ceiling is untouched: a promise past it empties the window",
+      _pick_min(45, 10.0, IDN30, ("JC900", 10.0, 60, 1.06, "s", "60Days")), ("short", None))
+check("what exists is still reported when a promise is what emptied the window",
+      decide(Catalogue([Variant(*CHEAP20)], set()), _row(10.0), min_days=30).have_days, (20,))
+check("the promise raises the floor, it does not become the answer: 31d still wins on price",
+      _pick_min(25, 10.0, ("JC900", 10.0, 25, 2.20, "s", "25Days"),
+                ("JC900", 10.0, 31, 2.00, "s", "31Days")), ("", 31))
+
+print()
 check("a (nonhkip) twin never wins on the order the API listed it in",
       decide(Catalogue([Variant(*v) for v in (
           ("JC900", 10.0, 30, 2.13, "s", "Indonesia 10GB 30Days (nonhkip)"),
           ("JC900", 10.0, 30, 2.13, "s", "Indonesia 10GB 30Days"))], set()),
-          _row(30)).pick.name,
+          _row(10.0)).pick.name,
       "Indonesia 10GB 30Days")
 
 
+print()
+print("-- an ESTIMATE is never written to the sheet --")
+
+# Without STELLAR_READ_KEY the euros are retail / a measured ratio, not our
+# cost -- and nothing downstream can tell the difference: stellar_buyer reads
+# these very cells back as the real wholesale price and refuses to buy a
+# listing that costs more than them. CI always has the key, so a keyless
+# --apply is a rotated or dropped secret and must be loud, not quietly wrong.
+
+_FEED_FILE = os.path.join(tempfile.gettempdir(), "stellar_test_feed.json")
+with open(_FEED_FILE, "w", encoding="utf-8") as _f:
+    json.dump(FEED, _f)
+
+
+class _ReachedTheSheet(Exception):
+    """Raised in place of opening the real sheet: the guard let the run past."""
+
+
+def _run(argv, key=""):
+    """main(argv) with the sheet stubbed out. -> (exit code or 'past the guard', printed)"""
+    was = os.environ.get("STELLAR_READ_KEY")
+    if key:
+        os.environ["STELLAR_READ_KEY"] = key
+    else:
+        os.environ.pop("STELLAR_READ_KEY", None)
+    real_svc, real_plans = stellar_prices.sheets_service, stellar_prices.fetch_plans
+    stellar_prices.sheets_service = lambda *a, **k: (_ for _ in ()).throw(_ReachedTheSheet())
+    stellar_prices.fetch_plans = lambda k: []
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            code = main(argv)
+    except _ReachedTheSheet:
+        code = "past the guard"
+    finally:
+        stellar_prices.sheets_service, stellar_prices.fetch_plans = real_svc, real_plans
+        os.environ.pop("STELLAR_READ_KEY", None)
+        if was is not None:
+            os.environ["STELLAR_READ_KEY"] = was
+    return code, out.getvalue()
+
+
+_code, _out = _run(["--apply", "--feed", _FEED_FILE])
+check("--apply off the retail feed exits 3 instead of writing", _code, 3)
+check("...and says the prices are an estimate", "ESTIMATE" in _out, True)
+check("...and names the way out", "--allow-estimate" in _out, True)
+check("...having touched no sheet at all", "wrote" in _out, False)
+check("a DRY run off the same feed is still allowed",
+      _run(["--feed", _FEED_FILE])[0], "past the guard")
+check("--allow-estimate is the owner saying yes, and it writes",
+      _run(["--apply", "--feed", _FEED_FILE, "--allow-estimate"])[0], "past the guard")
+check("a saved feed is an estimate even when the key is in the environment",
+      _run(["--apply", "--feed", _FEED_FILE], key="k")[0], 3)
+check("--apply with the key reads the real wholesale price and goes through",
+      _run(["--apply"], key="k")[0], "past the guard")
+check("a saved wholesale dump is our real cost, so --apply goes through",
+      _run(["--apply", "--plans", _FEED_FILE])[0], "past the guard")
+os.unlink(_FEED_FILE)
+
+print()
 if _fails:
     print(f"❌ {len(_fails)} failed: {_fails}")
     sys.exit(1)

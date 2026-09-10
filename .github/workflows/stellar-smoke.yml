@@ -7,6 +7,14 @@ name: Stellar smoke test
 
 on:
   workflow_dispatch:
+    inputs:
+      order_id:
+        description: >-
+          A Stellar order id to inspect -- the tail of a portal /orders/<id>
+          link. Its eSIM field NAMES are printed, so stellar_usage.py can be
+          taught the real shape without buying anything.
+        required: false
+        default: "71fa53ce-6dad-435f-ab98-6c3e531808e0"
 
 permissions:
   contents: read
@@ -44,6 +52,30 @@ jobs:
           code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $KEY" "$BASE/wallet")
           echo "HTTP $code (anything but 200 is correct)"
           test "$code" != 200
+
+      # usage_bot reads a Stellar package's consumption through
+      # stellar_usage.py, whose field mapping is deliberately STRICT: a shape
+      # it does not recognise leaves the receipts row untouched and logs the
+      # key names instead of guessing a meter. This step is that same list on
+      # demand, before anything is sold -- paste what it prints into
+      # stellar_usage.USED_LEAVES / TOTAL_LEAVES and the mapper knows the
+      # shape. NAMES ONLY: an eSIM payload carries an activation code, and
+      # this repo's logs are public.
+      - name: esim fields (names only)
+        env:
+          KEY: ${{ secrets.STELLAR_API_KEY }}
+          ORDER_ID: ${{ inputs.order_id }}
+        run: |
+          code=$(curl -s -o order.json -w '%{http_code}' -H "Authorization: Bearer $KEY" -H 'Accept: application/json' "$BASE/orders/$ORDER_ID")
+          echo "GET /orders/<id> -> HTTP $code"
+          test "$code" = 200
+          echo "order fields: $(python3 -c 'import json,sys; P=lambda o,p="": [y for k,v in o.items() for y in [(p+"."+k if p else k)]+P(v,(p+"."+k if p else k))] if isinstance(o,dict) else ([y for v in o[:1] for y in P(v,p+"[]")] if isinstance(o,list) else []); print(", ".join(sorted(set(P(json.load(open(sys.argv[1])))))))' order.json)"
+          for sid in $(jq -r '(.data.esims // [])[].sim_id // empty' order.json); do
+            c=$(curl -s -o esim.json -w '%{http_code}' -H "Authorization: Bearer $KEY" -H 'Accept: application/json' "$BASE/esims/$sid")
+            echo "GET /esims/<sim_id> -> HTTP $c"
+            test "$c" = 200
+            echo "esim fields: $(python3 -c 'import json,sys; P=lambda o,p="": [y for k,v in o.items() for y in [(p+"."+k if p else k)]+P(v,(p+"."+k if p else k))] if isinstance(o,dict) else ([y for v in o[:1] for y in P(v,p+"[]")] if isinstance(o,list) else []); print(", ".join(sorted(set(P(json.load(open(sys.argv[1])))))))' esim.json)"
+          done
 
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

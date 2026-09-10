@@ -33,13 +33,21 @@ A Stellar package code is a family, not a product: CKH995 is sold as
 listing usually cost the same, and the 20-day one is strictly worse. The
 sheet's Stellar rows were first written from a cheapest-first read, and 19 of
 them landed on the 20-day twin: they say Stellar gives fewer days than it
-does, for no saving at all. This script picks by the owner's rule instead:
+does, for no saving at all. This script no longer decides that for itself: the
+owner's day rules live in day_policy.py and this script asks them.
 
     GB must equal the SKU's GB exactly.
-    Days must be AT LEAST what the customer is promised — the days on the row
-    we actually sell (the esim.dog row, or the Stellar row itself when it is
-    the only one). More days is fine; fewer is not a substitute.
-    Among what qualifies: the cheapest; on a tie, the longer product.
+    The validity must sit inside the window day_policy draws for that size at
+    this supplier -- day_floor(gb, 'stellar') .. day_ceiling(gb, 'stellar') --
+    and day_policy.pick() chooses inside it: 30 days first, given up only for
+    more than 1% off; then whatever sits closest to 30; and from 30GB up, a
+    Stellar plan longer than 31 days is taken when it costs no more.
+    A tie between two identical listings goes to the plainer name, so a
+    '(nonhkip)' twin never wins on the order the API happened to list it in.
+
+The floor is the OWNER's product definition, not the esim.dog twin's validity:
+the chooser now compares the two suppliers, so a row must not inherit its
+window from the row it is competing with.
 
 Two traps in the feed, both handled here and pinned by test_stellar_prices.py:
   * `variant.data_gb` is ROUNDED UP — a 750MB plan says 1. `meta.data_gb`
@@ -81,13 +89,13 @@ from typing import Callable, Optional
 
 import requests
 
+import day_policy
 from esim_price_scraper import HEADER_KEYS, SHEET_ID, col_letter
 
 FEED_URL = "https://stellarsecurity.com/assets/esim/products.index.json"   # retail; fallback only
 API_URL = "https://wholesale.stellarsecurity.com/api/v1/plans"
 API_PER_PAGE = 100            # the API's maximum
 API_MAX_PAGES = 60            # 6,000 listings; the catalogue is ~3,400. Also the 60/min budget.
-LONGER_TOL = 0.05             # a longer validity may cost up to 5% over the cheapest listing
 FX_URL = "https://api.frankfurter.app/latest"
 # Measured 2026-09-09: 58 rows, median 1.2192, stdev 0.0041. Re-measure the
 # day the wholesale API is wired in — a drift here mis-prices every row.
@@ -260,8 +268,29 @@ class StellarRow:
     price_cell: str
     changed: str
     stock: str
-    floor_days: Optional[int] = None   # what the customer is promised
     networks: str = ""                 # the Networks cell as it stands
+
+    @property
+    def floor_days(self) -> int:
+        """Shortest validity the owner sells this SIZE as (day_policy's bands).
+
+        It used to be the esim.dog twin's days -- what the site promises today.
+        That let one supplier's catalogue define the other's window, and the
+        chooser now compares the two: the bands belong to the size, not to the
+        row we are competing with.
+        """
+        return day_policy.day_floor(self.gb, SOURCE) if self.gb is not None else 0
+
+    @property
+    def ceiling_days(self):
+        """Longest validity worth asking for; None = unbounded (30GB+)."""
+        return day_policy.day_ceiling(self.gb, SOURCE) if self.gb is not None else None
+
+    @property
+    def window_text(self) -> str:
+        """'25-31' / '33+' -- the window, for a note that has to name it."""
+        ceil = self.ceiling_days
+        return f"{self.floor_days}-{ceil}" if ceil else f"{self.floor_days}+"
 
 
 def _num(s) -> Optional[float]:
@@ -286,7 +315,7 @@ REQUIRED = ("code", "countries", "gb", "source", "validity", "price", "prev",
 
 
 def read_rows(values: list[list[str]]) -> tuple[list[StellarRow], dict[str, int]]:
-    """Every Stellar row, with the days the customer is promised on its SKU.
+    """Every Stellar row of the price sheet, as read.
 
     Columns are found by header text through the scraper's own HEADER_KEYS,
     so the two scripts can never disagree about which column is which.
@@ -301,7 +330,6 @@ def read_rows(values: list[list[str]]) -> tuple[list[StellarRow], dict[str, int]
     width = max(col.values()) + 1
 
     stellar: list[StellarRow] = []
-    sold_days: dict[str, int] = {}
     for idx, raw in enumerate(values[1:], start=2):
         r = [str(x) for x in raw] + [""] * (width - len(raw))
         sku = r[col["code"]].strip()
@@ -309,11 +337,8 @@ def read_rows(values: list[list[str]]) -> tuple[list[StellarRow], dict[str, int]
             continue
         src = r[col["source"]].strip().lower()
         days = _num(r[col["validity"]])
-        if src == "esim.dog":
-            # The row the site sells today; its days are the promise.
-            if days:
-                sold_days[sku] = int(days)
-            continue
+        # The esim.dog twin is another supplier's row, not this row's window:
+        # the day bands come from day_policy (see StellarRow.floor_days).
         if src != SOURCE:
             continue
         price = r[col["price"]].strip()
@@ -323,8 +348,6 @@ def read_rows(values: list[list[str]]) -> tuple[list[StellarRow], dict[str, int]
             days=int(days) if days else None, eur=_eur(price), price_cell=price,
             changed=r[col["changed"]].strip(), stock=r[col["stock"]].strip(),
             networks=r[col["network"]].strip() if "network" in col else ""))
-    for s in stellar:
-        s.floor_days = sold_days.get(s.sku, s.days)
     return stellar, col
 
 
@@ -340,8 +363,18 @@ class Decision:
     won_days: int = 0           # days the cheapest listing would have cost us
 
 
-def decide(cat: Catalogue, row: StellarRow) -> Optional[Decision]:
-    """None means the row is not ours to touch (an owner's '—' note)."""
+def decide(cat: Catalogue, row: StellarRow, min_days: Optional[int] = None) -> Optional[Decision]:
+    """None means the row is not ours to touch (an owner's '—' note).
+
+    `min_days` is a promise made OUTSIDE the catalogue — the validity a paying
+    customer was already shown (stellar_buyer passes the order token's `d`).
+    It can only RAISE the floor day_policy drew for the size, never lower it:
+    the effective floor is max(band floor, min_days). The ceiling is untouched,
+    so a promise longer than the size's ceiling empties the window and the row
+    comes back reason='short' — the same answer as a size with nothing long
+    enough in it, and the right one: refusing to buy is cheaper than buying a
+    customer fewer days than he paid for.
+    """
     if not row.code or row.gb is None:
         return None
     if row.code in cat.regional_codes and not is_regional_sku(row.sku):
@@ -349,23 +382,29 @@ def decide(cat: Catalogue, row: StellarRow) -> Optional[Decision]:
     family = cat.by_code.get(row.code)
     if not family:
         return Decision(row, None, "gone")
-    floor = row.floor_days or 0
     same_gb = [v for v in family if abs(v.gb - row.gb) < 1e-9]
-    ok = [v for v in same_gb if v.days >= floor]
-    if not ok:
-        return Decision(row, None, "short", tuple(sorted({v.days for v in same_gb})))
     # Inside one package code the listings are the SAME product cut at different
     # (GB, days), so a cent between the 20-day and the 30-day twin is a pricing
-    # artifact, not a difference in what the buyer receives. Cheapest-wins
-    # therefore sold a third of the validity for an agora. So: the LONGEST wins,
-    # and a shorter listing only takes it back by saving real money -- more than
-    # LONGER_TOL of the cheapest price. A tie goes to the plainer name, so a
+    # artifact, not a difference in what the buyer receives -- which is why the
+    # owner's bands, not the price, draw the window. day_policy.pick() sorts
+    # stably and keeps the incumbent whenever it cannot separate two listings,
+    # so handing it the plainer name FIRST is how that tie is broken: a
     # '(nonhkip)' twin never wins on the order the API happened to list it in.
-    thrift = min(ok, key=lambda v: (v.wholesale_eur, -v.days))     # the old rule's pick
-    near = [v for v in ok if v.wholesale_eur <= thrift.wholesale_eur * (1 + LONGER_TOL) + 1e-9]
-    best = max(near, key=lambda v: (v.days, -v.wholesale_eur, -len(v.name)))
-    return Decision(row, best, paid_up=round(best.wholesale_eur - thrift.wholesale_eur, 4),
-                    won_days=best.days - thrift.days)
+    plain_first = sorted(same_gb, key=lambda v: (len(v.name), v.name))
+    window = day_policy.in_window_candidates(
+        row.gb, SOURCE, [(v.days, v.wholesale_eur, v) for v in plain_first])
+    floor = max(day_policy.day_floor(row.gb, SOURCE), int(min_days or 0))
+    # A no-op unless a promise raised the floor; pick() re-checks the band
+    # window itself, and every survivor here already satisfies both.
+    window = [c for c in window if c[0] >= floor]
+    if not window:
+        return Decision(row, None, "short", tuple(sorted({v.days for v in same_gb})))
+    best = day_policy.pick(row.gb, SOURCE, window)[2]
+    # Not a rule any more, just the arithmetic the dry run prints: what a
+    # cheapest-first read would have bought, and what the owner's validity cost.
+    thrift = min(window, key=lambda c: (c[1], -c[0]))
+    return Decision(row, best, paid_up=round(best.wholesale_eur - thrift[1], 4),
+                    won_days=best.days - thrift[0])
 
 
 def sanity(decisions) -> str:
@@ -446,7 +485,7 @@ def plan_updates(decisions, fx: float, ts: str, today: str) -> list[tuple[int, s
                 note, mark = "הקוד נעלם מהקטלוג של Stellar", MARK_GONE
             elif d.reason == "short":
                 have = ", ".join(f"{x}d" for x in d.have_days) or "כלום"
-                note = f"אין {r.gb:g}GB ל-{r.floor_days}+ ימים בקוד {r.code} (יש: {have})"
+                note = f"אין {r.gb:g}GB ל-{r.window_text} ימים בקוד {r.code} (יש: {have})"
                 mark = MARK_SHORT
             else:
                 note, mark = "קוד אזורי תחת שם מדינה — לא הושווה", MARK_REGIONAL
@@ -590,7 +629,7 @@ def _describe(d: Decision, fx: float) -> str:
     head = f"row {r.row:<4}{r.sku:<9}{r.country:<12}{r.code:<11}"
     if d.pick is None:
         why = {"gone": "GONE from catalogue", "regional": "REGIONAL code under a country SKU",
-               "short": f"no {r.gb:g}GB with ≥{r.floor_days}d (has {', '.join(str(x) for x in d.have_days) or 'none'})"}[d.reason]
+               "short": f"no {r.gb:g}GB at {r.window_text}d (has {', '.join(str(x) for x in d.have_days) or 'none'})"}[d.reason]
         return f"{head} ✗ {why}"
     v = d.pick
     old = f"€{r.eur:.2f}" if r.eur is not None else "—"
@@ -608,6 +647,8 @@ def main(argv=None) -> int:
         pass
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--apply", action="store_true", help="write to the sheet (default: dry run)")
+    ap.add_argument("--allow-estimate", action="store_true",
+                    help="write even when the prices are the retail-feed estimate (normally refused)")
     ap.add_argument("--feed", help="read a saved products.index.json (retail feed) instead of fetching")
     ap.add_argument("--plans", help="read a saved wholesale-API dump (JSON list of plans) instead of fetching")
     ap.add_argument("--credentials",
@@ -616,6 +657,28 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     key = os.environ.get("STELLAR_READ_KEY", "").strip()
+
+    # The retail feed does not hold our cost: it holds the shop price, divided
+    # by a ratio MEASURED once over 58 rows. That is fine to LOOK at and wrong
+    # to write, because nothing downstream can tell an estimate from a price —
+    # stellar_buyer reads the sheet's euros back as the real wholesale figure
+    # and refuses a purchase whose listing costs more than it (PRICE_RISE_TOL).
+    # An estimate a few cents low therefore does not just mis-report a margin,
+    # it stops sales. CI always has STELLAR_READ_KEY (memory: stellar-key-
+    # placement), so a run that reaches here without one is a rotated or
+    # dropped secret — which must fail loudly, not quietly write guesses.
+    estimate = bool(a.feed) or not (a.plans or key)
+    if a.apply and estimate and not a.allow_estimate:
+        why = (f"a saved RETAIL feed ({a.feed})" if a.feed
+               else "the public RETAIL feed — STELLAR_READ_KEY is not set")
+        print(f"🛑 --apply refused: the prices would come from {why}, so every euro "
+              f"written would be retail / {RETAIL_OVER_WHOLESALE} — an ESTIMATE, not our cost.\n"
+              f"   The buyer trusts these cells as the real wholesale price, so a wrong one "
+              f"refuses purchases.\n"
+              f"   Restore STELLAR_READ_KEY (or pass --plans), or re-run with --allow-estimate "
+              f"if the estimate really is what you want written.")
+        return 3
+
     if a.plans:
         with open(a.plans, encoding="utf-8") as f:
             dump = json.load(f)
