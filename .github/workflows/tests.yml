@@ -80,6 +80,11 @@ jobs:
       - name: Day policy
         run: python test_day_policy.py
 
+      # The Stellar meter: /esims/{sim_id}/usage, and the VPN expiry never
+      # becomes the package expiry.
+      - name: Stellar usage
+        run: python test_stellar_usage.py
+
       # Which SUPPLIER a row is bought from. Two rows sit under one SKU and only
       # one of them is the one we pay; picking the wrong one spends money at the
       # wrong place under the right price.
