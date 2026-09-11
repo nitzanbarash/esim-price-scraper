@@ -1,0 +1,53 @@
+# The owner runs discounts from a sheet tab; the till reads them from the
+# site's KV. Nothing connects the two until this runs.
+name: Coupons sync (hourly)
+
+# :17 rather than :00 - the hour mark is where the other schedules pile up and
+# GitHub then hands out a late slot. Every three hours, not hourly: each run
+# pushes the whole tab (three store commands a row) against the one 500K/month
+# KV budget the order queue lives on, and every hand edit already pushes
+# itself instantly from waverole_sync.gs. This run is the safety net for
+# programmatic writes (which do not fire onEdit) and for pulling the use
+# counters back.
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+
+# The coupon tab has one other writer - the Apps Script - and this job both
+# reads it and writes three columns back. Two overlapping runs would push the
+# same rows twice and race on the append. Nothing here belongs to the price
+# columns, so this is its own group and never queues behind a scrape.
+concurrency:
+  group: coupons
+  cancel-in-progress: false
+
+jobs:
+  coupons:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -q gspread google-auth requests
+
+      # Without ORDERS_TOKEN the script stops before it reaches the site and
+      # says so in one line - it does not write half a sync (memory:
+      # orders-token-locations: the token lives in five places and a missing
+      # one has looked like a working, empty sync before).
+      #
+      # This log is PUBLIC. coupon_sync.py prints counts and public code names
+      # only; a personal code, its bound email and any social handle never
+      # leave the sheet.
+      - name: Sync the coupon tab
+        env:
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python coupon_sync.py

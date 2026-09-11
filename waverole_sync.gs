@@ -51,6 +51,7 @@
  *   fullSync       - push all packages to the site now
  *   runScrapeNow   - trigger the GitHub scraper now
  *   checkSiteFresh - run the freshness watchdog now
+ *   syncCouponsNow - push the coupon tab and pull the use counters now
  */
 
 const ENDPOINT = 'https://www.waverole.com/api/update-packages';
@@ -411,7 +412,12 @@ function setupTriggers() {
   // formula paste would otherwise be unrecoverable beyond version history.
   ScriptApp.newTrigger('weeklyBackup').timeBased()
     .onWeekDay(ScriptApp.WeekDay.SUNDAY).atHour(3).inTimezone('Asia/Jerusalem').create();
-  Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape + 12:00 watchdog + 1-min fulfillment tick + weekly backup');
+  // A redemption happens on the SITE, so the sheet only learns about it by
+  // asking. Editing the tab pushes instantly; this is the other direction, and
+  // the hourly GitHub job behind it is what still runs when this project has
+  // spent its quota.
+  ScriptApp.newTrigger('pullCoupons').timeBased().everyMinutes(30).create();
+  Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape + 12:00 watchdog + 1-min fulfillment tick + 30-min coupon pull + weekly backup');
 }
 
 // -- helpers ---------------------------------------------------------
@@ -677,6 +683,10 @@ function onEditPush(e) {
   try {
     if (!e || !e.range) return;
     const sheet = e.range.getSheet();
+    // The coupon tab is answered first and on its own terms: it has no SKUs, no
+    // fee ladder and no chosen-supplier tick, so everything below would read its
+    // header row as a broken price sheet.
+    if (sheet.getName() === COUPON_TAB) { syncCoupons_(true); return; }
     const main = e.source.getSheets()[0];
     if (sheet.getSheetId() !== main.getSheetId()) return;
     const map = colMap_(sheet);
@@ -1281,7 +1291,8 @@ function lastScrapeRun_() {
 // Kept next to the watchdog rather than inside setupTriggers so that adding a
 // feature here forces the question "and is it actually running?".
 const EXPECTED_TRIGGERS = ['onEditPush', 'onReceiptsEdit', 'dailyScrape',
-                           'checkSiteFresh', 'fulfillmentTick', 'weeklyBackup'];
+                           'checkSiteFresh', 'fulfillmentTick', 'pullCoupons',
+                           'weeklyBackup'];
 
 /**
  * The daily 12:00 health check.
@@ -1405,4 +1416,381 @@ function checkSiteFresh() {
     report_('\u05d4\u05d1\u05d3\u05d9\u05e7\u05d4 \u05d4\u05d9\u05d5\u05de\u05d9\u05ea \u05e2\u05d1\u05e8\u05d4 \u2014 \u05d4\u05db\u05dc \u05ea\u05e7\u05d9\u05df \u2713',
       '\u05db\u05dc \u05d4\u05d1\u05d3\u05d9\u05e7\u05d5\u05ea \u05e2\u05d1\u05e8\u05d5:\n\u2022 ' + passed.join('\n\u2022 '));
   }
+}
+
+// -- coupon tab -> the site's coupon store ---------------------------
+// Discount codes used to be a table inside the site's own JavaScript, which
+// meant anyone reading the page could read the codes. They now live in the
+// site's key-value store and are edited HERE: this tab is what the owner sees,
+// and this block is what makes the till agree with it.
+//
+// Two writers push the same three grey columns: this script (instantly on an
+// edit, plus every 30 minutes) and coupons-sync.yml in the scraper repo (hourly,
+// and the one that still runs when this project is out of quota). Both write
+// the same derived values from the same server answer, so an overlap costs a
+// duplicate request and nothing else - only the append of a code the sheet does
+// not have yet could race, and a script lock keeps this side of it single-file.
+const COUPON_TAB = '\u05e7\u05d5\u05e4\u05d5\u05e0\u05d9\u05dd';
+const COUPON_ORDERS_URL = 'https://www.waverole.com/api/orders';
+const COUPON_HEADERS = [
+  '\u05e7\u05d5\u05d3 - Code',
+  '\u05d4\u05e0\u05d7\u05d4 % - Percent',
+  '\u05d4\u05e0\u05d7\u05d4 $ - Fixed',
+  '\u05ea\u05e7\u05e8\u05d4 $ - Max off',
+  '\u05de-GB (\u05db\u05d5\u05dc\u05dc) - Min GB',
+  '\u05e2\u05d3 GB (\u05db\u05d5\u05dc\u05dc) - Max GB',
+  '\u05dc\u05d0 \u05ea\u05e7\u05e3 \u05dc - Exclude',
+  '\u05ea\u05e7\u05e3 \u05e8\u05e7 \u05dc - Only',
+  '\u05de\u05e7\u05e1\u05f3 \u05e9\u05d9\u05de\u05d5\u05e9\u05d9\u05dd - Max uses',
+  '\u05dc\u05db\u05dc \u05dc\u05e7\u05d5\u05d7 - Per customer',
+  '\u05de\u05ea\u05d0\u05e8\u05d9\u05da - Starts',
+  '\u05e2\u05d3 \u05ea\u05d0\u05e8\u05d9\u05da - Expires',
+  '\u05e4\u05e2\u05d9\u05dc - Active',
+  '\u05e8\u05e7 \u05dc\u05d0\u05d9\u05de\u05d9\u05d9\u05dc - Email',
+  '\u05ea\u05d5\u05d5\u05d9\u05ea - Label',
+  '\u05d4\u05e2\u05e8\u05d4 - Note',
+  '\u05e9\u05d9\u05de\u05d5\u05e9\u05d9\u05dd - Uses',
+  '\u05de\u05e7\u05d5\u05e8 - Source',
+  '\u05e1\u05d5\u05e0\u05db\u05e8\u05df - Synced',
+];
+const COUPON_SOURCE_HE = {
+  builtin: '\u05de\u05d5\u05d1\u05e0\u05d4',
+  sheet: '\u05d2\u05d9\u05dc\u05d9\u05d5\u05df',
+  auto: '\u05d0\u05d5\u05d8\u05d5\u05de\u05d8\u05d9',
+  api: 'API',
+};
+const COUPON_TZ = 'Asia/Jerusalem';
+const COUPON_CODE_RE = /^[A-Z0-9]{2,24}$/;
+const COUPON_TRUE = ['\u05db\u05df', 'yes', 'y', 'true', '1', 'v', '\u2713', 'on', '\u05e4\u05e2\u05d9\u05dc'];
+
+/** Trim + uppercase, or '' for anything the till would refuse anyway. */
+function couponCode_(v) {
+  const c = String(v === null || v === undefined ? '' : v).trim().toUpperCase();
+  return COUPON_CODE_RE.test(c) ? c : '';
+}
+
+function couponNum_(v, field, lo, hi) {
+  if (v === '' || v === null || v === undefined) return null;
+  if (typeof v === 'boolean') throw new Error(field + ': expected a number');
+  const n = typeof v === 'number' ? v
+    : parseFloat(String(v).replace(/[$%,\u20aa\s]/g, ''));
+  if (isNaN(n)) throw new Error(field + ': not a number');
+  if ((lo !== null && n < lo) || (hi !== null && n > hi)) {
+    throw new Error(field + ': ' + n + ' is out of range');
+  }
+  return n;
+}
+
+/**
+ * Percent, with the percent-FORMAT trap defused: a cell formatted as a percent
+ * reads back as 0.1, not 10. Nobody ships a 0.1% coupon, so anything under 1 is
+ * the format talking. Same class of bug as the currency format that once
+ * cancelled three paid orders.
+ */
+function couponPct_(v, field) {
+  const n = couponNum_(v, field, 0, 100);
+  return n !== null && n > 0 && n < 1 ? n * 100 : n;
+}
+
+function couponInt_(v, field) {
+  const n = couponNum_(v, field, 0, null);
+  if (n === null) return null;
+  if (Math.abs(n - Math.round(n)) > 1e-9) {
+    throw new Error(field + ': must be a whole number');
+  }
+  return Math.round(n);
+}
+
+/** A blank counts as NOT active - a half-typed row must not go live. */
+function couponBool_(v) {
+  if (typeof v === 'boolean') return v;
+  const s = String(v === null || v === undefined ? '' : v).trim().toLowerCase();
+  return COUPON_TRUE.indexOf(s) >= 0;
+}
+
+function couponList_(v) {
+  if (typeof v === 'number') return [String(v)];
+  return String(v === null || v === undefined ? '' : v)
+    .split(/[,\n;]+/).map(s => s.trim()).filter(Boolean);
+}
+
+/**
+ * Sheet date -> an instant, or null.
+ *
+ * A start opens at 00:00 Israel and an expiry runs to 23:59:59 Israel. A bare
+ * 'yyyy-MM-dd' is read by the site as UTC midnight, which retires a coupon
+ * three hours before the date printed beside it. The offset is taken at NOON of
+ * that day, the one hour a daylight-saving change can never land on.
+ */
+function couponIso_(v, endOfDay) {
+  if (v === '' || v === null || v === undefined) return null;
+  let d;
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    d = v;
+  } else {
+    const s = String(v).trim();
+    if (!s) return null;
+    if (s.indexOf('T') > 0) return s;              // already an instant
+    let m = s.match(/^(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})$/);
+    if (m) {
+      d = new Date(+m[1], +m[2] - 1, +m[3], 12);
+    } else {
+      m = s.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})$/);
+      if (!m) throw new Error('date: "' + s + '" is not a date');
+      let y = +m[3];
+      if (y < 100) y += 2000;
+      d = new Date(y, +m[2] - 1, +m[1], 12);       // day first: an Israeli sheet
+    }
+  }
+  const day = Utilities.formatDate(d, COUPON_TZ, 'yyyy-MM-dd');
+  const off = Utilities.formatDate(new Date(day + 'T12:00:00Z'), COUPON_TZ, 'XXX');
+  return day + (endOfDay ? 'T23:59:59' : 'T00:00:00') + off;
+}
+
+/** One sheet row -> one upsert input, or null when the row carries no code. */
+function couponRowInput_(cells, idx) {
+  const at = i => cells[idx[COUPON_HEADERS[i]]];
+  const code = couponCode_(at(0));
+  if (!code) {
+    if (String(at(0) || '').trim()) {
+      throw new Error('code: letters and digits only, 2-24 characters');
+    }
+    return null;
+  }
+  const email = String(at(13) || '').trim().toLowerCase();
+  const label = String(at(14) || '').trim().slice(0, 40);
+  // Rows the server wrote here are its own: a minted personal code pushed
+  // back up would be reborn as a permanent sheet definition the day its KV
+  // record expires. The source cell says so; the shape says so if the cell
+  // was lost.
+  if (String(at(17) || '').trim() === COUPON_SOURCE_HE.auto) return null;
+  if (/^WR[A-Z2-9]{8}$/.test(code) && email) return null;
+  return {
+    code: code,
+    pct: couponPct_(at(1), COUPON_HEADERS[1]),
+    fixed_usd: couponNum_(at(2), COUPON_HEADERS[2], 0, null),
+    max_off_usd: couponNum_(at(3), COUPON_HEADERS[3], 0, null),
+    min_gb: couponNum_(at(4), COUPON_HEADERS[4], 0, null),
+    max_gb: couponNum_(at(5), COUPON_HEADERS[5], 0, null),
+    exclude: couponList_(at(6)),
+    only: couponList_(at(7)),
+    max_uses: couponInt_(at(8), COUPON_HEADERS[8]),
+    per_customer: couponInt_(at(9), COUPON_HEADERS[9]),
+    starts_at: couponIso_(at(10), false),
+    expires_at: couponIso_(at(11), true),
+    active: couponBool_(at(12)),
+    bound_email: email || null,
+    label: label || null,
+    note: String(at(15) || '').trim() || null,
+  };
+}
+
+/**
+ * The site's token, or null after one email a day.
+ *
+ * Without it this whole feature does nothing and looks exactly like a broken
+ * sheet - the same silence that once hid the usage meter being dead. One email,
+ * at most once a day, then quiet. Its own property so a receipts warning and a
+ * coupon warning never mask each other.
+ */
+function couponToken_() {
+  const props = PropertiesService.getScriptProperties();
+  const tok = props.getProperty('ORDERS_TOKEN');
+  if (tok) return tok;
+  const today = Utilities.formatDate(new Date(), COUPON_TZ, 'yyyy-MM-dd');
+  if (props.getProperty('COUPON_TOKEN_WARNED_ON') !== today) {
+    props.setProperty('COUPON_TOKEN_WARNED_ON', today);
+    alert_('\u05d7\u05e1\u05e8 ORDERS_TOKEN \u2014 \u05d4\u05e7\u05d5\u05e4\u05d5\u05e0\u05d9\u05dd \u05dc\u05d0 \u05de\u05e1\u05ea\u05e0\u05db\u05e8\u05e0\u05d9\u05dd',
+      '\u05e2\u05e8\u05db\u05ea \u05d0\u05ea \u05d8\u05d1\u05dc\u05ea \u05d4\u05e7\u05d5\u05e4\u05d5\u05e0\u05d9\u05dd, \u05d0\u05d1\u05dc \u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05dc\u05d0\u05ea\u05e8 \u05dc\u05d0 \u05e8\u05e5 \u05db\u05d9 \u05d0\u05d9\u05df ORDERS_TOKEN \u05d1\u05de\u05d0\u05e4\u05d9\u05d9\u05e0\u05d9 \u05d4\u05e1\u05e7\u05e8\u05d9\u05e4\u05d8.\n\n' +
+      '\u05ea\u05d9\u05e7\u05d5\u05df: \u05e2\u05d5\u05e8\u05da \u05d4\u05e1\u05e7\u05e8\u05d9\u05e4\u05d8 \u2192 \u2699\ufe0f \u05d4\u05d2\u05d3\u05e8\u05d5\u05ea \u05d4\u05e4\u05e8\u05d5\u05d9\u05e7\u05d8 \u2192 \u05de\u05d0\u05e4\u05d9\u05d9\u05e0\u05d9 \u05e1\u05e7\u05e8\u05d9\u05e4\u05d8 \u2192 ' +
+      '\u05d4\u05d5\u05e1\u05e4\u05ea \u05de\u05d0\u05e4\u05d9\u05d9\u05df \u2192 \u05e9\u05dd: ORDERS_TOKEN \u2192 \u05d4\u05d3\u05d1\u05e7 \u05d0\u05ea \u05d4\u05e2\u05e8\u05da \u2192 \u05e9\u05de\u05d9\u05e8\u05d4.\n' +
+      '\u05d0\u05d7\u05e8 \u05db\u05da \u05d4\u05e8\u05e5 syncCouponsNow \u05db\u05d3\u05d9 \u05dc\u05d5\u05d5\u05d3\u05d0 \u05e9\u05d4\u05db\u05dc \u05e2\u05d5\u05d1\u05d3.');
+  }
+  return null;
+}
+
+/** POST when there is a payload, GET ?coupons=1 when there is not. */
+function couponCall_(tok, payload) {
+  const url = COUPON_ORDERS_URL + (payload ? '' : '?coupons=1');
+  const opts = {
+    method: payload ? 'post' : 'get',
+    headers: { Authorization: 'Bearer ' + tok },
+    muteHttpExceptions: true,
+  };
+  if (payload) {
+    opts.contentType = 'application/json';
+    opts.payload = JSON.stringify(payload);
+  }
+  const res = UrlFetchApp.fetch(url, opts);
+  const code = res.getResponseCode();
+  const body = res.getContentText();
+  if (code !== 200) {
+    alert_('\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05d4\u05e7\u05d5\u05e4\u05d5\u05e0\u05d9\u05dd \u05e0\u05db\u05e9\u05dc (HTTP ' + code + ')',
+      '\u05d4\u05e7\u05e8\u05d9\u05d0\u05d4 \u05dc-' + url + ' \u05d4\u05d7\u05d6\u05d9\u05e8\u05d4 ' + code + ':\n' + body.slice(0, 500));
+    return null;
+  }
+  try {
+    return JSON.parse(body);
+  } catch (err) {
+    alert_('\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05d4\u05e7\u05d5\u05e4\u05d5\u05e0\u05d9\u05dd \u05d4\u05d7\u05d6\u05d9\u05e8 \u05ea\u05e9\u05d5\u05d1\u05d4 \u05dc\u05d0 \u05ea\u05e7\u05d9\u05e0\u05d4',
+      '\u05d4\u05e7\u05e8\u05d9\u05d0\u05d4 \u05dc-' + url + ' \u05d4\u05e6\u05dc\u05d9\u05d7\u05d4 \u05d0\u05d1\u05dc \u05dc\u05d0 \u05d4\u05d7\u05d6\u05d9\u05e8\u05d4 JSON:\n' + body.slice(0, 500));
+    return null;
+  }
+}
+
+/**
+ * The server's answer back into the sheet: uses/source/synced beside every row
+ * it recognises, and a new row for every code it holds that the sheet does not -
+ * the personal codes the survey reward mints. Written with setValues, never a
+ * cell at a time.
+ */
+function couponWriteBack_(tab, values, idx, server, stamp) {
+  const byCode = {};
+  server.forEach(function (d) {
+    const c = couponCode_(d.code);
+    if (c) byCode[c] = d;
+  });
+  const ccol = idx[COUPON_HEADERS[0]];
+  const qcol = idx[COUPON_HEADERS[16]];
+  const rcol = idx[COUPON_HEADERS[17]];
+  const scol = idx[COUPON_HEADERS[18]];
+
+  const trio = [], seen = {};
+  for (let r = 1; r < values.length; r++) {
+    const code = couponCode_(values[r][ccol]);
+    const d = code ? byCode[code] : null;
+    // Not on the server: no count, no stamp - but the source cell stays, so
+    // an expired personal code is still recognised as the server's.
+    if (!d) { trio.push(['', values[r][rcol] || '', '']); continue; }
+    seen[code] = true;
+    trio.push([d.uses || 0, COUPON_SOURCE_HE[d.source] || d.source || '', stamp]);
+  }
+  if (trio.length) {
+    if (rcol === qcol + 1 && scol === qcol + 2) {
+      tab.getRange(2, qcol + 1, trio.length, 3).setValues(trio);
+    } else {
+      // A reordered sheet is still worth syncing; it just costs three writes.
+      [qcol, rcol, scol].forEach(function (col, n) {
+        tab.getRange(2, col + 1, trio.length, 1)
+          .setValues(trio.map(t => [t[n]]));
+      });
+    }
+  }
+
+  const extra = [], names = [];
+  Object.keys(byCode).sort().forEach(function (code) {
+    if (seen[code]) return;
+    const d = byCode[code];
+    const row = [];
+    for (let i = 0; i < COUPON_HEADERS.length; i++) row.push('');
+    row[0] = code;
+    row[1] = d.pct || '';
+    row[2] = d.fixed_usd || '';
+    row[3] = d.max_off_usd || '';
+    row[4] = d.min_gb || '';
+    row[5] = d.max_gb || '';
+    row[6] = (d.exclude || []).join(', ');
+    row[7] = (d.only || []).join(', ');
+    row[8] = d.max_uses || '';
+    row[9] = d.per_customer || '';
+    row[10] = String(d.starts_at || '').slice(0, 10);
+    row[11] = String(d.expires_at || '').slice(0, 10);
+    row[12] = d.active ? '\u05db\u05df' : '\u05dc\u05d0';
+    row[13] = d.bound_email || '';
+    row[14] = d.label || '';
+    row[15] = d.note || '';
+    row[16] = d.uses || 0;
+    row[17] = COUPON_SOURCE_HE[d.source] || d.source || '';
+    row[18] = stamp;
+    extra.push(row);
+    // A personal code is a bearer secret. It belongs in the owner's sheet, not
+    // in an execution log that gets pasted into a chat when something breaks.
+    names.push(d.source === 'auto' || d.bound_email ? '(\u05d0\u05d9\u05e9\u05d9)' : code);
+  });
+  if (extra.length) {
+    const first = values.length + 1;
+    const need = first + extra.length - 1;
+    if (need > tab.getMaxRows()) tab.insertRowsAfter(tab.getMaxRows(), need - tab.getMaxRows());
+    tab.getRange(first, 1, extra.length, COUPON_HEADERS.length).setValues(extra);
+  }
+  return names;
+}
+
+// push: true from an edit (the tab changed), false from the timer (only the
+// counters are wanted - re-sending an unchanged tab every half hour is three
+// store commands a row against the budget the order queue lives on). An edit
+// that could not take the lock leaves a flag, and the next timer run pushes
+// for it; a dropped edit would otherwise sit in the sheet looking synced.
+function syncCoupons_(push) {
+  const props = PropertiesService.getScriptProperties();
+  const lock = LockService.getScriptLock();
+  try {
+    lock.waitLock(60000);
+  } catch (err) {
+    if (push) props.setProperty('COUPON_SYNC_DUE', '1');
+    return;
+  }
+  try {
+    const tab = SpreadsheetApp.openById(SHEET_ID).getSheetByName(COUPON_TAB);
+    if (!tab) return;
+    const tok = couponToken_();
+    if (!tok) return;
+    if (!push && props.getProperty('COUPON_SYNC_DUE')) push = true;
+
+    const values = tab.getDataRange().getValues();
+    if (values.length < 1) return;
+    const head = values[0].map(h => String(h).trim());
+    const idx = {};
+    COUPON_HEADERS.forEach(function (h) { idx[h] = head.indexOf(h); });
+    const missing = COUPON_HEADERS.filter(h => idx[h] < 0);
+    if (missing.length) {
+      alert_('\u05e2\u05de\u05d5\u05d3\u05d4 \u05d7\u05e1\u05e8\u05d4 \u05d1\u05d8\u05d1\u05dc\u05ea \u05d4\u05e7\u05d5\u05e4\u05d5\u05e0\u05d9\u05dd \u2014 \u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05e0\u05e2\u05e6\u05e8',
+        '\u05d4\u05e2\u05de\u05d5\u05d3\u05d5\u05ea \u05d4\u05d0\u05dc\u05d4 \u05dc\u05d0 \u05e0\u05de\u05e6\u05d0\u05d5 \u05d1\u05e9\u05d5\u05e8\u05ea \u05d4\u05db\u05d5\u05ea\u05e8\u05d5\u05ea:\n' + missing.join('\n') +
+        '\n\n\u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05de\u05d5\u05e6\u05d0 \u05e2\u05de\u05d5\u05d3\u05d5\u05ea \u05dc\u05e4\u05d9 \u05d4\u05d8\u05e7\u05e1\u05d8 \u05e9\u05dc\u05d4\u05df, \u05d0\u05d6 \u05e9\u05d9\u05e0\u05d5\u05d9 \u05e9\u05dd \u05db\u05d5\u05ea\u05e8\u05ea \u05e2\u05d5\u05e6\u05e8 \u05d0\u05d5\u05ea\u05d5. ' +
+        '\u05d9\u05e9 \u05dc\u05d4\u05d7\u05d6\u05d9\u05e8 \u05d0\u05ea \u05d4\u05e9\u05dd \u05d1\u05d3\u05d9\u05d5\u05e7 \u05db\u05e4\u05d9 \u05e9\u05d4\u05d5\u05d0 \u05db\u05d0\u05df, \u05d0\u05d5 \u05dc\u05e2\u05d3\u05db\u05df \u05d0\u05ea COUPON_HEADERS \u05d1\u05e7\u05d5\u05d3.');
+      return;
+    }
+
+    const coupons = [], problems = [];
+    for (let r = 1; r < values.length; r++) {
+      try {
+        const inp = couponRowInput_(values[r], idx);
+        if (inp) coupons.push(inp);
+      } catch (err) {
+        problems.push('\u05e9\u05d5\u05e8\u05d4 ' + (r + 1) + ': ' + err.message);
+      }
+    }
+    if (problems.length) {
+      // One broken row must not stop the other twenty from reaching the till.
+      alert_('\u05e9\u05d5\u05e8\u05d5\u05ea \u05e9\u05dc\u05d0 \u05e0\u05e7\u05e8\u05d0\u05d5 \u05d1\u05d8\u05d1\u05dc\u05ea \u05d4\u05e7\u05d5\u05e4\u05d5\u05e0\u05d9\u05dd (' + problems.length + ')',
+        problems.join('\n') + '\n\n\u05e9\u05d0\u05e8 \u05d4\u05e9\u05d5\u05e8\u05d5\u05ea \u05e1\u05d5\u05e0\u05db\u05e8\u05e0\u05d5 \u05db\u05e8\u05d2\u05d9\u05dc.');
+    }
+
+    if (push) {
+      if (!couponCall_(tok, { action: 'coupon_sync', coupons: coupons })) return;
+      props.deleteProperty('COUPON_SYNC_DUE');
+    }
+    const state = couponCall_(tok, null);
+    if (!state) return;
+
+    const stamp = Utilities.formatDate(new Date(), COUPON_TZ, 'yyyy-MM-dd HH:mm');
+    const added = couponWriteBack_(tab, values, idx, state.coupons || [], stamp);
+    Logger.log('coupons: ' + (push ? 'pushed ' + coupons.length : 'pull only') + ', site holds ' +
+      (state.coupons || []).length + ', appended ' + added.length +
+      (added.length ? ' (' + added.join(', ') + ')' : '') +
+      ', rewards awaiting approval: ' + (state.rewards_pending || []).length);
+  } catch (err) {
+    Logger.log('syncCoupons_ failed: ' + err);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** The every-30-minute trigger: pull the use counters even on a quiet day. */
+function pullCoupons() { syncCoupons_(false); }
+
+/** Manual: function dropdown -> Run. Pushes the tab and pulls the counters. */
+function syncCouponsNow() {
+  syncCoupons_(true);
+  Logger.log('done - see the lines above');
 }

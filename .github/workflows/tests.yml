@@ -90,3 +90,9 @@ jobs:
       # wrong place under the right price.
       - name: Choose supplier
         run: python test_choose_supplier.py
+
+      # What a coupon row MEANS before it is pushed to the till. A blank 'active'
+      # cell that read as true, or a percent-formatted 10 that read as 0.1, is a
+      # discount nobody approved being handed to everyone who asks.
+      - name: Coupon sync
+        run: python test_coupon_sync.py
