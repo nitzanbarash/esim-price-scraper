@@ -87,8 +87,42 @@ PRICE_TOL = 0.005        # a rounding cent over the sheet is not a price rise
 # the day rules now live in day_policy and have nothing to do with this number.
 PRICE_RISE_TOL = 0.05
 SETTLE_WAIT_S = int(os.getenv("STELLAR_SETTLE_WAIT_S", "90"))   # one run's patience
-POLL_EVERY_S = 10
 REPLAY_WAIT_S = float(os.getenv("STELLAR_REPLAY_WAIT_S", "3"))  # before re-asking the same key
+
+# The gaps between asks while Stellar provisions, in seconds, then the last one
+# forever. It used to be a flat ten, which is the wrong shape: provisioning is
+# normally a second or two, so the common order sat finished for nine seconds
+# with a customer watching the order page, while a slow one gained nothing from
+# being asked six times a minute. SETTLE_WAIT_S is still the only thing that
+# ends the wait -- the ramp only decides when the asks fall.
+POLL_RAMP_DEFAULT = (1.0, 2.0, 3.0, 5.0, 8.0, 10.0)
+
+
+def _ramp(spec: str) -> tuple:
+    """'1,2,3' -> (1.0, 2.0, 3.0). Anything unreadable keeps the default: a
+    typo in a workflow env must not turn the wait into a tight loop."""
+    out = []
+    for part in str(spec or "").split(","):
+        try:
+            v = float(part.strip())
+        except ValueError:
+            return POLL_RAMP_DEFAULT
+        if not (v > 0) or v == float("inf"):    # 0, negative, nan, inf
+            return POLL_RAMP_DEFAULT
+        out.append(v)
+    return tuple(out) if out else POLL_RAMP_DEFAULT
+
+
+POLL_RAMP = _ramp(os.getenv("STELLAR_POLL_RAMP", ""))
+
+
+def poll_delays():
+    """1, 2, 3, 5, 8, 10, 10, 10 ... -- the ramp, then its last step forever."""
+    for d in POLL_RAMP:
+        yield d
+    while True:
+        yield POLL_RAMP[-1]
+
 
 # How long this run may spend before it hands the rest back to the next one.
 # The worst case is not the common one -- a create_order that times out is 60s,
@@ -344,18 +378,25 @@ def _hdr(ws) -> list[str]:
     return [h.strip() for h in ws.row_values(1)]
 
 
-def order_rows(ws, order_id: str) -> list[dict]:
+def order_rows(ws, order_id: str, hdr: Optional[list] = None,
+               values: Optional[list] = None) -> list[dict]:
     """Every attempt this bot recorded for the order, oldest first, as
     {n, status, stellar_id, ...} -- keyed by order number AND a Stellar
     route, so an esim.dog row for the same order number is never mistaken
-    for ours."""
-    hdr = _hdr(ws)
+    for ours.
+
+    `hdr` and `values` are the reads a caller has already made. One order used
+    to cost four full reads of the same sheet while the buyer sat in front of
+    a waiting customer; the header cannot change inside a run, and the rows are
+    re-read by append_row's own guard when it matters.
+    """
+    hdr = hdr if hdr is not None else _hdr(ws)
     want = {H_ORDER, H_ROUTE, H_STATUS, H_LINK_SUP}
     if not want <= set(hdr):
         raise RuntimeError(f"receipts sheet header missing: {sorted(want - set(hdr))}")
     idx = {h: hdr.index(h) for h in want}
     out = []
-    for n, r in enumerate(ws.get_all_values()[1:], start=2):
+    for n, r in enumerate((values if values is not None else ws.get_all_values())[1:], start=2):
         r = list(r) + [""] * len(hdr)
         if r[idx[H_ORDER]].strip() != order_id or not r[idx[H_ROUTE]].strip().startswith(ROUTE_PREFIX):
             continue
@@ -370,7 +411,7 @@ def order_rows(ws, order_id: str) -> list[dict]:
     return out
 
 
-def append_row(ws, values: dict) -> int:
+def append_row(ws, values: dict, hdr: Optional[list] = None) -> int:
     """Explicit A{n} write, never append_row: gspread's table detection once
     shifted a receipts row 18 columns right (memory: esim-bot-project).
 
@@ -379,8 +420,14 @@ def append_row(ws, values: dict) -> int:
     else's row can land on n and this one overwrites it. This row is the proof
     that money was spent; losing it buys the package again. So the write is
     read back once, and repeated at the new end if it did not survive.
+
+    n is always taken from a FRESH read, right before the write. The read the
+    duplicate guard made is minutes old by the time the money has moved (the
+    plan lookup and the purchase sit in between), and a guess from it would
+    land this row on top of a row another writer added meanwhile -- the
+    read-back cannot tell that apart from success, because our stamp IS at n.
     """
-    hdr = _hdr(ws)
+    hdr = hdr if hdr is not None else _hdr(ws)
     row = [""] * len(hdr)
     unplaced = []
     for k, v in values.items():
@@ -408,7 +455,7 @@ def append_row(ws, values: dict) -> int:
     return n
 
 
-def mail_cell(ws, n: int) -> str:
+def mail_cell(ws, n: int, hdr: Optional[list] = None) -> str:
     """The A1 address of row n's Mail cell, found by HEADER NAME.
 
     Every other read and write in this file finds its column by header text
@@ -420,7 +467,7 @@ def mail_cell(ws, n: int) -> str:
     the paint itself: a failure here must not cost a purchase.
     """
     try:
-        hdr = _hdr(ws)
+        hdr = hdr if hdr is not None else _hdr(ws)
         if H_MAIL in hdr:
             return f"{sp.col_letter(hdr.index(H_MAIL))}{n}"
     except Exception as e:                                  # noqa: BLE001
@@ -428,27 +475,31 @@ def mail_cell(ws, n: int) -> str:
     return f"A{n}"
 
 
-def paint_paid(ws, n: int, rail: str) -> bool:
+def paint_paid(ws, n: int, rail: str, hdr: Optional[list] = None) -> bool:
     """Green the Mail cell of a row the customer paid on a real rail.
 
     Best-effort by contract: the row is the receipt, the colour is a
     convenience, and a Sheets formatting call that fails (quota, a gspread
     without .format, a permissions edge) must never turn a bought package
     into a failed buy. Returns whether it painted, for the tests.
+
+    Cosmetic also means LAST: on the delivery path it is called once the site
+    already holds the eSIM, so a formatting round-trip is never something a
+    paying customer waits behind.
     """
     if (rail or "").strip().lower() not in PAID_RAILS or n < 2:
         return False
     try:
-        ws.format(mail_cell(ws, n), {"backgroundColor": PAID_BG})
+        ws.format(mail_cell(ws, n, hdr), {"backgroundColor": PAID_BG})
         return True
     except Exception as e:                                  # noqa: BLE001
         log.warning(f"could not paint receipts row {n} green: {e}")
         return False
 
 
-def update_row(ws, n: int, values: dict):
+def update_row(ws, n: int, values: dict, hdr: Optional[list] = None):
     import gspread
-    hdr = _hdr(ws)
+    hdr = hdr if hdr is not None else _hdr(ws)
     cells = [gspread.Cell(n, hdr.index(k) + 1, str(v))
              for k, v in values.items() if k in hdr and v not in (None, "")]
     if cells:
@@ -556,6 +607,27 @@ def choose(cat: sp.Catalogue, row: sp.StellarRow, order: dict) -> sp.Variant:
     return v
 
 
+def one_listing(raw_plan: dict, row: sp.StellarRow, order: dict) -> sp.Variant:
+    """The variant choose() would have returned had the catalogue held nothing
+    but this listing.
+
+    The pricing run (stellar_prices.py --apply, every four hours) writes the id
+    of the listing it priced each Stellar row from into the sheet's 'Stellar
+    plan_id' column, so the row already names the one listing out of ~3,400
+    that this order is meant to buy. Reading it back is ONE call where the
+    catalogue is thirty-five, and thirty-five calls is most of the two minutes
+    a customer spends watching the order page.
+
+    It is a shortcut through the CATALOGUE READ, never through a rule: the
+    listing goes through the same Catalogue.from_api, the same sp.decide with
+    the same day bands, and the same choose() -- the price, the GB, the days
+    and the promise in the order token are all checked exactly as they are on
+    the slow path. Whatever the shortcut cannot satisfy raises Refused, and the
+    caller then reads the whole catalogue as though the column were empty.
+    """
+    return choose(sp.Catalogue.from_api([raw_plan]), row, order)
+
+
 def plan_facts(raw_plan: dict, row: sp.StellarRow) -> tuple[str, str]:
     """(region, networks) for the order page and the receipts row, from the
     listing itself -- the sheet's Hebrew country name is the fallback."""
@@ -616,7 +688,26 @@ class Run:
         self._rows: Optional[dict] = None
         self._cat: Optional[sp.Catalogue] = None
         self._raw: dict = {}
+        self._header: Optional[list] = None
+        self._values: Optional[list] = None
+        self._created: Optional[dict] = None   # the body the purchase answered with
         self.bought = 0
+
+    def hdr(self) -> list:
+        """The receipts header, read once. The owner reorders these columns
+        (memory: receipts-sheet) but never mid-run, and every cell this bot
+        touches is found by name -- so one read serves the whole run instead of
+        four per order."""
+        if self._header is None:
+            self._header = _hdr(self.ws)
+        return self._header
+
+    def append(self, values: dict) -> int:
+        """A receipts row. The duplicate guard's read is NOT reused for the row
+        number -- it is minutes old once the money has moved (see append_row);
+        only the header is shared. Whatever comes next reads again."""
+        self._values = None
+        return append_row(self.ws, values, self.hdr())
 
     def rows(self) -> dict:
         if self._rows is None:
@@ -648,6 +739,40 @@ class Run:
                 return self.rows()[s]
         raise Refused(f"no Stellar row in the price sheet for SKU {sku}")
 
+    def pick(self, row: sp.StellarRow, o: dict) -> sp.Variant:
+        """What to buy for this order -- the sheet's own listing if it names
+        one and that listing still passes every rule, else the catalogue.
+
+        The fallback is deliberately blind to WHY the shortcut failed: a plan
+        that 404s, one Stellar has withdrawn, one whose price rose, one whose
+        days no longer suit the promise -- every one of them is a reason to
+        look at the whole catalogue, where another listing of the same package
+        code may well be the right buy. Only the slow path may refuse an order,
+        because only it has seen everything there is to choose from.
+        """
+        pid = str(getattr(row, "plan_id", "") or "").strip()
+        if pid:
+            try:
+                raw = self.st.plan(pid)
+                if str((raw or {}).get("id") or "") != pid:
+                    raise Refused(f"{row.sku}: /plans/{pid} answered with another listing")
+                v = one_listing(raw, row, o)
+                if v.plan_id != pid:
+                    raise Refused(f"{row.sku}: listing {pid} reads back under another id")
+                self._raw[pid] = raw
+                log.info(f"{row.sku}: bought straight off the sheet's listing "
+                         f"({v.gb:g}GB/{v.days}d) -- no catalogue read")
+                return v
+            except Refused as ex:
+                log.info(f"{row.sku}: the sheet's listing will not do ({ex}) -- reading the catalogue")
+            except requests.HTTPError as ex:
+                code = getattr(ex.response, "status_code", 0)
+                log.info(f"{row.sku}: /plans/{pid} answered HTTP {code} -- reading the catalogue")
+            except Exception as ex:                          # noqa: BLE001
+                log.info(f"{row.sku}: /plans/{pid} could not be read ({type(ex).__name__}) "
+                         f"-- reading the catalogue")
+        return choose(self.catalogue(), row, o)
+
     # ── one order ──
     def handle(self, o: dict):
         oid = str(o.get("order_id") or "").strip()
@@ -655,7 +780,10 @@ class Run:
             return
         if not claim(oid):
             return
-        attempts = order_rows(self.ws, oid)
+        # One read of the sheet, answering both questions asked of it: has this
+        # order been bought already, and where does a new row go.
+        self._values = self.ws.get_all_values()
+        attempts = order_rows(self.ws, oid, self.hdr(), self._values)
         # Only a row that explicitly says FAILED authorises another purchase.
         # Anything else -- processing, active, in review, a word a person
         # typed, a blank cell -- means an attempt is outstanding and this bot
@@ -688,14 +816,17 @@ class Run:
         n, sid = self.buy(o, attempt=len(attempts))
         self.bought += 1
         if sid:
-            self.settle(o, n, sid, wait=True)
+            # The answer to the purchase itself is the first poll: it carries
+            # the order, and often the credentials with it.
+            self.settle(o, n, sid, wait=True, first=self._created)
 
     def buy(self, o: dict, attempt: int) -> tuple[int, str]:
         oid = str(o["order_id"])
+        self._created = None
         sku = str(o.get("sku") or "")
         try:
             row = self.row_for(sku)
-            v = choose(self.catalogue(), row, o)
+            v = self.pick(row, o)
         except Refused as ex:
             log.warning(f"{oid}: refused -- {ex}")
             report_failed(oid, str(ex))
@@ -746,9 +877,9 @@ class Run:
 
         if code in (200, 201, 202) and data.get("id"):
             sid = str(data["id"])
-            n = append_row(self.ws, {**base, H_LINK_SUP: PORTAL_ORDER.format(id=sid),
-                                     H_STATUS: ST_PROCESSING})
-            paint_paid(self.ws, n, (o.get("source") or ""))
+            n = self.append({**base, H_LINK_SUP: PORTAL_ORDER.format(id=sid),
+                             H_STATUS: ST_PROCESSING})
+            self._created = data
             log.info(f"{oid}: Stellar order {sid} placed ({v.gb:g}GB/{v.days}d), row {n}")
             return n, sid
         if code == 402:
@@ -759,9 +890,9 @@ class Run:
             # Same key, different body: an order exists at Stellar for this key
             # and we cannot name it. A person must, before anyone buys again --
             # the review row is what stops the next run from doing so.
-            n = append_row(self.ws, {**base, H_LINK_SUP: "https://wholesale.stellarsecurity.com/orders",
-                                     H_STATUS: ST_REVIEW})
-            paint_paid(self.ws, n, (o.get("source") or ""))
+            n = self.append({**base, H_LINK_SUP: "https://wholesale.stellarsecurity.com/orders",
+                             H_STATUS: ST_REVIEW})
+            paint_paid(self.ws, n, (o.get("source") or ""), self.hdr())
             alert_now(f"{oid} needs a look: idempotency conflict",
                       f"Stellar already holds an order under key {idem} but answered 409 to a replay. "
                       f"Find it in the portal, deliver by hand or settle, then clear row {n} of the receipts sheet.")
@@ -799,7 +930,7 @@ class Run:
             # putting a PAID order back on its retry list. The row is what
             # gives the next attempt a NEW key, since this one is now spent.
             log.warning(f"{oid}: Stellar refused the order: {msg}")
-            append_row(self.ws, {**base, H_STATUS: f"{ST_FAILED} (HTTP {code})"})
+            self.append({**base, H_STATUS: f"{ST_FAILED} (HTTP {code})"})
             report_failed(oid, msg)
             alert_now(f"{oid} not bought",
                       f"Stellar: {msg}\n\nThe request was refused before anything was created "
@@ -814,9 +945,9 @@ class Run:
         # already be down a package. So the order simply keeps its place in the
         # queue, this row stops the next run from touching it, and a person
         # settles it from the portal.
-        n = append_row(self.ws, {**base, H_LINK_SUP: "https://wholesale.stellarsecurity.com/orders",
-                                 H_STATUS: ST_REVIEW})
-        paint_paid(self.ws, n, (o.get("source") or ""))
+        n = self.append({**base, H_LINK_SUP: "https://wholesale.stellarsecurity.com/orders",
+                         H_STATUS: ST_REVIEW})
+        paint_paid(self.ws, n, (o.get("source") or ""), self.hdr())
         alert_now(f"{oid} needs a look: Stellar would not say what it did",
                   f"Stellar: {msg}\n\nThe order for {oid} ({sku}, {v.gb:g}GB/{v.days}d, "
                   f"EUR {v.wholesale_eur:.2f}) may or may not exist under key {idem} -- the first "
@@ -830,11 +961,26 @@ class Run:
                   f"under a new key.")
         return n, ""
 
-    def settle(self, o: dict, n: int, sid: str, wait: bool):
+    def settle(self, o: dict, n: int, sid: str, wait: bool, first: Optional[dict] = None):
+        """Ask Stellar what became of the order until it can be delivered.
+
+        `first` is the body the purchase itself came back with. Stellar often
+        answers the POST with the finished order, credentials and all, and the
+        old loop threw that away and asked for it again -- a GET and a poll gap
+        spent re-reading what was already in hand. It is read exactly like any
+        later answer: nothing is delivered from it that would not be delivered
+        from a GET, and a create that names no credentials simply falls through
+        to the first ask.
+        """
         oid = str(o["order_id"])
         deadline = time.monotonic() + (SETTLE_WAIT_S if wait else 0)
+        data = first if isinstance(first, dict) and first else None
+        gaps = poll_delays()
+        asked = False          # has Stellar been asked about the order ITSELF yet
         while True:
-            data = self.st.order(sid)
+            if data is None:
+                data = self.st.order(sid)
+                asked = True
             status = str(data.get("status") or data.get("order_status") or "").lower()
             cred = credentials(self.st, data)
             if cred:
@@ -843,21 +989,25 @@ class Run:
             if status in TERMINAL_BAD:
                 log.warning(f"{oid}: Stellar order {sid} {status}")
                 report_failed(oid, f"order {status} (auto-refunded by Stellar)")
-                update_row(self.ws, n, {H_STATUS: f"{ST_FAILED} ({status})"})
+                update_row(self.ws, n, {H_STATUS: f"{ST_FAILED} ({status})"}, self.hdr())
                 alert_now(f"{oid}: Stellar order {status}",
                           f"Stellar order {sid} ended {status}; the wallet is refunded by Stellar. "
                           f"The site parked the order for retry -- the next attempt buys under a new key.")
                 return
             if status == "manual_review":
-                rows = order_rows(self.ws, oid)
+                rows = order_rows(self.ws, oid, self.hdr())
                 already = any(r["stellar_id"] == sid and r["status"] == ST_REVIEW for r in rows)
-                update_row(self.ws, n, {H_STATUS: ST_REVIEW})
+                update_row(self.ws, n, {H_STATUS: ST_REVIEW}, self.hdr())
                 if not already:
                     alert_now(f"{oid}: Stellar put the order in manual review",
                               f"Stellar order {sid} is 'manual_review' (an ambiguous provider timeout). "
                               f"Nothing more is bought for {oid} until row {n} of the receipts sheet is cleared.")
                 return
-            if time.monotonic() >= deadline:
+            if asked and time.monotonic() >= deadline:
+                # The purchase's own answer never ends the wait: it is a second
+                # old and says 'processing' about everything, so a run that
+                # stopped there would report a fresh order as stuck without
+                # once asking about it.
                 log.info(f"{oid}: Stellar order {sid} still {status or 'provisioning'} -- next run")
                 # A wait that is NOT this run's own purchase means an earlier
                 # run already spent the money and the order has still not come
@@ -873,7 +1023,9 @@ class Run:
                                  f"can read. The wallet is already debited. Look at it in the "
                                  f"portal -- the customer has paid and has nothing.", self.now)
                 return
-            time.sleep(POLL_EVERY_S)
+            if asked:
+                time.sleep(next(gaps))
+            data = None
 
     def deliver(self, o: dict, n: int, sid: str, cred: dict, data: dict):
         oid = str(o["order_id"])
@@ -912,7 +1064,8 @@ class Run:
             update_row(self.ws, n, {H_QR: cred.get("qr_code_url") or "", H_ACT: payload["activation_code"],
                                     H_SMDP: payload["smdp"], H_APN: payload["apn"],
                                     H_REGION: region, H_STATUS: ST_ACTIVE,
-                                    H_PLAN: f"{gb:g}GB - {days} days — {networks}".rstrip(" —")})
+                                    H_PLAN: f"{gb:g}GB - {days} days — {networks}".rstrip(" —")},
+                       self.hdr())
         except Exception as ex:
             log.exception("receipts row update failed")
             alert_now(f"{oid}: receipts row {n} not updated",
@@ -920,6 +1073,68 @@ class Run:
                       f"its credentials and its status: {ex}")
         report_fulfilled(oid, payload)
         log.info(f"{oid}: delivered from Stellar order {sid}")
+        # Everything past this line is AFTER the customer can install: the mail
+        # only because the site now holds the eSIM, the colour because it is a
+        # convenience and nobody waits for it.
+        self.mail(o, payload)
+        paint_paid(self.ws, n, (o.get("source") or ""), self.hdr())
+
+    def mail(self, o: dict, payload: dict):
+        """The buyer's 'your eSIM is ready' email, sent from THIS step.
+
+        It used to wait for the fulfillment bot, the next step of the same
+        workflow -- correct, and about a minute of a paying customer's evening
+        spent watching an order page for mail that was already written. The
+        same send, from the same functions, a minute earlier.
+
+        The safety rules are the fulfillment bot's, unchanged, because they are
+        the ones that stop a second eSIM going out (memory: duplicate-esim-
+        email):
+
+          * NEVER before report_fulfilled. The credentials exist by
+            construction here -- settle() only calls deliver() once it has
+            them -- and the site holds them before anything is promised.
+          * report_email_sent() closes the order's ledger entry, which is what
+            takes it off `awaiting_email`. Without that the fulfillment bot's
+            sweep, running seconds later in the very next step, would mail the
+            same eSIM again.
+          * A send that fails is NOT retried here and is not reported as
+            anything. The order stays on `awaiting_email`, and the sweep --
+            which asks the Sent folder before it writes a word -- is the retry.
+        """
+        oid = str(o["order_id"])
+        to = str(o.get("customer_email") or "").strip()
+        try:
+            if not to:
+                raise ValueError("the site has no address for this order")
+            fb.send_customer_email(to, oid, str(o.get("order_url") or ""),
+                                   fb._delivery_from_record({**o, "esim": payload}),
+                                   esim=payload, lang=str(o.get("lang") or ""),
+                                   total=o.get("paid_usd"))
+            if not fb.report_email_sent(oid, True, address=to):
+                # The mail is out but the site does not know: the sweep will ask
+                # the Sent folder before it writes a word, so this is noise, not
+                # a second eSIM -- unless the inbox is down too. Say it.
+                log.warning(f"{oid}: the eSIM email is out but the site did not record it")
+                alert_hourly(f"{oid}: eSIM email sent, ledger not updated",
+                             f"The customer's email went out from the buyer step, but "
+                             f"/api/orders refused the email_sent report. The order is "
+                             f"still on awaiting_email; the sweep checks the Sent folder "
+                             f"before resending. If the inbox is unreachable it could mail "
+                             f"again -- look at {oid}.", self.now)
+            else:
+                log.info(f"{oid}: the eSIM email is out")
+        except Exception as ex:                              # noqa: BLE001
+            # The address stays out of the log and out of the alert: this repo
+            # and its Actions logs are public.
+            log.warning(f"{oid}: the eSIM email did not go out here ({type(ex).__name__}) "
+                        f"-- the delivery sweep still owes it")
+            alert_hourly(f"{oid}: eSIM email not sent by the buyer",
+                         f"The eSIM is delivered and the order page works, but this step could "
+                         f"not send the customer's email ({type(ex).__name__}).\n\n"
+                         f"The order is still on the site's awaiting_email list, so the "
+                         f"fulfillment bot's sweep sends it -- this is a delay, not a loss.",
+                         self.now)
 
 
 # -- readiness ---------------------------------------------------------------
@@ -1007,23 +1222,47 @@ def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -
     ws = ws if ws is not None else fb.sheet_client().open_by_key(fb.RECEIPTS_SHEET_ID).sheet1
     r = Run(st, ws, now)
     started = time.monotonic()
-    for o in orders:
-        if time.monotonic() - started > RUN_BUDGET_S:
-            log.warning(f"{RUN_BUDGET_S}s spent -- the remaining order(s) stay queued for the "
-                        f"next run, which is five minutes away")
+    # Orders this run has already taken a decision about. The site hands back
+    # an order that is still pending -- one waiting on a review row, one whose
+    # claim another worker holds -- and asking about it twice in one run buys
+    # nothing but costs the next customer his place.
+    done: set = set()
+    stop = False
+    while orders and not stop:
+        for o in orders:
+            if time.monotonic() - started > RUN_BUDGET_S:
+                log.warning(f"{RUN_BUDGET_S}s spent -- the remaining order(s) stay queued for the "
+                            f"next run, which is five minutes away")
+                stop = True
+                break
+            oid = str(o.get("order_id") or "?")
+            done.add(oid)
+            try:
+                r.handle(o)
+            except Blocked as ex:
+                log.error(f"nothing is bought this run: {ex}")
+                alert_hourly("the Stellar catalogue read is not trustworthy",
+                             f"{ex}\n\nNothing was bought; every queued Stellar order keeps its "
+                             f"place and the next run tries again.", r.now)
+                stop = True
+                break
+            except Exception as ex:
+                log.exception(f"{oid}: {type(ex).__name__}")
+                alert_hourly(f"{oid}: {type(ex).__name__}", f"{ex}\n\nThe order stays queued; this repeats next run.", r.now)
+        if stop or r.bought >= MAX_ORDERS_PER_RUN or time.monotonic() - started > RUN_BUDGET_S:
             break
-        oid = str(o.get("order_id") or "?")
+        # A settle is ninety seconds of standing still, and the customer who
+        # paid during it would otherwise wait for the next run's cron -- five
+        # minutes for an order that was ready while this run was watching a
+        # poll. One more look at the queue costs a single GET.
         try:
-            r.handle(o)
-        except Blocked as ex:
-            log.error(f"nothing is bought this run: {ex}")
-            alert_hourly("the Stellar catalogue read is not trustworthy",
-                         f"{ex}\n\nNothing was bought; every queued Stellar order keeps its "
-                         f"place and the next run tries again.", r.now)
+            orders = [o for o in pending_orders()
+                      if str(o.get("order_id") or "?") not in done]
+        except Exception as ex:                              # noqa: BLE001
+            log.warning(f"could not re-read the queue ({type(ex).__name__}) -- next run")
             break
-        except Exception as ex:
-            log.exception(f"{oid}: {type(ex).__name__}")
-            alert_hourly(f"{oid}: {type(ex).__name__}", f"{ex}\n\nThe order stays queued; this repeats next run.", r.now)
+        if orders:
+            log.info(f"{len(orders)} Stellar order(s) arrived while this run was working")
     return r.bought
 
 

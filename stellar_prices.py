@@ -64,8 +64,10 @@ Only the cells the catalogue answers: days, buy price, the bookkeeping beside
 it (previous price / updated / changed / last change), and the stock column —
 that one only while it holds one of this script's own markers. A value the
 owner typed there is never cleared. The Networks cell is written from the
-API listing's coverage (operators • generations). SKU, country, GB, code and
-breakout are read, not written. A row with no code ('—') is left alone.
+API listing's coverage (operators • generations), and column X holds the plan
+UUID of the listing that price came from — the buyer fetches that one plan
+instead of the catalogue. SKU, country, GB, code and breakout are read, not
+written. A row with no code ('—') is left alone.
 
 Run:
     python stellar_prices.py              dry run — prints the plan, writes nothing
@@ -103,6 +105,15 @@ FX_URL = "https://api.frankfurter.app/latest"
 RETAIL_OVER_WHOLESALE = 1.2192
 FX_FALLBACK = 1.1614          # frankfurter, 2026-09-08 — last resort only
 SOURCE = "stellar"            # column D, compared lower-case
+
+# Column X holds the plan UUID of the listing this script priced, so the buyer
+# can fetch that ONE plan (GET /plans/{id}) instead of paging the whole
+# catalogue before a paid order. The header is not in HEADER_KEYS: the scraper
+# neither reads nor writes it, and it is this script's alone. X1 and Y1 were
+# empty when the column was taken (2026-09-13); Z1 onwards are the owner's
+# reference blocks, and nothing here ever writes past X.
+PLAN_ID_HEADER = "Stellar plan_id"
+PLAN_ID_COL = 23              # X, 0-based
 FEED_STALE_HOURS = 12         # the feed is a snapshot; say so when it is old
 
 # Column Q means "out of stock when non-empty". These are the values THIS
@@ -239,7 +250,8 @@ def fetch_feed() -> dict:
 
 def fetch_plans(key: str) -> list:
     """Every listing of the wholesale catalogue. ~35 calls at 100 a page against
-    a 60/minute limit; a second between pages keeps well clear of it."""
+    a 60/minute limit; a quarter-second between pages spaces the whole read
+    over ~9 seconds and still asks for well under 60 in any minute."""
     s = requests.Session()
     s.headers.update({"Authorization": f"Bearer {key}", "Accept": "application/json"})
     out, page = [], 1
@@ -251,7 +263,7 @@ def fetch_plans(key: str) -> list:
         if page >= int((body.get("meta") or {}).get("last_page") or page):
             break
         page += 1
-        time.sleep(1)
+        time.sleep(0.25)
     return out
 
 
@@ -270,6 +282,7 @@ class StellarRow:
     changed: str
     stock: str
     networks: str = ""                 # the Networks cell as it stands
+    plan_id: str = ""                  # column X: the UUID of the listing we priced
 
     @property
     def floor_days(self) -> int:
@@ -328,6 +341,15 @@ def read_rows(values: list[list[str]]) -> tuple[list[StellarRow], dict[str, int]
     missing = [HEADER_KEYS[k] for k in REQUIRED if k not in col]
     if missing:
         raise SystemExit(f"price sheet header missing: {missing}")
+    # The plan_id column is ours by header text wherever the owner moved it to,
+    # and otherwise column X -- but only while X1 is still empty. A word
+    # standing in X1 that is not our header belongs to someone else: the column
+    # is then simply not available, and every plan_id write is dropped by
+    # write_updates rather than landing on top of it.
+    if PLAN_ID_HEADER in header:
+        col["plan_id"] = header.index(PLAN_ID_HEADER)
+    elif len(header) <= PLAN_ID_COL or not header[PLAN_ID_COL].strip():
+        col["plan_id"] = PLAN_ID_COL
     width = max(col.values()) + 1
 
     stellar: list[StellarRow] = []
@@ -348,7 +370,8 @@ def read_rows(values: list[list[str]]) -> tuple[list[StellarRow], dict[str, int]
             code=r[col["route"]].strip(), gb=_num(r[col["gb"]]),
             days=int(days) if days else None, eur=_eur(price), price_cell=price,
             changed=r[col["changed"]].strip(), stock=r[col["stock"]].strip(),
-            networks=r[col["network"]].strip() if "network" in col else ""))
+            networks=r[col["network"]].strip() if "network" in col else "",
+            plan_id=r[col["plan_id"]].strip() if "plan_id" in col else ""))
     return stellar, col
 
 
@@ -481,6 +504,20 @@ def _real_note(note: str) -> bool:
     return note.startswith(("↑", "↓")) or note == "First check"
 
 
+def header_update(values, col: dict[str, int]) -> list[tuple[int, str, str]]:
+    """The one row-1 cell this script may write: the plan_id header, X1.
+
+    It is written only when the column read_rows claimed is still unlabelled,
+    and only that single cell — Y1 onwards, where the owner's reference blocks
+    start, are never touched.
+    """
+    if "plan_id" not in col:
+        return []
+    header = [str(h).strip() for h in (values[0] if values else [])]
+    label = header[col["plan_id"]] if col["plan_id"] < len(header) else ""
+    return [] if label == PLAN_ID_HEADER else [(1, "plan_id", PLAN_ID_HEADER)]
+
+
 def plan_updates(decisions, fx: float, ts: str, today: str) -> list[tuple[int, str, str]]:
     """(row, HEADER_KEYS key, value) — the whole write, before any of it happens."""
     out: list[tuple[int, str, str]] = []
@@ -502,6 +539,11 @@ def plan_updates(decisions, fx: float, ts: str, today: str) -> list[tuple[int, s
             else:
                 note, mark = "קוד אזורי תחת שם מדינה — לא הושווה", MARK_REGIONAL
             put(r.row, "changed", note)
+            # Nothing was priced, so there is no listing to buy: the id must go
+            # with the price it belonged to, or the buyer's fast path would
+            # fetch last week's plan for a row we refused today.
+            if r.plan_id:
+                put(r.row, "plan_id", "")
             # Only over an empty cell or our own marker — never over the owner's word.
             if (r.stock == "" or r.stock in OUR_MARKS) and r.stock != mark:
                 put(r.row, "stock", mark)
@@ -510,6 +552,13 @@ def plan_updates(decisions, fx: float, ts: str, today: str) -> list[tuple[int, s
         v = d.pick
         new_eur = v.wholesale_eur
         put(r.row, "price", price_cell(new_eur, fx))
+        # The UUID of the listing this very price came from, so stellar_buyer
+        # can fetch that one plan instead of the whole catalogue. A retail-feed
+        # run carries no ids and therefore blanks the cell; that is the honest
+        # answer — the buyer treats a missing id as "no fast path" and reads the
+        # catalogue, which is what it did before this column existed.
+        if v.plan_id != r.plan_id:
+            put(r.row, "plan_id", v.plan_id)
         # The Networks cell comes from the listing's coverage — never typed by
         # hand (127 Stellar rows had none on 2026-09-10). The feed carries no
         # networks, so a feed run leaves the cell as it is.
@@ -716,13 +765,15 @@ def main(argv=None) -> int:
         print(f"⚠️  feed snapshot is {age:.0f} hours old — prices below may already be stale")
 
     svc = sheets_service(a.credentials)
-    rows, col = read_rows(read_sheet(svc))
+    values = read_sheet(svc)
+    rows, col = read_rows(values)
     fx, fx_src = fetch_fx([r.price_cell for r in rows])
     print(f"💱 EUR→USD {fx:.4f} ({fx_src})")
 
     decisions = [d for d in (decide(cat, r) for r in rows) if d is not None]
     now = datetime.now()
-    updates = plan_updates(decisions, fx, now.strftime("%Y-%m-%d %H:%M"), now.strftime("%Y-%m-%d"))
+    updates = header_update(values, col) + plan_updates(
+        decisions, fx, now.strftime("%Y-%m-%d %H:%M"), now.strftime("%Y-%m-%d"))
 
     print(f"\n📋 {len(rows)} Stellar rows, {len(decisions)} with a code, "
           f"{len(rows) - len(decisions)} left alone\n")

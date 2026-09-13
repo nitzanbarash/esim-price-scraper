@@ -98,12 +98,16 @@ PLANS = [plan("p-20d", "JC059", 10, 20, 212), plan("p-30d", "JC059", 10, 30, 213
 
 class StellarFake:
     def __init__(self, wallet=10000, statuses=("fulfilled",), create=202, with_install=True,
-                 esims_read=True):
+                 esims_read=True, listings=None):
         # create may be one answer or a sequence of them, so a replay under the
         # same idempotency key can be answered differently from the first try.
         self.wallet, self.statuses = wallet, list(statuses)
         self.create_codes = list(create) if isinstance(create, (list, tuple)) else [create]
         self.with_install, self.esims_read = with_install, esims_read
+        # What GET /plans/{id} serves. It is the catalogue the scenario runs
+        # with, because the buyer can now reach a single listing WITHOUT
+        # downloading the catalogue -- the two must be the same world.
+        self.listings = list(listings) if listings else PLANS
         self.creates, self.gets, self.headers = [], [], {"Authorization": "Bearer k"}
         self.last_status = "processing"     # what /esims/{id} reflects: nothing before fulfilment
 
@@ -126,7 +130,7 @@ class StellarFake:
             return Resp(200, {"data": self._esim(self.last_status)})
         if "/plans/" in url:
             pid = url.rsplit("/", 1)[1]
-            for p in PLANS:
+            for p in self.listings:
                 if p["id"] == pid:
                     return Resp(200, {"data": p})
             return Resp(404, {})
@@ -198,13 +202,20 @@ def receipt_row(order_id, status, stellar_id="so-1", route="Stellar JC059"):
     return r
 
 
-def sheet_row(sku="1.62.10", code="JC059", gb=10.0, days=20, eur=2.12, country="אינדונזיה"):
+def sheet_row(sku="1.62.10", code="JC059", gb=10.0, days=20, eur=2.12, country="אינדונזיה",
+              plan_id=""):
     # No floor here any more: StellarRow.floor_days is a read-only property and
     # the floor belongs to the SIZE (day_policy's bands). 10GB -> 20..31 days.
     # The cell is built by the writer itself, so this fixture cannot drift out
     # of the format the sheet actually holds (euro-first since 2026-09-10).
-    return sp.StellarRow(row=83, sku=sku, country=country, code=code, gb=gb, days=days, eur=eur,
-                         price_cell=sp.price_cell(eur, 1.165), changed="", stock="")
+    r = sp.StellarRow(row=83, sku=sku, country=country, code=code, gb=gb, days=days, eur=eur,
+                      price_cell=sp.price_cell(eur, 1.165), changed="", stock="")
+    # Column X ('Stellar plan_id'), written by the 4-hourly pricing run. Set
+    # here rather than passed in: the field is being added to StellarRow by
+    # another hand, and the buyer reads it with getattr either way, so these
+    # tests hold whether or not it has landed yet.
+    r.plan_id = plan_id
+    return r
 
 
 def token(d=None, gb=10):
@@ -222,21 +233,41 @@ def order(oid="WR-TEST01", sku="1.62.10", paid=6.99, list_usd=6.99, d=None, sour
 
 
 alerts: list[tuple[str, str]] = []
+# Every customer email this run sent, as (to, order_id, order_url, delivery,
+# esim, lang, total). The buyer mails the customer itself now (section 30), so
+# every scenario has to stand in for the SMTP send the fulfillment bot owns.
+mails: list[dict] = []
+mail_raises: list = []          # put an exception in it and the send fails
+sleeps: list[float] = []        # every gap this run waited, in order
+downloads: list[str] = []       # every FULL catalogue download (~35 calls each)
+
+
+def fake_send(to, order_id, order_url, delivery, esim=None, lang="", total=None):
+    if mail_raises:
+        raise mail_raises[0]
+    mails.append({"to": to, "order_id": order_id, "order_url": order_url,
+                  "delivery": delivery, "esim": esim, "lang": lang, "total": total})
+
+
 NOW_TOP = datetime(2026, 9, 10, 4, 1, tzinfo=fb.TZ)     # alerts pass
 NOW_MID = datetime(2026, 9, 10, 4, 30, tzinfo=fb.TZ)    # hourly alerts held
 
 
 def scenario(orders, stellar: StellarFake, ws: Ws | None = None, rows=None, claim_by="", now=NOW_TOP,
-             plans=PLANS, settle_wait=5, fail_report=False):
+             plans=PLANS, settle_wait=5, fail_report=False, site=None):
     """Wire the fakes in, run once, hand everything back."""
-    site = Site(orders, claim_by, fail_report)
+    site = site if site is not None else Site(orders, claim_by, fail_report)
     ws = ws or Ws()
     alerts.clear()
+    mails.clear()
+    sleeps.clear()
+    downloads.clear()
+    sb.fb.send_customer_email = fake_send
     sb.requests.get, sb.requests.post = site.get, site.post
-    sb.sp.fetch_plans = lambda key: list(plans)
+    sb.sp.fetch_plans = lambda key: (downloads.append(key), list(plans))[1]
     sb.stellar_rows = lambda: {r.sku: r for r in (rows if rows is not None else [sheet_row()])}
     sb.fb.alert = lambda s, b: alerts.append((s, b))
-    sb.time.sleep = lambda s: None
+    sb.time.sleep = lambda s: sleeps.append(s)
     sb.SETTLE_WAIT_S = settle_wait
     st = sb.Stellar("k", session=stellar)
     log = io.StringIO()
@@ -864,6 +895,191 @@ check("a receipts sheet without the new column still gets its row",
       _w.rows[1][_no_col.index("מקור - source")] == "Stellar", str(_w.rows[1]))
 check("   ...and the value that had nowhere to go is logged, not raised",
       "רכישה - Purchase" in _log.getvalue(), _log.getvalue()[-200:])
+
+
+
+# ── 29. the sheet names the listing: one call instead of thirty-five ─────────
+# The 4-hourly pricing run writes the id of the listing it priced each row from
+# into the sheet's 'Stellar plan_id' column. The buyer reads it back with ONE
+# GET /plans/{id} rather than downloading the whole catalogue -- and the rules
+# do not move an inch: the same Catalogue, the same decide(), the same
+# choose(). Anything the shortcut cannot satisfy falls back to the slow path,
+# because only the slow path has seen every listing there is to choose from.
+print("\n29. the row's own plan_id buys without reading the catalogue")
+named = [sheet_row(plan_id="p-30d")]
+site, ws29, bought, _ = scenario([order()], (f29 := StellarFake()), rows=named)
+check("the catalogue is never downloaded", downloads == [], str(downloads))
+check("...the named listing is read instead, once",
+      [u for u in f29.gets if "/plans/" in u] == [f"{sb.BASE}/plans/p-30d"], str(f29.gets))
+check("the same package is bought as the slow path buys",
+      [b for _, b in f29.creates] == [{"plans": [{"plan_id": "p-30d", "quantity": 1}]}], str(f29.creates))
+check("delivered, with the listing's own region and networks",
+      bought == 1 and site.reports("fulfilled")[0]["esim"]["region"] == "Indonesia"
+      and site.reports("fulfilled")[0]["esim"]["networks"] == "Telkomsel/XL • 4G + 5G",
+      str(site.reports("fulfilled")))
+
+print("\n   a plan_id Stellar no longer knows -> the catalogue, not a refusal")
+gone = [sheet_row(plan_id="p-retired")]
+site, ws29b, _, log29 = scenario([order()], (f29b := StellarFake()), rows=gone)
+check("the catalogue was downloaded after the 404", len(downloads) == 1, str(downloads))
+check("...and the right package still bought, nothing reported failed",
+      [b for _, b in f29b.creates] == [{"plans": [{"plan_id": "p-30d", "quantity": 1}]}]
+      and not site.reports("failed"), str(f29b.creates))
+check("...the log says why it fell back", "p-retired" in log29 and "catalogue" in log29)
+
+print("\n   the shortcut obeys every rule choose() enforces")
+# p-20d is a real, live listing of the right code and size -- and the customer
+# was shown 30 days. The fast path must refuse it exactly as the slow path
+# would, then let the catalogue find the listing that keeps the promise.
+short = [sheet_row(plan_id="p-20d")]
+site, _, _, log29c = scenario([order(d=30)], (f29c := StellarFake()), rows=short)
+check("a listing that breaks the promise is not bought off the sheet",
+      [b for _, b in f29c.creates] == [{"plans": [{"plan_id": "p-30d", "quantity": 1}]}], str(f29c.creates))
+check("...it fell back rather than refusing the order", len(downloads) == 1 and not site.reports("failed"))
+
+# A price rise is the same story: the sheet's listing is refused by the very
+# rule that protects the margin, and the catalogue is asked for another.
+dearer = [plan("p-30d", "JC059", 10, 30, 400), plan("p-20d", "JC059", 10, 20, 212)]
+site, _, _, _ = scenario([order()], (f29d := StellarFake(listings=dearer)),
+                         rows=[sheet_row(plan_id="p-30d")], plans=dearer)
+check("a listing whose price rose is not bought off the sheet either",
+      [b for _, b in f29d.creates] == [{"plans": [{"plan_id": "p-20d", "quantity": 1}]}], str(f29d.creates))
+
+# The wrong family altogether (a 3GB listing under a 10GB row) can never be
+# verified as this row's listing, so it is not bought on the strength of the
+# column alone.
+site, _, _, _ = scenario([order()], (f29e := StellarFake()), rows=[sheet_row(plan_id="p-3gb")])
+check("a plan_id pointing at another package is ignored, not bought",
+      [b for _, b in f29e.creates] == [{"plans": [{"plan_id": "p-30d", "quantity": 1}]}], str(f29e.creates))
+
+print("\n   an empty column is the old path, unchanged")
+site, _, _, _ = scenario([order()], (f29f := StellarFake()))
+check("no plan_id -> the catalogue, exactly as before",
+      len(downloads) == 1 and len(f29f.creates) == 1, str(downloads))
+
+
+# ── 30. the purchase's own answer is the first poll ─────────────────────────
+print("\n30. credentials that came back with the purchase are used as they are")
+
+
+class Instant(StellarFake):
+    """Stellar answers the POST with the finished order -- which it does."""
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.creates.append((headers.get("Idempotency-Key"), json))
+        self.last_status = "fulfilled"
+        return Resp(202, {"data": {"id": "so-1", "order_number": "SW-1", "status": "fulfilled",
+                                   "ready": True, "esims": [self._esim("fulfilled")],
+                                   "sensitive_delivery_included": True}})
+
+
+site, ws30, _, _ = scenario([order()], (f30 := Instant()))
+check("the order is never asked about again", not [u for u in f30.gets if "/orders/" in u], str(f30.gets))
+check("...and the customer has the eSIM anyway",
+      site.reports("fulfilled") and site.reports("fulfilled")[0]["esim"]["activation_code"] == LPA)
+check("...with nothing waited for", sleeps == [], str(sleeps))
+
+print("\n   the poll ramp: fast while it is probably ready, slow when it is not")
+from itertools import islice                                       # noqa: E402
+_ramp8 = list(islice(sb.poll_delays(), 8))
+check("1, 2, 3, 5, 8, then 10 for ever", _ramp8 == [1, 2, 3, 5, 8, 10, 10, 10], str(_ramp8))
+check("a bad STELLAR_POLL_RAMP keeps the default rather than spinning",
+      sb._ramp("nonsense") == sb.POLL_RAMP_DEFAULT and sb._ramp("-1") == sb.POLL_RAMP_DEFAULT
+      and sb._ramp("2,4") == (2.0, 4.0))
+site, ws30b, _, _ = scenario([order()], (f30b := StellarFake(statuses=("processing", "processing", "fulfilled"))),
+                             settle_wait=60)
+check("a slow order is asked at 1s and 2s, not at 10s and 10s", sleeps == [1.0, 2.0], str(sleeps))
+check("...and is delivered inside the same run", len(site.reports("fulfilled")) == 1)
+
+
+# ── 31. the customer's email leaves with the eSIM, not a step later ─────────
+# It used to wait for the fulfillment bot -- the next step of the same workflow,
+# and about a minute of a paying customer's evening. The rules that stop a
+# SECOND eSIM going out are the fulfillment bot's own, unchanged: never before
+# report_fulfilled, and the ledger entry closed the moment it is sent (memory:
+# duplicate-esim-email).
+print("\n31. the buyer mails the customer as soon as the site holds the eSIM")
+site, ws31, _, log31 = scenario([order()], (f31 := StellarFake()))
+check("exactly one email, to the buyer", len(mails) == 1 and mails[0]["to"] == "buyer@example.com", str(len(mails)))
+check("...carrying the order link, the language and what was paid",
+      mails[0]["order_id"] == "WR-TEST01" and mails[0]["order_url"].startswith("https://www.waverole.com/?order=")
+      and mails[0]["total"] == 6.99, str(mails[0]["order_id"]))
+check("...and the plan facts the fulfillment bot builds, from the eSIM record",
+      mails[0]["delivery"] == {"gb": 10.0, "days": 30, "location": "Indonesia",
+                               "network": "Telkomsel/XL • 4G + 5G"}, str(mails[0]["delivery"]))
+order_of_posts = [("fulfilled" if p.get("status") == "fulfilled" else
+                   "mailed" if p.get("email_sent") else "other") for p in site.posts]
+check("the site was told fulfilled BEFORE the mail went out",
+      order_of_posts.index("fulfilled") < order_of_posts.index("mailed"), str(order_of_posts))
+check("the ledger entry is closed, so the sweep cannot send it twice",
+      [p for p in site.posts if p.get("email_sent") is True]
+      and [p for p in site.posts if p.get("email_sent")][0]["customer_email"] == "buyer@example.com",
+      str([p for p in site.posts if "email_sent" in p]))
+check("the address still stays out of the public log", "buyer@example.com" not in log31)
+
+print("\n   nothing is mailed for an order that was not delivered")
+site, _, _, _ = scenario([order()], StellarFake(statuses=("processing",)), settle_wait=0)
+check("still provisioning -> no email", not mails, str(mails))
+site, _, _, _ = scenario([order()], StellarFake(create=422))
+check("refused -> no email", not mails, str(mails))
+site, _, _, _ = scenario([order()], StellarFake(), fail_report=True)
+check("the site never heard 'fulfilled' -> the customer is not told either", not mails, str(mails))
+
+print("\n   a mail that will not send costs the eSIM nothing")
+mail_raises.append(RuntimeError("smtp said no"))
+try:
+    site, ws31b, bought, _ = scenario([order()], (f31b := StellarFake()))
+finally:
+    mail_raises.clear()
+check("the order is still fulfilled and the row still פעיל",
+      bought == 1 and len(site.reports("fulfilled")) == 1 and ws31b.col(2, sb.H_STATUS) == sb.ST_ACTIVE)
+check("the ledger entry is NOT closed -- the sweep still owes the mail",
+      not [p for p in site.posts if p.get("email_sent")], str(site.posts))
+check("the owner is told once an hour, not per run", len(alerts) == 1 and "email" in alerts[0][0], str(alerts))
+
+
+# ── 32. a customer who pays while the run is settling ───────────────────────
+# A settle is up to ninety seconds of standing still. The queue is read once
+# more at the end of the run, so the next customer is served now rather than at
+# the next cron -- five minutes later, for an order that was ready all along.
+print("\n32. an order that arrives mid-run is served by the same run")
+
+
+class Burst(Site):
+    """The second customer pays while the first order is being settled."""
+    def __init__(self, first, later):
+        super().__init__(first)
+        self.later = later
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        self.gets.append(dict(params or {}))
+        return Resp(200, {"orders": self.orders if len(self.gets) == 1 else self.later})
+
+
+first, second = order(), order(oid="WR-TEST02")
+burst = Burst([first], [first, second])
+site, ws32, bought, _ = scenario([first], (f32 := StellarFake()), site=burst)
+check("both orders bought in one run", bought == 2 and len(f32.creates) == 2, str(f32.creates))
+check("...each under its own key",
+      sorted(k for k, _ in f32.creates) == ["waverole-WR-TEST01-a0", "waverole-WR-TEST02-a0"],
+      str([k for k, _ in f32.creates]))
+check("...each with its own receipts row", len(ws32.rows) == 3
+      and {ws32.col(2, "מס׳ הזמנה"), ws32.col(3, "מס׳ הזמנה")} == {"WR-TEST01", "WR-TEST02"},
+      str([r[HDR.index("מס׳ הזמנה")] for r in ws32.rows[1:]]))
+check("...and both customers mailed", sorted(m["order_id"] for m in mails) == ["WR-TEST01", "WR-TEST02"])
+check("the first order is not handled twice", len(site.reports("fulfilled")) == 2)
+check("the queue is re-read, and the re-read names its supplier too",
+      len(site.gets) >= 2 and all(g.get("supplier") == "stellar" for g in site.gets), str(site.gets))
+
+print("\n   the run budget still ends the run")
+sb.RUN_BUDGET_S = -1
+burst2 = Burst([first], [first, second])
+site, _, bought, _ = scenario([first], StellarFake(), site=burst2)
+check("nothing is handled once the budget is spent", bought == 0 and len(site.gets) == 1, str(site.gets))
+sb.RUN_BUDGET_S = 300
+
+print("\n   a queue that answers nothing new ends the run quietly")
+site, _, bought, _ = scenario([order()], (f32c := StellarFake()))
+check("the same order is not bought a second time", bought == 1 and len(f32c.creates) == 1)
 
 
 

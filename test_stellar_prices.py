@@ -23,6 +23,7 @@ from stellar_prices import (
     MARK_GONE, MARK_REGIONAL, MARK_SHORT, RETAIL_OVER_WHOLESALE, FX_FALLBACK,
     Catalogue, Variant, StellarRow, _eur, decide, fetch_fx, is_regional_sku,
     main, plan_updates, price_cell, read_rows, usd_outside_parens,
+    PLAN_ID_HEADER, PLAN_ID_COL, header_update, write_updates,
 )
 
 _fails = []
@@ -329,6 +330,78 @@ check("binary megabytes land on the sheet's decimal sizes",
       [_gb_from_mb(m) for m in (3072, 10240, 768, 750, 512, 500, 100, 1536, 1500)],
       [3.0, 10.0, 0.75, 0.75, 0.5, 0.5, 0.1, 1.5, 1.5])
 check("750MB row matches a 768MB listing", api.by_code["CKH993"][0].gb, 0.75)
+
+# ── the plan_id column (X) ─────────────────────────────────────────────────
+
+# The buyer is allowed to skip the whole catalogue only because this column
+# says WHICH listing was priced. The id therefore has to be the id of the
+# listing this run actually chose, and it has to disappear the moment the row
+# stops being priced -- an id left behind on a refused row would send a paid
+# order at last week's plan.
+
+PID_HDR = HDR + ["", PLAN_ID_HEADER]          # X1 labelled
+PID_SHEET = [PID_HDR,
+    row("2.49.10", "גרמניה", "10gb", "Stellar", "30d", "(€2.21) $2.57", "CKH995") + ["", "uuid-9"],
+    row("2.49.5", "גרמניה", "5gb", "Stellar", "20d", "(€1.15) $1.34", "ZZZ999") + ["", "uuid-dead"],
+]
+pid_rows, pid_col = read_rows(PID_SHEET)
+
+print("-- the plan_id column --")
+check("the column is found by its header text", pid_col["plan_id"], PID_HDR.index(PLAN_ID_HEADER))
+check("the cell is read onto the row", [r.plan_id for r in pid_rows], ["uuid-9", "uuid-dead"])
+check("a sheet without the header reads every plan_id blank",
+      [r.plan_id for r in rows], [""] * len(rows))
+
+# X1 empty: the column is column X, and the header is written with the prices.
+check("an unlabelled X is claimed as the plan_id column", col["plan_id"], PLAN_ID_COL)
+check("...and X1 gets the header in the same apply",
+      header_update(SHEET, col), [(1, "plan_id", PLAN_ID_HEADER)])
+check("a header already in place is not rewritten", header_update(PID_SHEET, pid_col), [])
+_taken = [HDR + [""] * (PLAN_ID_COL - len(HDR)) + ["משהו של הבעלים"]]
+_, taken_col = read_rows(_taken)
+check("a word standing in X1 is not ours: no column, no header write",
+      ("plan_id" in taken_col, header_update(_taken, taken_col)), (False, []))
+
+pid_ups = plan_updates([decide(api, r) for r in pid_rows], FX, TS, TODAY)
+PW = {}
+for r, k, v in pid_ups:
+    PW.setdefault(r, {})[k] = v
+check("the priced row gets the id of the listing that was priced",
+      (PW[2].get("plan_id"), PW[2].get("price")), ("uuid-1", price_cell(2.21, FX)))
+check("a refused row has its stale id cleared", PW[3].get("plan_id"), "")
+_same = plan_updates([decide(api, StellarRow(
+    2, "2.49.10", "גרמניה", "CKH995", 10.0, 30, 2.21, "(€2.21) $2.57", "", "",
+    plan_id="uuid-1"))], FX, TS, TODAY)
+check("an id that did not move is not rewritten",
+      any(k == "plan_id" for _, k, _ in _same), False)
+
+
+class _WriteSvc:
+    """Enough of the Sheets service to read back what write_updates sends."""
+
+    def __init__(self):
+        self.data = []
+
+    def spreadsheets(self):
+        return self
+
+    def values(self):
+        return self
+
+    def batchUpdate(self, **kw):
+        self.data.extend(kw["body"]["data"])
+        return _Exec({})
+
+
+_w = _WriteSvc()
+write_updates(_w, col, [(1, "plan_id", PLAN_ID_HEADER), (3, "plan_id", "uuid-1")])
+check("the apply payload puts the id in column X, header included",
+      [(d["range"], d["values"][0][0]) for d in _w.data],
+      [("X1", PLAN_ID_HEADER), ("X3", "uuid-1")])
+_w2 = _WriteSvc()
+write_updates(_w2, taken_col, [(3, "plan_id", "uuid-1")])
+check("with no column of its own, not one plan_id cell is written", _w2.data, [])
+print()
 
 # ── the broken-read guard ──────────────────────────────────────────────────
 def dec(reason): return Decision(None, None, reason)

@@ -1,0 +1,60 @@
+name: Stellar buyer
+
+# Bot #8: buys the queue's supplier=stellar orders from Stellar Wholesale,
+# hands the site the eSIM and mails the customer the moment it is ready
+# (never before -- the mail is sent only once the activation code exists).
+#
+# Woken by the site the instant an order is paid (repository_dispatch
+# order-paid, waverole-site api/_fulfil.js). fulfillment.yml's 5-minute tick
+# wakes it again if an order is still pending, which covers a lost dispatch.
+# The schedule below is the last backstop only: GitHub throttles crons on
+# public repos (observed: */5 firing about once an hour).
+#
+# This is the ONLY workflow that may buy from Stellar. The site's claim
+# records one worker name (gha:stellar); two buyers under that name could
+# buy the same order twice. Money rules and the receipts-sheet ledger:
+# stellar_buyer.py. Its key can SPEND (memory: stellar-key-placement), so it
+# is scoped to the one step.
+on:
+  repository_dispatch:
+    types: [order-paid]
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/10 * * * *"
+
+# A run that arrives while another is buying waits its turn instead of
+# racing it; GitHub keeps one pending run per group, which is all a queue
+# of paid orders needs -- the run that starts picks up every pending order.
+concurrency:
+  group: stellar-buy
+  cancel-in-progress: false
+
+jobs:
+  buy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip            # a customer is waiting; every second counts
+
+      # Libraries only, no browser: stellar_buyer imports the price scripts,
+      # which import playwright and the Google client at module level.
+      - name: Install dependencies
+        run: pip install -q gspread requests playwright google-auth google-api-python-client
+
+      # The backstop only. The bot stops itself at STELLAR_RUN_BUDGET_S (300s)
+      # and hands whatever is left to the next run; being killed HERE is a
+      # stop with nothing written and nothing said, so this must be looser
+      # than the budget, not tighter.
+      - name: Stellar buyer
+        timeout-minutes: 8
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          STELLAR_API_KEY: ${{ secrets.STELLAR_API_KEY }}
+        run: python stellar_buyer.py

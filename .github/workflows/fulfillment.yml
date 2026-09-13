@@ -2,12 +2,20 @@ name: Order fulfillment (delivery emails)
 
 # Bot #4: completes orders from esim.dog delivery emails — receipts sheet +
 # waverole.com order page. Stateless: processed emails are IMAP-flagged.
+#
+# 2026-09-13: the Stellar purchase moved to its own workflow, stellar-buy.yml,
+# which the site wakes the moment an order is paid. This tick is only its
+# backstop: when a Stellar order is still pending at tick time, the step
+# below wakes that workflow. Only stellar-buy.yml may ever buy from Stellar —
+# two buyers would share the claim worker name and could buy twice.
 on:
   schedule:
     - cron: "*/5 * * * *"    # every 5 minutes (public repo — free)
-  workflow_dispatch: {}       # manual run from the Actions tab
-  repository_dispatch:        # instant trigger the site can call on purchase
-    types: [order-paid]
+  workflow_dispatch: {}       # manual run from the Actions tab; the sheet script ticks this
+
+permissions:
+  contents: read
+  actions: write              # the backstop step dispatches stellar-buy.yml
 
 concurrency:
   group: fulfillment
@@ -23,34 +31,34 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-          cache: pip            # the site dispatches this on a paid order; every second counts
+          cache: pip
 
       # No browser any more: the bot reads the supplier's JSON endpoint
-      # directly, which cut this job from ~2 minutes to a few seconds. The
-      # Stellar buyer imports the price scripts, which import playwright and
-      # the Google client at module level -- libraries only, no browser.
+      # directly, which cut this job from ~2 minutes to a few seconds.
       - name: Install dependencies
         run: pip install -q gspread requests playwright google-auth google-api-python-client
 
-      # Bot #8: buys the queue's supplier=stellar orders from Stellar Wholesale
-      # and hands the site the eSIM, so the fulfillment step below mails it in
-      # this same run. Idle and free when no Stellar order is pending. Its key
-      # can SPEND (memory: stellar-key-placement), so it is scoped to this one
-      # step; continue-on-error so a Stellar fault never blocks esim.dog
-      # deliveries. Money rules and the receipts-sheet ledger: stellar_buyer.py.
-      - name: Stellar buyer
+      # Backstop for a lost order-paid dispatch (token missing, GitHub
+      # answered 404, the run cancelled behind another): if a Stellar order
+      # is still pending, wake stellar-buy.yml. Only a COUNT is printed —
+      # the orders JSON carries customer addresses and this repo is public.
+      - name: Wake the Stellar buyer if an order waits
         continue-on-error: true
-        # The backstop only. The bot stops itself at STELLAR_RUN_BUDGET_S (300s)
-        # and hands whatever is left to the next run; being killed HERE is a
-        # stop with nothing written and nothing said, so this must be looser
-        # than the budget, not tighter.
-        timeout-minutes: 8
         env:
-          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
-          STELLAR_API_KEY: ${{ secrets.STELLAR_API_KEY }}
-        run: python stellar_buyer.py
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_URL: https://api.github.com/repos/${{ github.repository }}/actions/workflows/stellar-buy.yml/dispatches
+        run: |
+          n=$(curl -sf -H "Authorization: Bearer $ORDERS_TOKEN" \
+                "https://www.waverole.com/api/orders?status=pending&supplier=stellar" \
+              | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("orders") or []))' 2>/dev/null || echo 0)
+          echo "pending Stellar orders: $n"
+          if [ "${n:-0}" -gt 0 ]; then
+            curl -sf -o /dev/null -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$DISPATCH_URL" -d '{"ref":"main"}' && echo "stellar-buy.yml dispatched"
+          fi
 
       - name: Run fulfillment bot
         env:
