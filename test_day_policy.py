@@ -146,17 +146,23 @@ check("Stellar ceiling at 30GB is no ceiling", day_ceiling(30, STELLAR), None)
 check("the ceiling constant", DAY_CEILING, 31)
 
 print("\n-- 50GB: 'above 32 days' is a Stellar rule only --")
-check("Stellar 50GB floor", day_floor(50, STELLAR), 33)
+check("Stellar 50GB floor is a month", day_floor(50, STELLAR), 30)
 check("esim.dog 50GB floor stays at 30", day_floor(50, ESIMDOG), 30)
 check("esim.dog 50GB still has a window", in_window(50, ESIMDOG, 30), True)
-check("Stellar 50GB refuses 30 days", in_window(50, STELLAR, 30), False)
-check("Stellar 50GB takes 33", in_window(50, STELLAR, 33), True)
-# 30 days is under the floor here, so the cheap row is not on the table at all;
-# 33 takes it, and then 60 takes it off 33 for the same money.
-check("Stellar 50GB ignores the sub-floor 30d and lands on 60",
-      days_of(pick(50, STELLAR, [(30, 55.00), (33, 59.00), (60, 59.00)])), 60)
-check("...but a dearer 60 leaves it on 33",
-      days_of(pick(50, STELLAR, [(30, 55.00), (33, 59.00), (60, 62.00)])), 33)
+check("Stellar 50GB takes 30", in_window(50, STELLAR, 30), True)
+check("Stellar 50GB still refuses 29", in_window(50, STELLAR, 29), False)
+# A month is on the table now, so the cheap 30-day row is a real candidate and
+# only a longer plan at no extra cost takes it away ("לחודש או חודשיים").
+check("Stellar 50GB keeps the cheap month when 60 costs more",
+      days_of(pick(50, STELLAR, [(30, 55.00), (33, 59.00), (60, 59.00)])), 30)
+check("...but two months at the same money wins",
+      days_of(pick(50, STELLAR, [(30, 55.00), (60, 55.00)])), 60)
+# The case the owner ruled out: 180 days must not beat a month it costs 50%
+# more than, or a 50GB ends up outliving the 100GB sold beside it.
+check("Thailand 50GB takes the month, not the half-year",
+      days_of(pick(50, STELLAR, [(30, 14.84), (180, 22.24)])), 30)
+check("Japan 50GB takes the month, not the half-year",
+      days_of(pick(50, STELLAR, [(30, 14.16), (180, 23.13)])), 30)
 
 print("\n-- the floor bands, on their boundaries --")
 for gb, want in ((1, 1), (2, 1), (2.5, 5), (3, 5), (5, 5), (6, 10), (9, 10),

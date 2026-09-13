@@ -366,7 +366,7 @@ def _pick(gb, *vs):
 
 check("the window is the owner's band for the SIZE, uncapped from 30GB up",
       (_row(10.0).window_text, _row(30.0).window_text, _row(31.0).window_text,
-       _row(50.0).window_text), ("20-31", "25+", "30+", "33+"))
+       _row(50.0).window_text), ("20-31", "25+", "30+", "30+"))
 check("an agora never buys back ten days of validity",
       _pick(10.0, IDN20, IDN30), (30, 2.13, 10, 1))
 check("at exactly 1% under 30 days' price the row stays on 30 days",

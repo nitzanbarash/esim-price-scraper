@@ -49,11 +49,17 @@ THE AGREED READING (this is what the code below does):
        only taken when it costs no MORE than the incumbent ("באותו מחיר") —
        which is a weaker test than rule 1, on purpose: extra validity at the
        same money is free, so it does not have to be 1% cheaper to be taken.
-    5. "50 גיגה: החל ממעל ל-32 ימים" is read as a floor of 33 days, and it can
-       only ever apply to Stellar: esim.dog is capped at 31, so on esim.dog a
-       50GB row keeps the 30-day floor of the band below it. A rule that made
-       esim.dog's floor 33 under a ceiling of 31 would leave 50GB with an empty
-       window and nothing to sell.
+    5. 50GB and up starts at a MONTH. The rule was "50 גיגה: החל ממעל ל-32
+       ימים" — a floor of 33 — until 2026-09-13, when the owner replaced it:
+       "של 50gb יהיה לחודש או חודשיים לא 180 יום". A floor of 33 left Japan and
+       Thailand with exactly one listing above it, the 180-day plan, so 50GB
+       came back as a half-year product sitting next to a 100GB sold for 60
+       days — a smaller package carrying more validity than a bigger one, which
+       is the thing he ruled out. The floor is therefore 30: a month, or the
+       two-month plan where one exists. It can only ever apply to Stellar
+       anyway — esim.dog is capped at 31, so on esim.dog a 50GB row keeps the
+       30-day floor of the band below it, and a floor of 33 under a ceiling of
+       31 would leave 50GB with an empty window and nothing to sell.
 
 Read in the same voice as fallback_day_floor() in esim_price_scraper.py, which
 implements the OLD single-supplier ladder; this module is the two-supplier
@@ -91,9 +97,9 @@ CHEAPEST_ONLY_MAX_GB = DAY_FLOOR_BANDS[0][0]
 
 # "מעל 30: 30 ומעלה" — everything above 30GB starts at 30 days...
 DAY_FLOOR_ABOVE_BANDS = 30
-# ...except that from 50GB up, Stellar starts above 32.
+# ...and from 50GB up Stellar starts at a month (owner, 2026-09-13 — see rule 5).
 BIG_GB = 50.0
-BIG_GB_FLOOR = 33
+BIG_GB_FLOOR = 30
 
 # esim.dog is never asked past 31 days. Stellar is, but only on the big sizes.
 DAY_CEILING = 31
