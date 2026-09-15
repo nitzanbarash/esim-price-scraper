@@ -1,0 +1,68 @@
+name: Create order
+
+# Creates a manual order on the site -- a replacement for one cancelled at
+# the supplier, or a sale agreed off-site -- and hands it to the right buyer:
+# the Stellar buyer in this repo, or the PC bot for esim.dog. The site's
+# ORDERS_TOKEN is a secret of this repo, so this is how an order is created
+# without the token leaving GitHub. Actions -> Create order -> Run workflow.
+#
+# This repo is public and so are its logs. The inputs sit in job-level env
+# on purpose: a step-level env block is echoed into the step's log, job-level
+# is not. create_order.py masks the address before it prints anything and
+# never prints the order page link.
+on:
+  workflow_dispatch:
+    inputs:
+      sku:
+        description: "Package code, e.g. 2.30.10"
+        required: true
+      customer_email:
+        description: "Where the eSIM is sent"
+        required: true
+      paid_usd:
+        description: "Amount for the ledger's Sell column. 0 = none (a replacement was already paid for)"
+        required: true
+        default: "0"
+      lang:
+        description: "Customer's language"
+        type: choice
+        options: [he, en]
+        default: he
+      supplier:
+        description: "Who buys it. catalogue = whichever row the price Sheet has ticked"
+        type: choice
+        options: [catalogue, stellar, esim.dog]
+        default: catalogue
+      dest:
+        description: "Country name on the order page (optional)"
+      iso:
+        description: "Two-letter country code (optional)"
+      gb:
+        description: "Package size in GB (optional)"
+      days:
+        description: "Validity in days (optional)"
+
+permissions:
+  contents: read
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SKU: ${{ inputs.sku }}
+      CUSTOMER_EMAIL: ${{ inputs.customer_email }}
+      PAID_USD: ${{ inputs.paid_usd }}
+      LANG_CODE: ${{ inputs.lang }}
+      SUPPLIER: ${{ inputs.supplier }}
+      DEST: ${{ inputs.dest }}
+      ISO: ${{ inputs.iso }}
+      GB: ${{ inputs.gb }}
+      DAYS: ${{ inputs.days }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create the order
+        env:
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+        run: python3 create_order.py
