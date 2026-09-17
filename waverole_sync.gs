@@ -93,11 +93,19 @@ const HEADERS = {
 // silently read as "no tick anywhere" would delist the whole storefront.
 const REQUIRED_FIELDS = ['sku', 'price', 'chosen'];
 
-// A full sync that would take MORE than this share of the sheet's SKUs off
-// the site is a broken read (a shifted column, a paste that lost the tick
-// column), not a decision - nobody delists half the shop in one edit. The
-// push is refused and the owner is mailed instead.
+// A push that would take MORE than this share of the sheet's SKUs off the
+// site in one go is a broken read (a shifted column, a block Delete over W, a
+// paste that lost the tick column), not a decision - nobody delists half the
+// shop in one edit. The push is refused and the owner is mailed instead.
+// Measured on what this push NEWLY delists, against the set the site was
+// last told about (DELISTED_KEY): pruning the catalogue one tick at a time
+// past half is allowed, and a sheet that already stands half-delisted keeps
+// syncing. Both paths - the daily full sync and the onEdit flush - are
+// guarded, because a block edit arrives on the edit path with hundreds of
+// rows and would otherwise walk straight past a full-sync-only check.
 const MAX_DELIST_SHARE = 0.5;
+const MIN_SKUS_FOR_GUARD = 10;
+const DELISTED_KEY = 'DELISTED_SKUS';   // Script Property: SKUs the site was last told are hidden
 
 // The colours the owner already paints by hand (read off the live sheet
 // 2026-09-10): green = the row the site sells, grey = the other supplier's row.
@@ -494,7 +502,9 @@ function checkColumns() {
     lines.push('  ' + key + ' -> column ' + (at < 0 ? 'NOT FOUND' : at + 1 + ' (' + colLetter_(at) + ')'));
   }
   // And what the sheet actually holds, so the tick can be seen without reading
-  // a single Hebrew character.
+  // a single Hebrew character. The table is logged first: colMap_ throws on
+  // a missing REQUIRED header, and that is exactly when the table matters.
+  Logger.log('COLUMNS\n' + lines.join('\n'));
   const map = colMap_(sheet);
   const data = sheet.getDataRange().getValues();
   const bySupplier = {}, ticked = {};
@@ -504,15 +514,22 @@ function checkColumns() {
     bySupplier[pkg.source] = (bySupplier[pkg.source] || 0) + 1;
     if (pkg._chosen) ticked[pkg.source] = (ticked[pkg.source] || 0) + 1;
   }
+  // The whole point of this function is the numbers above, and they are
+  // needed most when the sync is refusing to run - so they are logged before
+  // the one call below that can throw, and that call's failure is logged
+  // rather than thrown: the delist guard's own email says 'run checkColumns'.
+  Logger.log('PRICED ROWS PER SUPPLIER: ' + JSON.stringify(bySupplier) +
+    '\nOF THOSE, TICKED: ' + JSON.stringify(ticked));
   const sold = {};
-  for (const pkg of buildPackages_(null)) {
-    const k = pkg.listed === false ? 'DELISTED (no tick)' : pkg.source;
-    sold[k] = (sold[k] || 0) + 1;
+  try {
+    for (const pkg of buildPackages_(null)) {
+      const k = pkg.listed === false ? 'DELISTED (no tick)' : pkg.source;
+      sold[k] = (sold[k] || 0) + 1;
+    }
+    Logger.log('WHAT THE SITE WOULD BE SENT: ' + JSON.stringify(sold));
+  } catch (err) {
+    Logger.log('WHAT THE SITE WOULD BE SENT: refused - ' + err);
   }
-  Logger.log('COLUMNS\n' + lines.join('\n') +
-    '\n\nPRICED ROWS PER SUPPLIER: ' + JSON.stringify(bySupplier) +
-    '\nOF THOSE, TICKED: ' + JSON.stringify(ticked) +
-    '\n\nWHAT THE SITE WOULD BE SENT: ' + JSON.stringify(sold));
 }
 
 function colLetter_(i) {
@@ -627,7 +644,8 @@ function buildPackages_(rowsWanted) {   // rowsWanted: null = all, or Set of she
     (bySku[pkg.sku] = bySku[pkg.sku] || []).push(pkg);
   }
   const out = [];
-  let delisted = 0;
+  const known = knownDelisted_();
+  let newly = 0;
   for (const sku of Object.keys(bySku)) {
     if (!touched.has(sku)) continue;
     // No priced row and a tick somewhere: nothing to sell and nothing to say
@@ -635,19 +653,37 @@ function buildPackages_(rowsWanted) {   // rowsWanted: null = all, or Set of she
     if (!bySku[sku].length && anyTick[sku]) continue;
     const pick = pickRow_(bySku[sku].length ? bySku[sku] : [{ sku: sku }], anyTick[sku], routes[sku]);
     if (!pick) continue;
-    if (pick.listed === false) delisted++;
+    if (pick.listed === false && !known.has(sku)) newly++;
     out.push(pick);
   }
-  // The guard, on a FULL sync only: a single edit delists one SKU by design.
   const total = Object.keys(bySku).length;
-  if (!rowsWanted && total >= 10 && delisted > total * MAX_DELIST_SHARE) {
-    const msg = delisted + ' \u05de\u05ea\u05d5\u05da ' + total +
+  if (total >= MIN_SKUS_FOR_GUARD && newly > total * MAX_DELIST_SHARE) {
+    const msg = newly + ' \u05de\u05ea\u05d5\u05da ' + total +
       ' \u05d7\u05d1\u05d9\u05dc\u05d5\u05ea \u05d1\u05dc\u05d9 \u05d5\u05d9 \u05d1\u05db\u05dc\u05dc - \u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05e0\u05e2\u05e6\u05e8 \u05d1\u05de\u05e7\u05d5\u05dd \u05dc\u05d4\u05d5\u05e8\u05d9\u05d3 \u05d0\u05ea \u05e8\u05d5\u05d1 \u05d4\u05d0\u05ea\u05e8.' +
       '\n\u05e1\u05d1\u05d9\u05e8 \u05e9\u05e2\u05de\u05d5\u05d3\u05ea \u05e0\u05d1\u05d7\u05e8 (W) \u05d6\u05d6\u05d4 \u05d0\u05d5 \u05e9\u05d4\u05db\u05d5\u05ea\u05e8\u05ea \u05e9\u05dc\u05d4 \u05e0\u05e4\u05d2\u05e2\u05d4 - \u05dc\u05d4\u05e8\u05d9\u05e5 checkColumns.';
     alert_('\u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05e0\u05e2\u05e6\u05e8: \u05db\u05de\u05e2\u05d8 \u05db\u05dc \u05d4\u05d7\u05d1\u05d9\u05dc\u05d5\u05ea \u05d1\u05dc\u05d9 \u05d5\u05d9', msg);
-    throw new Error('refusing to delist ' + delisted + ' of ' + total + ' SKUs in one sync');
+    throw new Error('refusing to delist ' + newly + ' of ' + total + ' SKUs in one sync');
   }
   return out;
+}
+
+// The SKUs the site was last told are hidden - kept so the guard above can
+// tell a mass wipe (many NEW delistings at once) from a sheet that simply
+// stands part-delisted. Updated by post_ after every successful push:
+// listed:false adds a SKU, listed:true removes it, a SKU not in the push is
+// left as it was.
+function knownDelisted_() {
+  const raw = PropertiesService.getScriptProperties().getProperty(DELISTED_KEY) || '';
+  return new Set(raw.split(',').filter(Boolean));
+}
+
+function rememberDelisted_(packages) {
+  const set = knownDelisted_();
+  for (const p of packages) {
+    if (p.listed === false) set.add(p.sku);
+    else if (p.listed === true) set.delete(p.sku);
+  }
+  PropertiesService.getScriptProperties().setProperty(DELISTED_KEY, Array.from(set).join(','));
 }
 
 function post_(packages) {
@@ -687,6 +723,7 @@ function post_(packages) {
   // alarm is exactly what fired on 2026-07-16).
   PropertiesService.getScriptProperties()
     .setProperty('LAST_SYNC_OK', new Date().toISOString());
+  rememberDelisted_(packages);
   try { SpreadsheetApp.openById(SHEET_ID).toast(msg, 'Waverole', 8); } catch (e) {}
   return body;
 }

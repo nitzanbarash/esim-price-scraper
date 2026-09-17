@@ -170,13 +170,17 @@ d = only(decide([stellar(2, "1.66.10", "$10.00"), stellar(3, "1.66.10", "$5.00")
 check("no tick and no esim.dog row -> skipped", d.action, "skip")
 check("...and nothing written", d.writes, [])
 
-print("\n-- with no tick, esim.dog is the incumbent --")
+print("\n-- no tick anywhere: the SKU is OFF THE SITE and is left alone --")
+# Since 2026-09-17 the tick is the listing: the sync hides a SKU whose rows
+# carry no tick. The chooser used to read that as "esim.dog is selling it"
+# and tick the cheaper rival — re-listing a package the owner took down.
 d = only(decide([dog(2, "1.66.10", "$10.00", chosen=""), stellar(3, "1.66.10", "$9.95")]))
-check("the unticked dog row is the incumbent", d.incumbent.row, 2)
-check("...and 0.5% does not unseat it", d.action, "keep")
+check("no tick -> skipped, not an esim.dog incumbent", d.action, "skip")
+check("...and the reason says the SKU is off the site", "off the site" in d.reason, True)
 d = only(decide([dog(2, "1.66.10", "$10.00", chosen=""), stellar(3, "1.66.10", "$8.00")]))
-check("a real gap does", d.action, "switch")
-check("the tick is written even though none existed", writes_of(d, "chosen"), [(3, TICK)])
+check("even a real gap does not re-list it", d.action, "skip")
+check("...and no tick is invented", writes_of(d, "chosen"), [])
+check("...and not one cell is written", d.writes, [])
 
 print("\n-- a tick on the Stellar row makes STELLAR the incumbent --")
 d = only(decide([dog(2, "1.66.10", "$8.00", chosen=""),
@@ -225,13 +229,13 @@ d = only(decide([dog(2, "1.66.10", "$10.00", my_price="15.96", final="\u2014"),
                  stellar(3, "1.66.10", "$8.00")]))
 check("an unparseable U is skipped the same way", d.action, "skip")
 
-# No tick means the site was not selling this row's price anyway: the switch
-# goes ahead and simply carries nothing.
+# No tick means the SKU is off the site: nothing is switched and nothing is
+# carried, however cheap the rival.
 d = only(decide([dog(2, "1.66.10", "$10.00", chosen="", my_price="15.96", final=""),
                  stellar(3, "1.66.10", "$8.00")]))
-check("an UNTICKED incumbent with no U still switches", d.action, "switch")
+check("an UNTICKED SKU with no U is skipped, not switched", d.action, "skip")
 check("...carrying nothing", [k for _, k, _ in d.writes if k in CARRY], [])
-check("...and the tick lands", writes_of(d, "chosen"), [(3, TICK)])
+check("...and no tick lands", writes_of(d, "chosen"), [])
 
 print("\n-- רווח, in the scraper's own format --")
 check("the format", profit_text(5.40, 3.08), "🟢 +$2.32 (+75.3%)")
@@ -322,12 +326,12 @@ check("...and still loses to a real gap", d.action, "switch")
 check("the note names it esim.dog, not an empty string",
       writes_of(d, "changed"), [(3, "\u2194 \u05e1\u05e4\u05e7: esim.dog \u2192 Stellar ($10.00 \u2192 $8.00)")])
 
-# With no tick anywhere, a blank-source row is the esim.dog row and therefore
-# the incumbent - the SKU is not ambiguous just because D was never filled in.
+# With no tick anywhere the SKU is off the site whatever column D says: a
+# blank-source row earns no incumbency by being esim.dog.
 d = only(decide([Row(row=2, sku="1.66.10", source="", price="$10.00",
                      validity="30d", my_price="15.96", final="16.99"),
                  stellar(3, "1.66.10", "$9.95")]))
-check("a blank-source row is the incumbent when no row is ticked", d.incumbent.row, 2)
+check("a blank-source row with no tick anywhere is skipped too", d.action, "skip")
 d = only(decide([Row(row=2, sku="1.66.10", source="", price="$10.00", validity="30d"),
                  Row(row=3, sku="1.66.10", source="esim.dog", price="$5.00",
                      validity="30d")]))
@@ -498,7 +502,7 @@ d = only(decide([dog(2, "2.49.50", "$10.00", chosen="", final="18.99", profit="x
 check("a SKU with no tick writes nothing", d.writes, [])
 check("...mirrors nothing", d.mirrored, 0)
 check("...and no tick is invented", writes_of(d, "chosen"), [])
-check("...and the log names the missing tick", TICK in d.mirror_note, True)
+check("...and the log names the missing tick", TICK in (d.reason + d.mirror_note), True)
 
 print("\n-- a blank source is not automatically the other half of a twin --")
 # Both rows read as esim.dog, so this is one supplier written twice, not a

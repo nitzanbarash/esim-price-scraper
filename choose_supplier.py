@@ -32,11 +32,17 @@ What "eligible" means (all four, or the row cannot win):
 
 Who the incumbent is
 --------------------
-The tick, if there is exactly one. Otherwise the esim.dog row, because that is
-the supplier every SKU was born on. And when that is not a single answer — two
-ticks, two esim.dog rows, or neither a tick nor a dog row — the SKU is SKIPPED
-and logged. A guess here moves real money to the wrong supplier; a skip only
-leaves the sheet as the owner last had it.
+The tick, if there is exactly one. Two ticks is not a single answer, and the
+SKU is SKIPPED and logged. A guess here moves real money to the wrong supplier;
+a skip only leaves the sheet as the owner last had it.
+
+NO tick at all is not a gap to fill — since 2026-09-17 the tick IS the listing
+(memory: tick-is-the-listing): the sync hides a SKU whose rows carry no tick,
+so a row with no tick is a package the owner has taken OFF THE SITE, and the
+chooser must not put it back. It used to treat the esim.dog row as the
+incumbent and write a tick onto whichever rival beat it; that would have
+re-listed a delisted package within four hours, every time. Such a SKU is now
+skipped whole, and the log says why.
 
 What a switch writes, in one batchUpdate so the row can never be half-switched:
     W   the tick on the winner, cleared on every other row of the SKU
@@ -406,18 +412,18 @@ def _cheapest(rows: list[Row]) -> Row:
 
 
 def _incumbent(rows: list[Row]) -> tuple[Optional[Row], str]:
-    """The row the SKU is sold on today, or why that is not a single answer."""
+    """The row the SKU is sold on today, or why that is not a single answer.
+
+    No tick on any row means the SKU is OFF THE SITE (the sync hides it — the
+    tick is the listing since 2026-09-17), not that esim.dog is selling it by
+    default. The chooser leaves it alone: writing a tick here would re-list a
+    package the owner took down."""
     ticked = [r for r in rows if text(r.chosen).strip()]
     if len(ticked) > 1:
         return None, f"{len(ticked)} rows ticked in נבחר"
     if ticked:
         return ticked[0], ""
-    dogs = [r for r in rows if source_key(r) == DEFAULT_SOURCE]
-    if len(dogs) > 1:
-        return None, f"no tick and {len(dogs)} esim.dog rows"
-    if not dogs:
-        return None, "no tick and no esim.dog row"
-    return dogs[0], ""
+    return None, f"no {TICK} on any row — the SKU is off the site; left alone"
 
 
 def decide(rows: list[Row]) -> list[Decision]:
