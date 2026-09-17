@@ -125,8 +125,11 @@ BIG_GB_FLOOR = 30
 # where the 25-day black row is inside the $18 buy ceiling and the month-long
 # blue is not (Greece, Austria, Hungary, Belgium, Poland). The add-country
 # picker carries the same list (DAY_EXCEPTIONS); keep the two identical.
+# 2026-09-17, later the same day: Austria and Hungary lost their 50GB rows
+# altogether (only the popular countries carry 40/50GB now), so their
+# exceptions went with them — three remain.
 DAY_FLOOR_EXCEPTIONS: Dict[str, int] = {
-    '2.30.50': 25, '2.43.50': 25, '2.36.50': 25, '2.32.50': 25, '2.48.50': 25,
+    '2.30.50': 25, '2.32.50': 25, '2.48.50': 25,
 }
 
 # esim.dog is never asked past 31 days. Stellar is, but only on the big sizes.

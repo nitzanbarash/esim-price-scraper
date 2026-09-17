@@ -164,9 +164,11 @@ check("Thailand 50GB takes the month, not the half-year",
 check("Japan 50GB takes the month, not the half-year",
       days_of(pick(50, STELLAR, [(30, 14.16), (180, 23.13)])), 30)
 
-print("\n-- owner-approved exceptions: five 50GB rows at 25 days, by name (2026-09-17) --")
-check("the list is exactly the five the owner approved",
-      sorted(DAY_FLOOR_EXCEPTIONS), ['2.30.50', '2.32.50', '2.36.50', '2.43.50', '2.48.50'])
+print("\n-- owner-approved exceptions: 50GB rows at 25 days, by name (2026-09-17) --")
+check("the list is exactly the three that still have a 50GB row (Greece, Belgium, Poland)",
+      sorted(DAY_FLOOR_EXCEPTIONS), ['2.30.50', '2.32.50', '2.48.50'])
+check("Austria's and Hungary's rows are gone, and so are their exceptions",
+      [day_floor(50, ESIMDOG, '2.43.50'), day_floor(50, ESIMDOG, '2.36.50')], [30, 30])
 for code in DAY_FLOOR_EXCEPTIONS:
     check(f"esim.dog {code} floor is 25", day_floor(50, ESIMDOG, code), 25)
 check("without the code the floor stays a month", day_floor(50, ESIMDOG), 30)
