@@ -24,6 +24,22 @@ And the same day, on the 1-2GB band specifically:
 
     "1-2 אין העדפה באמת ל 30 אלא להכי זול"
 
+Two later revisions by the owner, both verbatim:
+
+    2026-09-16, on 20GB (Montenegro: 30d $8.98 had been filed while 25d was
+    $7.36 — "the scan should have gone deeper"):
+    "חבילה של 20gb היא חבילה שמאפשרת חיפוש 21 יום ומעלה מה שיותר זול -
+     אם המחיר הוא אותו דבר אז תשאף לשלושים ימים"
+    and the same evening, asked whether that reaches 30GB: "30GB לא הולך עם 21
+    יום... זה הולך רק עם 20 גיגה ומטה" — so 20GB starts at 21 days and 30GB
+    keeps the 25-day floor it always had.
+
+    2026-09-17, on the sizes above 30GB:
+    "ה-40gb לא יהיה מתחת ל-25 ימים, 25-30 ימים
+     וה-50 תהיה לו רק אופציה אחת של 30 ימים ואי אפשר לרדת"
+    so 31-49GB starts at 25 days and 50GB+ at 30 — which is what rule 5
+    below already said for 50GB.
+
 THE AGREED READING (this is what the code below does):
 
     1. 30 days is always first preference — from 3GB up — and it is only given
@@ -88,7 +104,8 @@ DAY_FLOOR_BANDS: Tuple[Tuple[float, int], ...] = (
     (5.0, 5),      # 3-5GB   : from 5 days
     (9.0, 10),     # 6-9GB   : from 10 days
     (19.0, 20),    # 10-19GB : from 20 days
-    (30.0, 25),    # 20-30GB : from 25 days
+    (20.0, 21),    # 20GB    : from 21 days (owner, 2026-09-16; "20 גיגה ומטה")
+    (49.0, 25),    # 21-49GB : from 25 days (30GB as before; 40GB "לא מתחת ל-25", 2026-09-17)
 )
 # The band that has no 30-day preference at all: the one whose floor is 1 day.
 # "1-2 אין העדפה באמת ל 30 אלא להכי זול" — inside it price alone decides and

@@ -166,10 +166,10 @@ check("Japan 50GB takes the month, not the half-year",
 
 print("\n-- the floor bands, on their boundaries --")
 for gb, want in ((1, 1), (2, 1), (2.5, 5), (3, 5), (5, 5), (6, 10), (9, 10),
-                 (10, 20), (19, 20), (20, 25), (30, 25), (31, 30), (49, 30)):
+                 (10, 20), (19, 20), (20, 21), (21, 25), (30, 25), (49, 25)):
     check(f"floor({gb}GB)", day_floor(gb, ESIMDOG), want)
 check("the bands do not depend on the supplier below 50GB",
-      [day_floor(g, STELLAR) for g in (2, 5, 9, 19, 30, 31)], [1, 5, 10, 20, 25, 30])
+      [day_floor(g, STELLAR) for g in (2, 5, 9, 19, 30, 31)], [1, 5, 10, 20, 25, 25])
 
 print("\n-- candidates may be objects or dicts, and ride back whole --")
 

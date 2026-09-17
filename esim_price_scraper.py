@@ -19,11 +19,16 @@ Profitability: 1GB packages allow up to -20% loss; all others require >=20% prof
 Alternative validity: esim.dog sells each (GB x days) pair separately and drops
   pairs without notice — ask for Italy 10GB/30d and it hands back 9GB. So a
   10GB+ row that is out of stock or has stopped paying is retried at the other
-  days in its band, SAME GB, preferring 30d then 31d then downwards (21d floor
-  for 10-19GB, 25d for 20GB and up, never past 31d). A row that fell back
+  days in its band, SAME GB, preferring 30d then 31d then downwards (20d floor
+  for 10-19GB, 21d for 20GB, 25d for 30-40GB, 30d for 50GB, never past 31d —
+  the bands are day_policy's). A row that fell back
   returns to 30d as soon as 30d is sellable again. What is adopted is written
   into the LINK as well as the days column — the purchase bot buys from the
   link and refuses an order when the two disagree.
+Buy ceilings (owner, 2026-09-17): a size has a maximum BUY price above which it
+  cannot be sold at a proportional price at all — 30GB $10, 40GB $14, 50GB $18.
+  Over the ceiling the row keeps its link and price (the market moves) but the
+  stock cell says so and the site does not sell it, whatever the margin says.
 Regional codes: A=mini, B=grande (e.g. 1.0A.10, 1.0B.5).
 """
 
@@ -222,6 +227,25 @@ async def prefetched(items, fetch, n):
 PROFIT_MIN_PCT = 20.0
 PROFIT_MIN_PCT_1GB = -20.0   # 1GB plans are a loss leader; a 20% loss is allowed
 
+# The owner's proportion rule (2026-09-17). A customer reads the ladder as
+# dollars per GB and it has to FALL as the size grows: 1GB 0.99 → 5GB 0.70 →
+# 10GB 0.60 → 20GB 0.50 → 30GB 0.50 or less. Spain's 30GB, bought at $11.30
+# and sold at 17.99, cleared the 20% bar above and still sold 30GB for the
+# price of two 20GB — "it looks like a bug" to the buyer who spotted it. So a
+# size now has a ceiling on what it may COST before it cannot be sold at a
+# proportional price at all, in the owner's words:
+#   "30 אמור להיות עד 10 דולר קנייה כדי שישתלם למכור 14.99/15.99
+#    40 אמור להיות עד 14 דולר קנייה כדי שישתלם למכור 17.99-18.99
+#    50 אמור להיות עד 18 דולר קנייה כדי שישתלם למכור 19.99-21.99"
+# Over the ceiling the row STAYS in the sheet with its live price — the market
+# moves and the row must keep watching it — but the stock cell says why it is
+# not for sale, and the site sync reads any non-empty stock cell as sold out.
+# The regional bundles (1.0A, 1.0B, 2.0, 2.0B) sell on their own ladder and
+# are not judged by these numbers.
+BUY_CEILINGS = ((30.0, 10.0), (40.0, 14.0), (50.0, 18.0))   # (size from, max buy $)
+OVER_CEILING_LABEL = 'לא רווחי — מעל תקרה'
+REGIONAL_CODE_RE = re.compile(r'^\d+\.0[A-Z]?\.')
+
 # How long the scrape may run before it stops itself and saves what it has.
 # The workflow allows more than this, deliberately: a run killed from OUTSIDE
 # dies at an arbitrary point with nothing able to report what it skipped,
@@ -324,6 +348,23 @@ def is_profitable(my_price: Optional[float], buy: Optional[float],
     if not my_price or not buy:
         return True
     return ((my_price - buy) / buy) * 100.0 >= profit_floor_pct(gb)
+
+
+def buy_ceiling(gb: Optional[float], code: str = '') -> Optional[float]:
+    """The most this size may cost and still be sold, or None when no ceiling applies."""
+    if gb is None or REGIONAL_CODE_RE.match((code or '').strip()):
+        return None
+    ceiling = None
+    for size_from, cap in BUY_CEILINGS:
+        if float(gb) >= size_from:
+            ceiling = cap
+    return ceiling
+
+
+def over_ceiling(buy: Optional[float], gb: Optional[float], code: str = '') -> bool:
+    """Is this buy price above the owner's ceiling for the size? False when unjudged."""
+    cap = buy_ceiling(gb, code)
+    return bool(buy) and cap is not None and float(buy) > cap + 1e-9
 
 
 def fallback_day_floor(gb: float) -> int:
@@ -1069,8 +1110,11 @@ class ESIMScraper:
 
         my_price = val(it['my_price'])
 
+        code = str(it.get('old_code') or '')
+
         def sellable(res: Dict) -> bool:
             return bool(res.get('price')) and not res.get('out_of_stock') \
+                and not over_ceiling(val(res['price']), req_gb, code) \
                 and is_profitable(my_price, val(res['price']), req_gb)
 
         primary_ok = sellable(primary)
@@ -1144,7 +1188,9 @@ class ESIMScraper:
                 continue
             if not sellable(cand):
                 reason = ("out of stock" if cand.get('out_of_stock')
-                          else "no price" if not cand.get('price') else "unprofitable")
+                          else "no price" if not cand.get('price')
+                          else "over the buy ceiling" if over_ceiling(val(cand['price']), req_gb, code)
+                          else "unprofitable")
                 print(f"    {d}d: {cand.get('price') or '—'} — {reason}")
                 continue
             found.append({'days': d, 'price': val(cand['price']), 'res': cand,
@@ -1484,6 +1530,8 @@ class ESIMScraper:
 
             # ── Profitability check ──
             my_price_val = to_val(it['my_price'])
+            gb_num = to_val(res['gb'].replace('gb', '')) if res['gb'] else None
+            code_str = str(it.get('old_code') or res.get('code') or '')
             if my_price_val and new_val:
                 profit_abs = my_price_val - new_val
                 profit_pct = (profit_abs / new_val) * 100
@@ -1494,7 +1542,14 @@ class ESIMScraper:
                 put(r, 'profit',
                     f"{emoji} {sign}${abs(profit_abs):.2f} ({sign}{abs(profit_pct):.1f}%)")
 
-                gb_num = to_val(res['gb'].replace('gb', '')) if res['gb'] else None
+            # The ceiling is judged first and on the buy price alone: a 30GB
+            # bought over $10 is not for sale even when a generous sell price
+            # would clear 20%, and even before the owner has priced the row.
+            if over_ceiling(new_val, gb_num, code_str):
+                put(r, 'stock', OVER_CEILING_LABEL)
+                print(f"  📏 Row {r}: ${new_val:.2f} is over the {gb_num:g}GB buy ceiling "
+                      f"${buy_ceiling(gb_num, code_str):.2f} — not for sale")
+            elif my_price_val and new_val:
                 if is_profitable(my_price_val, new_val, gb_num):
                     put(r, 'stock', '')
                 else:

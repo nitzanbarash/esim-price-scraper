@@ -80,6 +80,9 @@ jobs:
       - name: Day policy
         run: python test_day_policy.py
 
+      - name: Buy ceiling
+        run: python test_buy_ceiling.py
+
       # The Stellar meter: /esims/{sim_id}/usage, and the VPN expiry never
       # becomes the package expiry.
       - name: Stellar usage

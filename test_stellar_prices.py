@@ -190,7 +190,7 @@ check("every decided row gets a timestamp", all("updated" in W[r] for r in (3, 5
 
 check("too short: our marker goes in the stock column", W[5].get("stock"), MARK_SHORT)
 check("too short: the note names the code, the size and the WINDOW",
-      W[5]["changed"], "אין 20GB ל-25-31 ימים בקוד CKH1013 (יש: 20d)")
+      W[5]["changed"], "אין 20GB ל-21-31 ימים בקוד CKH1013 (יש: 20d)")
 check("too short: the price is NOT rewritten", "price" in W[5], False)
 
 check("regional: marker + note", (W[8].get("stock"), W[8]["changed"]),
@@ -439,7 +439,7 @@ def _pick(gb, *vs):
 
 check("the window is the owner's band for the SIZE, uncapped from 30GB up",
       (_row(10.0).window_text, _row(30.0).window_text, _row(31.0).window_text,
-       _row(50.0).window_text), ("20-31", "25+", "30+", "30+"))
+       _row(50.0).window_text), ("20-31", "25+", "25+", "30+"))
 check("an agora never buys back ten days of validity",
       _pick(10.0, IDN20, IDN30), (30, 2.13, 10, 1))
 check("at exactly 1% under 30 days' price the row stays on 30 days",

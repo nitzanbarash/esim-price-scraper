@@ -75,15 +75,15 @@ check("10GB inclusive starts at 20 days",
       fallback_days(10.0, 30), [20, 21, 25, 30, 31])
 check("19GB inclusive is the same band",
       fallback_days(19.0, 30), [20, 21, 25, 30, 31])
-check("20GB inclusive starts at 25 days",
-      fallback_days(20.0, 30), [25, 30, 31])
-check("30GB inclusive is still the 25-day band",
+check("20GB inclusive starts at 21 days (owner, 2026-09-16)",
+      fallback_days(20.0, 30), [21, 25, 30, 31])
+check("30GB keeps the 25-day band — 21 is for 20GB and below",
       fallback_days(30.0, 30), [25, 30, 31])
 # Over 30GB the floor is 30 days, and at 50GB the owner's "above 32 days" rule
 # cannot apply here at all: esim.dog is capped at 31, so a 33-day floor would
 # leave the row with an empty window and nothing to sell. That reading is
 # day_policy's; this pins that the scraper still has two days to ask for.
-check("31GB starts at 30 days", fallback_days(31.0, 30), [30, 31])
+check("31GB is the same 25-day band (40GB: 25-30, owner 2026-09-17)", fallback_days(31.0, 30), [25, 30, 31])
 check("50GB keeps a window on esim.dog", fallback_days(50.0, 30), [30, 31])
 check("nothing above 31d is ever a candidate",
       [d for d in fallback_days(1.0, 30) if d > DAY_CEILING], [])
@@ -91,7 +91,8 @@ check("no GB at all is left alone", fallback_days(None, 30), [])
 check("floors", (fallback_day_floor(2.0), fallback_day_floor(5.0),
                  fallback_day_floor(10.0), fallback_day_floor(20.0),
                  fallback_day_floor(100.0)),
-      (1, 5, 20, 25, 30))
+      (1, 5, 20, 21, 30))
+check("30GB floor is 25", fallback_day_floor(30.0), 25)
 
 print("\n-- a day outside the window is not a candidate, even the one we hold --")
 # This is the 2026-09-07 rule REVERSED, on purpose. Back then `current` was
