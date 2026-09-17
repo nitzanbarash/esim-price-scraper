@@ -1272,10 +1272,17 @@ function fullSyncOnce() {
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'fullSyncOnce')
     .forEach(t => ScriptApp.deleteTrigger(t));
+  // Same lock as hourlySync: both land somewhere in 11:10-11:45, and two
+  // full pushes in flight commit the overlay twice for one change. If the
+  // hourly one is already sending, this one has nothing to add.
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) { Logger.log('fullSyncOnce: lock busy for 30 s, skipped'); return; }
   try {
     fullSync();
   } catch (err) {
     alert_('\u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05d4\u05d9\u05d5\u05de\u05d9 \u05d4\u05de\u05dc\u05d0 \u05e0\u05db\u05e9\u05dc', String(err));
+  } finally {
+    lock.releaseLock();
   }
 }
 
