@@ -419,6 +419,14 @@ function setupTriggers() {
     .atHour(10).everyDays(1).inTimezone('Asia/Jerusalem').create();
   ScriptApp.newTrigger('checkSiteFresh').timeBased()
     .atHour(12).everyDays(1).inTimezone('Asia/Jerusalem').create();
+  // Script writes (the GitHub scraper, the Stellar price job, the supplier
+  // chooser) never fire onEdit, so until 2026-09-17 they reached the site
+  // through ONE door: fullSyncOnce at ~11:10. The scheduled afternoon scrape
+  // (drifts 14:20-17:15) and every Stellar pass after it waited for the next
+  // morning - the overlay went two days without a write. Once an hour closes
+  // that. Apps Script places an hourly trigger within +/-15 min of the minute
+  // asked for; :30 keeps it off the hour mark the other schedules share.
+  ScriptApp.newTrigger('hourlySync').timeBased().everyHours(1).nearMinute(30).create();
   // GitHub throttles */5 cron on public repos to ~1/hour in practice, so the
   // fulfillment bot is dispatched from here instead. Fires every minute; the
   // handler itself decides whether to dispatch - every minute while an order
@@ -435,7 +443,7 @@ function setupTriggers() {
   // the hourly GitHub job behind it is what still runs when this project has
   // spent its quota.
   ScriptApp.newTrigger('pullCoupons').timeBased().everyMinutes(30).create();
-  Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape + 12:00 watchdog + 1-min fulfillment tick + 30-min coupon pull + weekly backup');
+  Logger.log('Triggers installed: onEdit sync + daily 10:00 scrape + hourly :30 full sync + 12:00 watchdog + 1-min fulfillment tick + 30-min coupon pull + weekly backup');
 }
 
 // -- helpers ---------------------------------------------------------
@@ -1271,6 +1279,46 @@ function fullSyncOnce() {
   }
 }
 
+// The hourly full sync (installed by setupTriggers). Two things it steps
+// around:
+//  * 10:xx - the dispatched scrape rewrites the sheet 10:21-11:17 and
+//    fullSyncOnce is already booked for the moment it ends. Everything the
+//    other writers do is a per-SKU batchUpdate (the chooser) or 50-cell
+//    chunks of prices (the scraper), so a sync that lands mid-run publishes a
+//    mix of this hour's and last hour's prices - all of them real prices -
+//    and the next hour finishes the job. No other hour is skipped for that.
+//  * whoever holds the script lock - an onEdit flush, the coupon pull
+//    (pullCoupons fires every 30 minutes, so it can land on the same minute
+//    every hour), or the receipts push. Waiting up to 30 s costs nothing
+//    when the lock is free and is what stops two pushes racing to commit
+//    the overlay; if it is still busy after that, the next hour repeats.
+// The endpoint skips the commit when the overlay comes out byte-identical,
+// so an hour with nothing new costs one read of the sheet and one POST.
+// Failures: post_, colMap_ and the delist guard mail before they throw, so
+// the catch here only logs - plus one mail per 6 hours (same ladder as
+// fulfillmentTick) for what does NOT mail itself, a network exception or a
+// missing token. 23 runs a day must not become 46 emails a day.
+function hourlySync() {
+  const hour = Number(Utilities.formatDate(new Date(), 'Asia/Jerusalem', 'H'));
+  if (hour === 10) { Logger.log('hourlySync: scrape window, skipped'); return; }
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) { Logger.log('hourlySync: lock busy for 30 s, skipped'); return; }
+  try {
+    fullSync();
+  } catch (err) {
+    Logger.log('hourlySync failed: ' + err);
+    const props = PropertiesService.getScriptProperties();
+    const last = +(props.getProperty('HS_LAST_ALERT') || 0);
+    if (Date.now() - last > 6 * 36e5) {
+      props.setProperty('HS_LAST_ALERT', String(Date.now()));
+      alert_('\u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05d4\u05e9\u05e2\u05ea\u05d9 \u05e0\u05db\u05e9\u05dc',
+        String(err) + '\n(\u05d4\u05ea\u05e8\u05d0\u05d4 \u05d6\u05d5 \u05e0\u05e9\u05dc\u05d7\u05ea \u05dc\u05db\u05dc \u05d4\u05d9\u05d5\u05ea\u05e8 \u05e4\u05e2\u05dd \u05d1-6 \u05e9\u05e2\u05d5\u05ea.)');
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 // -- weekly Drive backup of both spreadsheets ------------------------
 function weeklyBackup() {
   try {
@@ -1395,7 +1443,7 @@ function lastScrapeRun_() {
 // feature here forces the question "and is it actually running?".
 const EXPECTED_TRIGGERS = ['onEditPush', 'onReceiptsEdit', 'dailyScrape',
                            'checkSiteFresh', 'fulfillmentTick', 'pullCoupons',
-                           'weeklyBackup'];
+                           'weeklyBackup', 'hourlySync'];
 
 /**
  * The daily 12:00 health check.
