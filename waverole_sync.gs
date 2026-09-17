@@ -85,9 +85,19 @@ const HEADERS = {
   sale:        ['\u05de\u05d1\u05e2\u05e6\u05e2\u05d9\u05dd (\u05d0\u05d7\u05d5\u05d6\u05d9\u05dd)'],         // empty/0 cancels the sale
   buy:         ['\u05de\u05d7\u05d9\u05e8 \u05e7\u05e0\u05d9\u05d9\u05d4'],               // what the SUPPLIER charges us (scraper writes it)
   profit:      ['\u05e8\u05d5\u05d5\u05d7 (\u05db\u05d3\u05d0\u05d9\u05d5\u05ea)'],           // derived: net minus buy, in $ and %
+  route:       ['Route'],                    // esim.dog's colour / Stellar's package code, per row
 };
 // Fields the sync cannot work without - missing => loud email, not silence.
-const REQUIRED_FIELDS = ['sku', 'price'];
+// 'chosen' joined the list on 2026-09-17: the tick now decides whether a
+// package is on the site AT ALL (see pickRow_), so a mangled header that
+// silently read as "no tick anywhere" would delist the whole storefront.
+const REQUIRED_FIELDS = ['sku', 'price', 'chosen'];
+
+// A full sync that would take MORE than this share of the sheet's SKUs off
+// the site is a broken read (a shifted column, a paste that lost the tick
+// column), not a decision - nobody delists half the shop in one edit. The
+// push is refused and the owner is mailed instead.
+const MAX_DELIST_SHARE = 0.5;
 
 // The colours the owner already paints by hand (read off the live sheet
 // 2026-09-10): green = the row the site sells, grey = the other supplier's row.
@@ -495,7 +505,10 @@ function checkColumns() {
     if (pkg._chosen) ticked[pkg.source] = (ticked[pkg.source] || 0) + 1;
   }
   const sold = {};
-  for (const pkg of buildPackages_(null)) sold[pkg.source] = (sold[pkg.source] || 0) + 1;
+  for (const pkg of buildPackages_(null)) {
+    const k = pkg.listed === false ? 'DELISTED (no tick)' : pkg.source;
+    sold[k] = (sold[k] || 0) + 1;
+  }
   Logger.log('COLUMNS\n' + lines.join('\n') +
     '\n\nPRICED ROWS PER SUPPLIER: ' + JSON.stringify(bySupplier) +
     '\nOF THOSE, TICKED: ' + JSON.stringify(ticked) +
@@ -543,21 +556,46 @@ function rowToPackage_(row, map) {
   const bip = String(row[map.breakout_ip] || '').trim();
   if (bip) pkg.breakout_ip = bip;
   const fee = num_(row[map.fee]); if (fee !== null) pkg.fee = fee;
+  const route = map.route === undefined ? '' : String(row[map.route] || '').trim();
+  if (route) pkg.route = route;
   return pkg;
 }
 
-// The one row of a SKU's pair the site sells. The (tick) wins when exactly one
-// row carries it; otherwise esim.dog's row, the supplier we have always
-// bought from. A ticked Stellar row with no customer price never gets here
-// (rowToPackage_ dropped it), so the tick alone cannot empty a SKU. The site
-// still refuses checkout on a supplier its bot cannot buy from - the tick
-// moves the PRICE, LIVE_SUPPLIERS on the site moves the money.
-function pickRow_(cands) {
+// The one row of a SKU's pair the site sells - or the word that it sells none.
+//
+// THE TICK IS THE LISTING (owner, 2026-09-17: "every package with no tick at
+// all comes off the site; ticked AND marked out of stock shows as sold out,
+// as we know it"). So:
+//   * no tick on ANY row of the SKU  -> { sku, listed:false }: the site hides
+//     the package outright. Not "sold out" - gone, until a row is ticked.
+//   * a tick, and the stock column filled on that row -> in_stock:false, the
+//     greyed "Sold out" card, exactly as before.
+//   * a tick -> that row when exactly one row carries it; otherwise esim.dog's
+//     row, the supplier we have always bought from. A ticked Stellar row with
+//     no customer price never gets here (rowToPackage_ dropped it), so the
+//     tick alone cannot empty a SKU. The site still refuses checkout on a
+//     supplier its bot cannot buy from - the tick moves the PRICE,
+//     LIVE_SUPPLIERS on the site moves the money.
+// `anyTick` is read off EVERY row of the SKU, priced or not, in
+// buildPackages_ - a tick on an unpriced row is still the owner saying
+// "listed", and the price then comes from whichever row can be sold.
+// `routes` is the Route column of EVERY row of the SKU keyed by supplier,
+// priced or not - the site keeps it so a survey answer can name the route an
+// old order was bought on even after the tick moved (update-packages.js
+// accepts it since 2026-09-15; the sheet had not been sending it).
+function pickRow_(cands, anyTick, routes) {
+  // A delisted package also says in_stock:false: a page loaded before the
+  // site learned the word "hidden" then shows it sold out rather than for
+  // sale, and the till refuses it either way.
+  if (!anyTick) return { sku: cands[0].sku, listed: false, in_stock: false };
   const ticked = cands.filter(p => p._chosen);
   const pick = ticked.length === 1 ? ticked[0] : cands.find(p => p.source === 'esim.dog');
   if (!pick) return null;
   const pkg = Object.assign({}, pick);
   delete pkg._chosen;
+  pkg.listed = true;
+  pkg.routes = routes || {};
+  pkg.route = pkg.routes[pkg.source] || '';
   return pkg;
 }
 
@@ -569,18 +607,45 @@ function buildPackages_(rowsWanted) {   // rowsWanted: null = all, or Set of she
   // changed may be the ticked Stellar half of a pair, and choosing between
   // the halves needs both of them in hand.
   const bySku = {};
+  const anyTick = {};      // sku -> a tick on ANY of its rows, priced or not
+  const routes = {};       // sku -> { supplier: route } off every row
   const touched = new Set();
   for (let r = 1; r < data.length; r++) {
+    // The SKU and the tick are read off the raw row, not off rowToPackage_:
+    // that one drops an unpriced row, and the rule above must still see the
+    // tick (or its absence) on such a row, and an edit to it must still
+    // reach the site.
+    const rawSku = String(data[r][map.sku] || '').trim();
+    if (!rawSku || rawSku.indexOf('.') < 0) continue;
+    anyTick[rawSku] = anyTick[rawSku] || String(data[r][map.chosen] || '').trim() !== '';
+    const rawSrc = String(data[r][map.source] || '').trim().toLowerCase() || 'esim.dog';
+    const rawRoute = map.route === undefined ? '' : String(data[r][map.route] || '').trim();
+    if (rawRoute) (routes[rawSku] = routes[rawSku] || {})[rawSrc] = rawRoute;
+    if (!rowsWanted || rowsWanted.has(r + 1)) touched.add(rawSku);
     const pkg = rowToPackage_(data[r], map);
-    if (!pkg) continue;
+    if (!pkg) { bySku[rawSku] = bySku[rawSku] || []; continue; }
     (bySku[pkg.sku] = bySku[pkg.sku] || []).push(pkg);
-    if (!rowsWanted || rowsWanted.has(r + 1)) touched.add(pkg.sku);
   }
   const out = [];
+  let delisted = 0;
   for (const sku of Object.keys(bySku)) {
     if (!touched.has(sku)) continue;
-    const pick = pickRow_(bySku[sku]);
-    if (pick) out.push(pick);
+    // No priced row and a tick somewhere: nothing to sell and nothing to say
+    // - the site keeps whatever it last heard, as it always has.
+    if (!bySku[sku].length && anyTick[sku]) continue;
+    const pick = pickRow_(bySku[sku].length ? bySku[sku] : [{ sku: sku }], anyTick[sku], routes[sku]);
+    if (!pick) continue;
+    if (pick.listed === false) delisted++;
+    out.push(pick);
+  }
+  // The guard, on a FULL sync only: a single edit delists one SKU by design.
+  const total = Object.keys(bySku).length;
+  if (!rowsWanted && total >= 10 && delisted > total * MAX_DELIST_SHARE) {
+    const msg = delisted + ' \u05de\u05ea\u05d5\u05da ' + total +
+      ' \u05d7\u05d1\u05d9\u05dc\u05d5\u05ea \u05d1\u05dc\u05d9 \u05d5\u05d9 \u05d1\u05db\u05dc\u05dc - \u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05e0\u05e2\u05e6\u05e8 \u05d1\u05de\u05e7\u05d5\u05dd \u05dc\u05d4\u05d5\u05e8\u05d9\u05d3 \u05d0\u05ea \u05e8\u05d5\u05d1 \u05d4\u05d0\u05ea\u05e8.' +
+      '\n\u05e1\u05d1\u05d9\u05e8 \u05e9\u05e2\u05de\u05d5\u05d3\u05ea \u05e0\u05d1\u05d7\u05e8 (W) \u05d6\u05d6\u05d4 \u05d0\u05d5 \u05e9\u05d4\u05db\u05d5\u05ea\u05e8\u05ea \u05e9\u05dc\u05d4 \u05e0\u05e4\u05d2\u05e2\u05d4 - \u05dc\u05d4\u05e8\u05d9\u05e5 checkColumns.';
+    alert_('\u05d4\u05e1\u05e0\u05db\u05e8\u05d5\u05df \u05e0\u05e2\u05e6\u05e8: \u05db\u05de\u05e2\u05d8 \u05db\u05dc \u05d4\u05d7\u05d1\u05d9\u05dc\u05d5\u05ea \u05d1\u05dc\u05d9 \u05d5\u05d9', msg);
+    throw new Error('refusing to delist ' + delisted + ' of ' + total + ' SKUs in one sync');
   }
   return out;
 }
@@ -646,8 +711,9 @@ const PENDING_ROWS_KEY = 'PENDING_SYNC_ROWS';
 // reads the sheet, because pickRow_() resolves a two-tick pair to esim.dog -
 // the opposite of what was just asked for - and would push it before anyone
 // noticed. Programmatic writes do not re-fire onEdit, so this cannot loop.
-// Clearing a tick greys that row and changes nothing else (the site then
-// falls back to esim.dog for the SKU, as it always has).
+// Clearing a tick greys that row. If it was the SKU's only tick the package
+// comes OFF the site (pickRow_), which is what clearing the last tick means
+// since 2026-09-17; with the twin still ticked nothing else changes.
 // Only a single-cell edit is handled: a pasted block that ticks both halves
 // of a pair has no "the one the owner meant", so it is left exactly as typed
 // and checkColumns will name it.
