@@ -21,7 +21,7 @@ Run:  python test_day_policy.py
 import sys
 
 from day_policy import (
-    DAY_CEILING, DAY_TOL, ESIMDOG, STELLAR, SUPPLIERS,
+    DAY_CEILING, DAY_FLOOR_EXCEPTIONS, DAY_TOL, ESIMDOG, STELLAR, SUPPLIERS,
     day_ceiling, day_floor, in_window, pick,
 )
 
@@ -163,6 +163,22 @@ check("Thailand 50GB takes the month, not the half-year",
       days_of(pick(50, STELLAR, [(30, 14.84), (180, 22.24)])), 30)
 check("Japan 50GB takes the month, not the half-year",
       days_of(pick(50, STELLAR, [(30, 14.16), (180, 23.13)])), 30)
+
+print("\n-- owner-approved exceptions: five 50GB rows at 25 days, by name (2026-09-17) --")
+check("the list is exactly the five the owner approved",
+      sorted(DAY_FLOOR_EXCEPTIONS), ['2.30.50', '2.32.50', '2.36.50', '2.43.50', '2.48.50'])
+for code in DAY_FLOOR_EXCEPTIONS:
+    check(f"esim.dog {code} floor is 25", day_floor(50, ESIMDOG, code), 25)
+check("without the code the floor stays a month", day_floor(50, ESIMDOG), 30)
+check("a code that is not listed changes nothing", day_floor(50, ESIMDOG, '2.49.50'), 30)
+check("Stellar keeps its month for the same code", day_floor(50, STELLAR, '2.30.50'), 30)
+check("25 days is inside Greece's window", in_window(50, ESIMDOG, 25, '2.30.50'), True)
+check("...and outside Germany's", in_window(50, ESIMDOG, 25, '2.49.50'), False)
+check("24 days is still out, even for Greece", in_window(50, ESIMDOG, 24, '2.30.50'), False)
+check("Greece: the cheap 25-day black beats the month-long blue",
+      days_of(pick(50, ESIMDOG, [(31, 20.49), (25, 13.94)], '2.30.50')), 25)
+check("Germany: same candidates, no exception — 25 days is not even a candidate",
+      days_of(pick(50, ESIMDOG, [(31, 20.49), (25, 13.94)])), 31)
 
 print("\n-- the floor bands, on their boundaries --")
 for gb, want in ((1, 1), (2, 1), (2.5, 5), (3, 5), (5, 5), (6, 10), (9, 10),

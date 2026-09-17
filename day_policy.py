@@ -82,7 +82,7 @@ implements the OLD single-supplier ladder; this module is the two-supplier
 replacement and knows nothing about URLs, tabs or the sheet.
 """
 
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 ESIMDOG = 'esim.dog'
 STELLAR = 'stellar'
@@ -118,6 +118,17 @@ DAY_FLOOR_ABOVE_BANDS = 30
 BIG_GB = 50.0
 BIG_GB_FLOOR = 30
 
+# Per-SKU exceptions to the FLOOR, each approved by the owner BY NAME — the rule
+# itself does not move ("תפתח את זה רק במקרים ספציפיים ... תאשר את זה מולי",
+# 2026-09-17). Keyed by the Sheet's package code; esim.dog rows only — Stellar
+# keeps its own floor for the same code. 2026-09-17: five 50GB rows at 25 days,
+# where the 25-day black row is inside the $18 buy ceiling and the month-long
+# blue is not (Greece, Austria, Hungary, Belgium, Poland). The add-country
+# picker carries the same list (DAY_EXCEPTIONS); keep the two identical.
+DAY_FLOOR_EXCEPTIONS: Dict[str, int] = {
+    '2.30.50': 25, '2.43.50': 25, '2.36.50': 25, '2.32.50': 25, '2.48.50': 25,
+}
+
 # esim.dog is never asked past 31 days. Stellar is, but only on the big sizes.
 DAY_CEILING = 31
 STELLAR_UNCAPPED_FROM_GB = 30.0
@@ -131,10 +142,16 @@ def _supplier(supplier: str) -> str:
     return key
 
 
-def day_floor(gb: float, supplier: str) -> int:
-    """Shortest validity the owner will sell this size as, at this supplier."""
+def day_floor(gb: float, supplier: str, code: Optional[str] = None) -> int:
+    """Shortest validity the owner will sell this size as, at this supplier.
+
+    `code` is the Sheet's package code; it only matters when the owner has
+    approved that exact SKU as an exception (DAY_FLOOR_EXCEPTIONS)."""
     key = _supplier(supplier)
     gb = float(gb)
+    code = str(code or '').strip()
+    if key == ESIMDOG and code in DAY_FLOOR_EXCEPTIONS:
+        return DAY_FLOOR_EXCEPTIONS[code]
     if gb >= BIG_GB:
         # esim.dog cannot honour "above 32 days" under a 31-day ceiling, so its
         # 50GB rows keep the floor of the band below.
@@ -153,10 +170,10 @@ def day_ceiling(gb: float, supplier: str) -> Optional[int]:
     return DAY_CEILING
 
 
-def in_window(gb: float, supplier: str, days: int) -> bool:
+def in_window(gb: float, supplier: str, days: int, code: Optional[str] = None) -> bool:
     """Is this validity one we are allowed to sell this size as?"""
     days = int(days)
-    if days < day_floor(gb, supplier):
+    if days < day_floor(gb, supplier, code):
         return False
     ceiling = day_ceiling(gb, supplier)
     return ceiling is None or days <= ceiling
@@ -188,13 +205,15 @@ def preference_key(candidate: Any) -> Tuple[int, int]:
     return (abs(days - PREFERRED_DAYS), -days)
 
 
-def in_window_candidates(gb: float, supplier: str, candidates: Iterable[Any]) -> List[Any]:
+def in_window_candidates(gb: float, supplier: str, candidates: Iterable[Any],
+                         code: Optional[str] = None) -> List[Any]:
     """The candidates we are allowed to consider, in preference order."""
-    kept = [c for c in candidates if in_window(gb, supplier, candidate_days(c))]
+    kept = [c for c in candidates if in_window(gb, supplier, candidate_days(c), code)]
     return sorted(kept, key=preference_key)
 
 
-def pick(gb: float, supplier: str, candidates: Iterable[Any]) -> Optional[Any]:
+def pick(gb: float, supplier: str, candidates: Iterable[Any],
+         code: Optional[str] = None) -> Optional[Any]:
     """The validity to sell `gb` at, from this supplier's priced candidates.
 
     `candidates` carry (days, price) — as attributes, mapping keys or the first
@@ -207,7 +226,7 @@ def pick(gb: float, supplier: str, candidates: Iterable[Any]) -> Optional[Any]:
     it is simply the cheapest candidate in the window (rule 1's exception).
     """
     key = _supplier(supplier)
-    ordered = in_window_candidates(gb, key, candidates)
+    ordered = in_window_candidates(gb, key, candidates, code)
     if not ordered:
         return None
 

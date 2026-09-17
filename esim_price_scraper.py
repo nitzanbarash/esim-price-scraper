@@ -367,17 +367,18 @@ def over_ceiling(buy: Optional[float], gb: Optional[float], code: str = '') -> b
     return bool(buy) and cap is not None and float(buy) > cap + 1e-9
 
 
-def fallback_day_floor(gb: float) -> int:
+def fallback_day_floor(gb: float, code: Optional[str] = None) -> int:
     """Shortest validity the owner will sell this size as, on esim.dog.
 
     A thin name over day_policy.day_floor() — the bands themselves moved out of
     this file on 2026-09-10 so that the scraper and Stellar cannot drift apart
     on what a 10GB package IS.
     """
-    return day_policy.day_floor(gb, DAY_SUPPLIER)
+    return day_policy.day_floor(gb, DAY_SUPPLIER, code)
 
 
-def fallback_days(gb: Optional[float], current: Optional[int] = None) -> List[int]:
+def fallback_days(gb: Optional[float], current: Optional[int] = None,
+                  code: Optional[str] = None) -> List[int]:
     """Every validity worth pricing for a `gb` package. [] = leave it alone.
 
     The order carries no preference — day_policy.pick() decides the winner once
@@ -392,9 +393,9 @@ def fallback_days(gb: Optional[float], current: Optional[int] = None) -> List[in
     """
     if gb is None:
         return []
-    days = [d for d in DAY_LADDER if day_policy.in_window(gb, DAY_SUPPLIER, d)]
+    days = [d for d in DAY_LADDER if day_policy.in_window(gb, DAY_SUPPLIER, d, code)]
     if current and current not in days \
-            and day_policy.in_window(gb, DAY_SUPPLIER, current):
+            and day_policy.in_window(gb, DAY_SUPPLIER, current, code):
         days.append(current)
     return sorted(days)
 
@@ -1104,7 +1105,7 @@ class ESIMScraper:
         req = parse_url(it['link'])
         req_gb = val(req.get('gb'))
         current = int(req['validity']) if str(req.get('validity') or '').isdigit() else None
-        days = fallback_days(req_gb, current)
+        days = fallback_days(req_gb, current, str(it.get('old_code') or ''))
         if not days:
             return None
 
@@ -1139,7 +1140,7 @@ class ESIMScraper:
         # days is not a cheap incumbent to be beaten; it is a row being sold
         # wrong, and putting it in the comparison is how it would defend itself.
         held_in_window = bool(current and req_gb is not None
-                              and day_policy.in_window(req_gb, DAY_SUPPLIER, current))
+                              and day_policy.in_window(req_gb, DAY_SUPPLIER, current, code))
         best = ({'days': current, 'price': val(primary.get('price')),
                  'res': primary, 'link': it['link']}
                 if primary_ok and held_in_window
@@ -1206,7 +1207,7 @@ class ESIMScraper:
             candidates.append(best)
 
         while candidates:
-            winner = day_policy.pick(req_gb, DAY_SUPPLIER, candidates)
+            winner = day_policy.pick(req_gb, DAY_SUPPLIER, candidates, code)
             if winner is None:
                 return nothing_to_adopt()
             if best is not None and winner is best:
