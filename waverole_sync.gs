@@ -1043,20 +1043,39 @@ function fulfillmentTick() {
   // So: dispatch at once while a paid order is still waiting for its eSIM
   // (customer gets the QR in ~1 minute instead of up to 5), and otherwise
   // keep the old 5-minute cadence - same idle cost as before.
+  //
+  // One read of the site's queue serves the whole tick. Until 2026-09-20 the
+  // tick made THREE site calls a minute - a sweep, a live supplier re-check
+  // and the queue probe - 4,320 function runs a day for a queue that is
+  // empty nearly all the time, against a Vercel Hobby CPU allowance the site
+  // was 85% through (the plan pauses the site at 100%). Now: the probe every
+  // minute (it decides the dispatch), the sweep only while something is
+  // queued, the supplier re-check every fifth minute.
+  const minute = new Date().getMinutes();    // before the network call: a slow site must not move it
+  const pending = pendingOrders_();          // null = the site could not be read
+
   // Finish any order whose eSIM was still being provisioned when the purchase
   // bot handed over its supplier session. Usually a no-op - the site normally
   // completes the order on the spot - but it is what closes the gap when the
   // supplier is a few seconds slow, without waiting for the delivery email.
-  sweepProvisioningOrders_();
+  // It only ever has work while an order is queued, so it runs every minute
+  // only while a FRESH one is (an order stuck for hours needs a person, not
+  // 1,440 sweeps a day) - and whenever the queue could not be read, because
+  // unknown is not empty. Every fifth minute regardless: the same call
+  // retries tax receipts still owed on orders that have long left the queue.
+  if (pending === null || hasFreshOrder_(pending) || minute % 5 === 0) sweepProvisioningOrders_();
   // Watch whether the supplier can still sell us packages, and email once on
-  // each change. Also keeps the site's cached verdict warm, so a shopper's
-  // page load never has to wait for a live check.
-  supplierWatch_();
+  // each change. Every fifth minute: each call has the site fetch the
+  // supplier's plan page and build files (~40 ms of CPU there), and between
+  // calls the site re-checks by itself the moment a shopper asks for a
+  // verdict older than a minute - so the cached verdict is as fresh as the
+  // traffic needs it, and an empty night costs one check in five, not five.
+  if (minute % 5 === 2) supplierWatch_();
   // Anything an edit queued but could not send (its flush was already busy)
   // goes out here, so a price change can never sit unsent.
   flushPendingRows_();
 
-  if (!orderAwaitingEsim_() && new Date().getMinutes() % 5 !== 0) return;
+  if (!orderAwaitingEsim_(pending) && minute % 5 !== 0) return;
 
   try {
     const res = UrlFetchApp.fetch(FULFILL_DISPATCH, {
@@ -1099,7 +1118,7 @@ function rowTime_(v) {
   return new Date(+m[3], +m[2] - 1, +m[1], +m[4], +m[5], +(m[6] || 0)).getTime();
 }
 
-// -- supplier watch - every minute -----------------------------------
+// -- supplier watch - every fifth minute (from fulfillmentTick) ---------
 // On 2026-07-27 the supplier answered HTTP 200 on every page while all of its
 // JavaScript build files 404'd: the site rendered, the Checkout button did
 // nothing, and nobody could buy. We could still have taken payments for
@@ -1108,7 +1127,7 @@ function rowTime_(v) {
 // So this asks the site to re-run its real check (page loads AND its build
 // files exist), which both keeps the cached verdict warm for shoppers and
 // tells us the moment selling becomes impossible - or possible again.
-// Emails only on a CHANGE, so a long outage does not send 1440 messages.
+// Emails only on a CHANGE, so a long outage does not send 288 messages.
 function supplierWatch_() {
   const props = PropertiesService.getScriptProperties();
   const tok = props.getProperty('ORDERS_TOKEN');
@@ -1133,7 +1152,17 @@ function supplierWatch_() {
 
   const was = props.getProperty('SUPPLIER_SELLING');
   const now = selling ? 'yes' : 'no';
-  if (was === now) return;                   // nothing changed - stay quiet
+  if (was === now) {
+    // Nothing changed between two samples - but five minutes apart, an outage
+    // can begin AND end in between and leave no trace here. Any order the bot
+    // failed inside it sits on the unfulfilled list with nothing else to hand
+    // it back, so a selling supplier is always asked to. The site refuses
+    // anything already served, out of retries or older than 48h; notify:false
+    // leaves the "still undelivered" mail to the recovery branch below, where
+    // it goes out once - not every five minutes.
+    if (selling) retryUnfulfilled_(tok, true);
+    return;
+  }
   props.setProperty('SUPPLIER_SELLING', now);
   if (was === null) return;                  // first ever run - no news yet
 
@@ -1156,13 +1185,15 @@ function supplierWatch_() {
 // Give paid-but-unbought orders back to the bot. Returns how many.
 // Orders that have used up their retries are NOT returned here - the site
 // emails about those separately, because they need a person.
-function retryUnfulfilled_(tok) {
+function retryUnfulfilled_(tok, quiet) {
+  const body = { action: 'retry_unfulfilled' };
+  if (quiet) body.notify = false;            // the unattended path: requeue, do not mail
   try {
     const res = UrlFetchApp.fetch('https://www.waverole.com/api/orders', {
       method: 'post',
       contentType: 'application/json',
       headers: { Authorization: 'Bearer ' + tok },
-      payload: JSON.stringify({ action: 'retry_unfulfilled' }),
+      payload: JSON.stringify(body),
       muteHttpExceptions: true,
     });
     if (res.getResponseCode() !== 200) return 0;
@@ -1192,31 +1223,49 @@ function sweepProvisioningOrders_() {
   }
 }
 
-function orderAwaitingEsim_() {
+/**
+ * The site's pending queue - every paid order the bots have not finished.
+ * Read ONCE per tick and handed to whoever needs it. Returns null when the
+ * site could not be read (no token, non-200, network fault): callers must
+ * treat that as "unknown", never as "empty". Optional: needs ORDERS_TOKEN in
+ * Script Properties (same value as the site's env var).
+ */
+function pendingOrders_() {
+  const tok = PropertiesService.getScriptProperties().getProperty('ORDERS_TOKEN');
+  if (!tok) return null;
+  try {
+    const res = UrlFetchApp.fetch('https://www.waverole.com/api/orders?status=pending&probe=1', {
+      headers: { Authorization: 'Bearer ' + tok },
+      muteHttpExceptions: true,
+    });
+    if (res.getResponseCode() !== 200) return null;
+    const orders = JSON.parse(res.getContentText()).orders;
+    return Array.isArray(orders) ? orders : null;   // an odd shape is "unknown" too
+  } catch (err) {
+    Logger.log('site queue check failed: ' + err);
+    return null;
+  }
+}
+
+/** Is any queued order young enough to still be mid-flight? (NaN never passes.) */
+function hasFreshOrder_(pending) {
+  if (!Array.isArray(pending)) return false;
+  for (const o of pending) {
+    const age = Date.now() - new Date(o && o.ts).getTime();
+    if (Math.abs(age) < AWAITING_WINDOW_MS) return true;
+  }
+  return false;
+}
+
+function orderAwaitingEsim_(pending) {
   // Signal 1 - the SITE's own queue: an order sits there as "pending" from
   // the second the payment IPN lands, before the PC bot has done anything.
   // The receipts-row signal below only exists AFTER the PC bot both bought
   // and wrote the row - the night WR-845JFY got stuck proved that row can
-  // simply never appear. Optional: needs ORDERS_TOKEN in Script Properties
-  // (same value as the site's env var); skipped silently without it.
-  try {
-    const tok = PropertiesService.getScriptProperties().getProperty('ORDERS_TOKEN');
-    if (tok) {
-      const res = UrlFetchApp.fetch('https://www.waverole.com/api/orders?status=pending&probe=1', {
-        headers: { Authorization: 'Bearer ' + tok },
-        muteHttpExceptions: true,
-      });
-      if (res.getResponseCode() === 200) {
-        const orders = JSON.parse(res.getContentText()).orders || [];
-        for (const o of orders) {
-          const age = Date.now() - new Date(o.ts).getTime();
-          if (Math.abs(age) < AWAITING_WINDOW_MS) return true;
-        }
-      }
-    }
-  } catch (err) {
-    Logger.log('site queue check failed: ' + err);   // fall through to the sheet
-  }
+  // simply never appear. The tick passes the queue it already read; called
+  // bare, this reads it itself. null falls through to the sheet.
+  if (pending === undefined) pending = pendingOrders_();
+  if (hasFreshOrder_(pending)) return true;
   // Signal 2 - a receipts row with an order number and no activation code
   // (order bought, eSIM email not yet processed).
   try {
