@@ -259,9 +259,15 @@ def claim(order_id: str) -> bool:
 
 
 def report_fulfilled(order_id: str, esim: dict):
-    r = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "status": "fulfilled",
-                                           "esim": esim},
-                      headers=_site_headers(), timeout=20)
+    # days_bought: the validity actually delivered, stated outright so the
+    # site can say "upgraded from 7 to 30 days" on the order page when the
+    # listing bought ran longer than the one sold (site reads it off the plan
+    # label too; this is the plain-words copy).
+    body = {"order_id": order_id, "status": "fulfilled", "esim": esim}
+    m = re.search(r"(\d+)\s*days?", str(esim.get("plan") or ""))
+    if m:
+        body["days_bought"] = int(m.group(1))
+    r = requests.post(fb.ORDERS_URL, json=body, headers=_site_headers(), timeout=20)
     r.raise_for_status()
 
 
