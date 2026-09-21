@@ -215,6 +215,21 @@ check("...which is a different string from the one it replaces",
 check("a cell already euro-first is left in that order",
       W[9]["price"], price_cell(2.83, FX))
 
+# A margin word is the chooser's (derived, re-judged every run) and a plan
+# that is GONE cannot be bought whatever it used to cost: the availability
+# word replaces it. Left alone, the row kept a frozen price under a word the
+# chooser reads as "buyable" (review finding, 2026-09-21).
+gone_row = by_sku["2.49.5"]
+for stale in ("לא רווחי", "לא רווחי — מעל תקרה"):
+    gone_row.stock = stale
+    ups_g = plan_updates([decide(cat, gone_row)], FX, TS, TODAY)
+    check(f"gone: marker replaces the margin word {stale!r}",
+          [v for _, k, v in ups_g if k == "stock"], [MARK_GONE])
+gone_row.stock = "לא למכור"
+check("gone: the owner's own word still wins",
+      [v for _, k, v in plan_updates([decide(cat, gone_row)], FX, TS, TODAY) if k == "stock"], [])
+gone_row.stock = MARK_SHORT
+
 # the recovery path: our own marker is cleared once the row prices again
 rec_row = by_sku["2.49.10"]
 rec_row.stock = MARK_GONE

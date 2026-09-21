@@ -92,7 +92,7 @@ from typing import Callable, Optional
 import requests
 
 import day_policy
-from choose_supplier import usd_outside_parens
+from choose_supplier import PROFIT_MARKS, usd_outside_parens
 from esim_price_scraper import HEADER_KEYS, SHEET_ID, col_letter
 
 FEED_URL = "https://stellarsecurity.com/assets/esim/products.index.json"   # retail; fallback only
@@ -544,8 +544,14 @@ def plan_updates(decisions, fx: float, ts: str, today: str) -> list[tuple[int, s
             # fetch last week's plan for a row we refused today.
             if r.plan_id:
                 put(r.row, "plan_id", "")
-            # Only over an empty cell or our own marker — never over the owner's word.
-            if (r.stock == "" or r.stock in OUR_MARKS) and r.stock != mark:
+            # Over an empty cell, our own marker, or a MARGIN word — never over
+            # the owner's word. The margin words (choose_supplier.PROFIT_MARKS)
+            # are derived from the price and re-judged by the chooser every
+            # run; a plan that is gone has no price to judge, and "cannot be
+            # bought" outranks "does not pay". Left in place, the margin word
+            # kept a vanished plan looking buyable at its frozen price.
+            if (r.stock == "" or r.stock in OUR_MARKS or r.stock in PROFIT_MARKS) \
+                    and r.stock != mark:
                 put(r.row, "stock", mark)
             continue
 

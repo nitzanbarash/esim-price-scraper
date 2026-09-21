@@ -244,6 +244,9 @@ PROFIT_MIN_PCT_1GB = -20.0   # 1GB plans are a loss leader; a 20% loss is allowe
 # are not judged by these numbers.
 BUY_CEILINGS = ((30.0, 10.0), (40.0, 14.0), (50.0, 18.0))   # (size from, max buy $)
 OVER_CEILING_LABEL = 'לא רווחי — מעל תקרה'
+# The same word waverole_sync.gs applyFee_ writes (UNPROFITABLE) when the
+# owner types a sell price; choose_supplier.py keeps it fresh on twin rows.
+UNPROFITABLE_LABEL = 'לא רווחי'
 REGIONAL_CODE_RE = re.compile(r'^\d+\.0[A-Z]?\.')
 
 # How long the scrape may run before it stops itself and saves what it has.
@@ -1554,7 +1557,7 @@ class ESIMScraper:
                 if is_profitable(my_price_val, new_val, gb_num):
                     put(r, 'stock', '')
                 else:
-                    put(r, 'stock', 'לא רווחי')
+                    put(r, 'stock', UNPROFITABLE_LABEL)
                     print(f"  💸 Row {r}: unprofitable ({profit_pct:+.1f}%, "
                           f"needs {profit_floor_pct(gb_num):+.0f}%)")
             else:

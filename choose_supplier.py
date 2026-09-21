@@ -26,8 +26,19 @@ What "eligible" means (all four, or the row cannot win):
                      prose is not a price, and a row with no price is not for
                      sale. Either order reads the same: '(€0.48) $0.56' and
                      '$0.56 (€0.48)' both cost 56 cents
-    Q  במלאי/רווחי   is EMPTY. Anything there — לא רווחי, לא זמין, the owner's
-                     own note — means do not sell this row
+    Q  במלאי/רווחי   holds no AVAILABILITY word — לא זמין, פחות ימים מהמובטח,
+                     the scraper's out-of-stock, the owner's own note: the row
+                     cannot be bought, so it cannot win. The two MARGIN words
+                     (לא רווחי and לא רווחי — מעל תקרה) do NOT disqualify a
+                     row: they are derived from cost and sell price, and the
+                     chooser recomputes them itself (below). Reading them as
+                     "cannot buy" is how 74 SKUs fled to the DEARER supplier on
+                     2026-09-21: a stale לא רווחי sat on every Stellar row, the
+                     esim.dog twins had just been re-judged clean by the morning
+                     scrape, and "incumbent not sellable" handed each SKU to a
+                     row that cost more — which can never make a package MORE
+                     profitable. The price rule alone decides between two rows
+                     that can both be bought.
     F  זמן חבילה     parses as days
 
 Who the incumbent is
@@ -96,6 +107,30 @@ P is never mirrored — it is RECOMPUTED per row, off the SKU's own מחיר ש�
 that row's OWN cost, exactly as it always was. Two suppliers cost different
 money, so one P copied onto both rows would be a lie on one of them.
 
+THE MARGIN WORD IN Q, also on every run, on every row of a multi-row SKU
+------------------------------------------------------------------------
+The site reads any word in Q as sold out, and the two margin words are written
+by the scraper on the esim.dog rows every morning (esim_price_scraper.py) and
+by applyFee_ on both rows when the owner types a sell price — and by nobody
+else. A Stellar row's verdict therefore went stale the moment either input
+moved without a hand edit of U, and a stale word had no way out. Now every row
+of every SKU the chooser looks at is re-judged here, by the scraper's own two
+rules in the scraper's own order: the buy ceiling first, on cost and size
+alone (regional bundles exempt), then the profit floor against the SKU's
+מחיר שלי. The verdict is written only over an EMPTY cell or over one of these
+two words, and only when it differs — a supplier's availability word or the
+owner's own note is never touched, exactly as applyFee_ behaves (and
+stellar_prices.py, whose availability words in turn DO replace a margin word:
+a plan that is gone cannot be bought, whatever it used to cost). The ceiling
+is judged on cost and size alone; the floor needs the SKU's מחיר שלי, and
+without it a לא רווחי is cleared rather than kept as a verdict nobody made.
+
+One more thing the margin verdict changes: an incumbent this run judges
+unprofitable is dark on the site anyway, so the 1% churn tolerance — which
+protects a LIVE listing from moving for pennies — protects nothing. A rival
+that is cheaper by any amount AND pays on its own verdict takes such a SKU;
+a dearer or equal rival never does, which is the whole point.
+
 Run:
     python choose_supplier.py            dry run — prints the table, writes nothing
     python choose_supplier.py --apply    writes to the sheet
@@ -116,11 +151,19 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import day_policy
-from esim_price_scraper import HEADER_KEYS, SHEET_ID
+from esim_price_scraper import (
+    HEADER_KEYS, OVER_CEILING_LABEL, SHEET_ID, UNPROFITABLE_LABEL,
+    is_profitable, over_ceiling,
+)
 
 # The two suppliers, spelled the way column D spells them (compared lower-case:
 # the sheet writes 'Stellar' on some rows and 'stellar' on others).
 SOURCES = frozenset({"esim.dog", "stellar"})
+
+# The two words Q may hold about a row's MARGIN rather than its supply. Both
+# are derived — from the row's cost, the SKU's sell price and its size — so
+# they are recomputed here on every run and never read as "cannot buy".
+PROFIT_MARKS = frozenset({UNPROFITABLE_LABEL, OVER_CEILING_LABEL})
 
 # A blank מקור is not an unknown supplier — it is esim.dog. Every other reader
 # of this sheet already says so: waverole_sync.gs rowToPackage_ (blank source
@@ -149,7 +192,7 @@ EXTRA_HEADERS = {
 }
 COLUMN_KEYS = {**HEADER_KEYS, **EXTRA_HEADERS}
 
-REQUIRED = ("code", "source", "validity", "price", "changed", "profit", "stock",
+REQUIRED = ("code", "gb", "source", "validity", "price", "changed", "profit", "stock",
             "my_price", "fee", "final", "discount", "chosen")
 
 # The four customer-side cells a switch carries over, in the order they are
@@ -178,6 +221,7 @@ class Row:
     """
     row: int                       # 1-based sheet row
     sku: str = ""
+    gb: object = ""                # C — 10, '10' or '10gb'
     source: object = ""            # D — blank means esim.dog
     price: object = ""             # G — '$0.58' or '(€0.48) $0.56'
     validity: object = ""          # F — '7d'
@@ -280,12 +324,72 @@ def price_num(cell) -> Optional[float]:
         return None
 
 
+def gb_of(cell) -> Optional[float]:
+    """Column C as a size: 10, '10', '10gb' or '0.5GB'. None when it holds none."""
+    m = re.search(r"\d+(?:\.\d+)?", text(cell))
+    return float(m.group()) if m else None
+
+
+# The invisible marks Sheets sprinkles into RTL text (the same class _FINAL
+# tolerates): a margin word wearing one is still the margin word.
+_BIDI = re.compile(r"[​‎‏‪-‮⁦-⁩]")
+
+
+def stock_word(r: Row) -> str:
+    """Q as a word: trimmed, bidi marks dropped — what the comparisons see."""
+    return _BIDI.sub("", text(r.stock)).strip()
+
+
+def availability_word(r: Row) -> str:
+    """The word in Q that says this row cannot be BOUGHT — or '' when it can.
+
+    A margin word (PROFIT_MARKS) is not that: the row is on sale at the
+    supplier, it just does not pay at today's sell price, and that verdict is
+    recomputed by profit_mark() rather than trusted from the cell.
+    """
+    q = stock_word(r)
+    return "" if q in PROFIT_MARKS else q
+
+
 def eligible(r: Row) -> bool:
-    """Can this row be sold at all today?"""
+    """Can this row be BOUGHT today? (Whether it pays is the price rule's job.)"""
     return (source_key(r) in SOURCES
             and usd(r.price) is not None
-            and not text(r.stock).strip()
+            and not availability_word(r)
             and days_of(r.validity) is not None)
+
+
+def profit_mark(sku: str, r: Row, my_price: Optional[float]) -> str:
+    """What Q should say about this row's margin: a PROFIT_MARKS word, or ''.
+
+    The scraper's two rules in the scraper's order (esim_price_scraper.py
+    run(), the profitability check): the buy ceiling is judged first and on
+    cost and size alone — a 30GB bought over $10 is not for sale whatever the
+    sell price, priced by the owner or not — then the profit floor, which
+    needs the SKU's מחיר שלי. With no cost nothing is judged; with a cost but
+    no sell price only the ceiling is. Unjudged is '' — not called
+    unprofitable, the same as is_profitable() says.
+    """
+    cost, gb = usd(r.price), gb_of(r.gb)
+    if over_ceiling(cost, gb, sku):
+        return OVER_CEILING_LABEL
+    if my_price and cost and not is_profitable(my_price, cost, gb):
+        return UNPROFITABLE_LABEL
+    return ""
+
+
+def judge_stock(sku: str, r: Row, my_price: Optional[float]) -> Optional[tuple]:
+    """The write that brings Q's margin word up to date, or None for no write.
+
+    Only an empty cell or one of PROFIT_MARKS is ever written: a supplier's
+    availability word or the owner's own note is a reason more specific than
+    ours, and it stays — the same rule applyFee_ and stellar_prices.py keep.
+    """
+    now = stock_word(r)
+    if now and now not in PROFIT_MARKS:
+        return None
+    want = profit_mark(sku, r, my_price)
+    return None if want == now else (r.row, "stock", want)
 
 
 def profit_text(my_price: float, cost: float) -> str:
@@ -396,6 +500,7 @@ class Decision:
     mirror_note: str = ""           # why the mirror wrote nothing, when the
                                     # reason is a rule and not just "already
                                     # matches" — the owner has to be told
+    judged: int = 0                 # Q margin words written or cleared this run
 
     @property
     def old_cost(self) -> Optional[float]:
@@ -445,21 +550,31 @@ def decide(rows: list[Row]) -> list[Decision]:
 
         others = [r for r in group if r is not inc]
         rivals = [r for r in others if eligible(r)]
+        mine = price_num(inc.my_price)      # the SKU's מחיר שלי, off the ticked row
         winner, reason = inc, ""
         if not eligible(inc):
             if rivals:
                 winner = _cheapest(rivals)
                 reason = ("no price" if usd(inc.price) is None
-                          else f"incumbent {text(inc.stock).strip() or 'not sellable'}")
+                          else f"incumbent {availability_word(inc) or 'not sellable'}")
             else:
                 reason = "incumbent not sellable, no challenger either"
         else:
-            floor = usd(inc.price) * (1 - day_policy.DAY_TOL)
-            cheaper = [r for r in rivals if usd(r.price) < floor]
+            cost = usd(inc.price)
+            floor = cost * (1 - day_policy.DAY_TOL)
+            # A dark incumbent (its own margin verdict, not the cell) has no
+            # live listing for the tolerance to protect: a rival that is
+            # strictly cheaper and pays takes it. Never one that costs more.
+            dark = profit_mark(sku, inc, mine)
+            cheaper = [r for r in rivals
+                       if usd(r.price) < floor
+                       or (dark and usd(r.price) < cost and not profit_mark(sku, r, mine))]
             if cheaper:
                 winner = _cheapest(cheaper)
-                gap = (usd(inc.price) - usd(winner.price)) / usd(inc.price) * 100
+                gap = (cost - usd(winner.price)) / cost * 100
                 reason = f"{gap:.1f}% cheaper"
+                if usd(winner.price) >= floor:
+                    reason = f"incumbent {dark}, rival {reason} and pays"
 
         d = Decision(sku=sku, incumbent=inc, winner=winner, reason=reason)
         carried: dict = {}          # what a switch hands the winner this run
@@ -513,12 +628,21 @@ def decide(rows: list[Row]) -> list[Decision]:
         # NOT mirrored, and never copied off the chosen row: it is recomputed
         # from the SKU's own מחיר שלי against THIS row's cost, because the two
         # suppliers are not paid the same money for the same package.
-        mine = price_num(inc.my_price)
         if mine is not None:
             for r in group:
                 cost = usd(r.price)
                 if not text(r.profit).strip() and cost:
                     d.writes.append((r.row, "profit", profit_text(mine, cost)))
+
+        # Q's margin word, on every row of the SKU, off the same two inputs P
+        # is: the ticked row's verdict is what the site shows as sold out, and
+        # the other row's is what the next switch will inherit. Both stay
+        # fresh here because nothing else refreshes a Stellar row's.
+        for r in group:
+            w = judge_stock(sku, r, mine)
+            if w:
+                d.writes.append(w)
+                d.judged += 1
         out.append(d)
     return out
 
@@ -545,6 +669,7 @@ def cap_switches(decisions: list[Decision], limit: int) -> int:
         d.colours = []
         d.mirrored = 0           # and its mirror: the row it would copy FROM is
         d.mirror_note = ""       # the one this run is no longer going to choose
+        d.judged = 0
         left += 1
     return left
 
@@ -605,6 +730,7 @@ def read_rows(values: list[list]) -> tuple[list[Row], dict[str, int]]:
         cells = list(raw) + [""] * (width - len(raw))
         rows.append(Row(row=idx,
                         sku=text(cells[col["code"]]).strip(),
+                        gb=cells[col["gb"]],
                         source=cells[col["source"]],
                         price=cells[col["price"]],
                         validity=cells[col["validity"]],
@@ -710,6 +836,10 @@ def _describe(d: Decision) -> str:
         tail += f"   [⇉{d.mirrored} mirrored]"
     if d.mirror_note:
         tail += f"   [no mirror: {d.mirror_note}]"
+    if d.judged:
+        words = ", ".join(f"{row}:{value or 'cleared'}"
+                          for row, key, value in d.writes if key == "stock")
+        tail += f"   [Q {words}]"
     return head + tail
 
 
@@ -755,9 +885,10 @@ def main(argv=None) -> int:
     profits = sum(1 for d in decisions for _, key, _ in d.writes if key == "profit")
     mirrored = sum(d.mirrored for d in decisions)
     mirror_skus = sum(1 for d in decisions if d.mirrored)
+    judged = sum(d.judged for d in decisions)
     print(f"\n\U0001f4ca switched {len(switched)} / kept {len(kept)} / skipped {len(skipped)}"
-          f" | {cells} cells ({profits} of them \u05e8\u05d5\u05d5\u05d7) | "
-          f"{sum(len(d.colours) for d in decisions)} rows recoloured")
+          f" | {cells} cells ({profits} of them \u05e8\u05d5\u05d5\u05d7, {judged} of them "
+          f"Q) | {sum(len(d.colours) for d in decisions)} rows recoloured")
     # The mirror is counted on its own line: it is not a switch, it moves no
     # money between suppliers, and on a quiet day it is the only thing the run
     # does. Zero here means every row of every SKU already quotes the SKU price.

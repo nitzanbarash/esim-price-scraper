@@ -7,8 +7,12 @@ pinned here without a sheet, a network or a credential:
 
     * a rival that is 0.9% cheaper does NOT move a live SKU; 1.1% does
       (day_policy.DAY_TOL, the same 1% the validity rules use),
-    * an incumbent that cannot be sold — a word in במלאי/רווחי, or no price —
-      yields to any eligible challenger, however small the gap,
+    * an incumbent that cannot be BOUGHT — an availability word in
+      במלאי/רווחי, or no price — yields to any eligible challenger, however
+      small the gap; the two MARGIN words (לא רווחי, לא רווחי — מעל תקרה) are
+      derived, re-judged on every row every run, and never a reason to move
+      to a dearer row — a dark incumbent yields only to a cheaper rival that
+      pays,
     * an ambiguous SKU (two ticks, two esim.dog rows, neither) is SKIPPED and
       not one of its cells is written,
     * a one-supplier SKU is not a choice and is never touched,
@@ -34,9 +38,11 @@ import sys
 
 import day_policy
 from choose_supplier import (
-    CARRY, LAST_COL, LOSER_BG, TICK, WINNER_BG, Row, _entered_value,
-    cap_switches, decide, eligible, final_usd, mirror_of, money, profit_text,
-    same_cell, source_of, switch_note, usd, usd_outside_parens,
+    CARRY, LAST_COL, LOSER_BG, OVER_CEILING_LABEL, PROFIT_MARKS, TICK,
+    UNPROFITABLE_LABEL, WINNER_BG, Row, _entered_value, availability_word,
+    cap_switches, decide, eligible, final_usd, gb_of, judge_stock, mirror_of,
+    money, profit_mark, profit_text, same_cell, source_of, switch_note, usd,
+    usd_outside_parens,
 )
 
 _fails: list[str] = []
@@ -107,8 +113,22 @@ check("nested brackets unwind", usd("(€4.55 (net)) $5.30"), 5.30)
 
 print("\n-- eligibility --")
 check("a stocked, priced, dated row is eligible", eligible(dog(2, "1.1.1", "$1.00")), True)
-check("a word in Q makes it ineligible",
-      eligible(dog(2, "1.1.1", "$1.00", stock="לא רווחי")), False)
+check("an availability word in Q makes it ineligible",
+      eligible(dog(2, "1.1.1", "$1.00", stock="לא זמין")), False)
+check("the scraper's out-of-stock word too",
+      eligible(dog(2, "1.1.1", "$1.00", stock="לא במלאי")), False)
+check("and the owner's own note",
+      eligible(dog(2, "1.1.1", "$1.00", stock="לא למכור עד יום שני")), False)
+# The two margin words are about price, not supply: the row CAN be bought, it
+# just may not pay. The chooser recomputes them (below) rather than obey them.
+check("the margin word does NOT make it ineligible",
+      eligible(dog(2, "1.1.1", "$1.00", stock=UNPROFITABLE_LABEL)), True)
+check("nor does the ceiling word",
+      eligible(dog(2, "1.1.1", "$1.00", stock=OVER_CEILING_LABEL)), True)
+check("availability_word ignores the margin words",
+      availability_word(dog(2, "1.1.1", "$1.00", stock=UNPROFITABLE_LABEL)), "")
+check("...but returns anything else verbatim",
+      availability_word(dog(2, "1.1.1", "$1.00", stock=" לא זמין ")), "לא זמין")
 check("no price makes it ineligible", eligible(dog(2, "1.1.1", "—")), False)
 check("no days makes it ineligible", eligible(dog(2, "1.1.1", "$1.00", validity="")), False)
 check("an unknown supplier is never eligible",
@@ -132,17 +152,76 @@ check("green on the winner, grey on the loser",
 d = only(decide([dog(2, "1.66.10", "$10.00"), stellar(3, "1.66.10", "$10.00")]))
 check("an equal price stays put", d.action, "keep")
 
-print("\n-- an incumbent that cannot be sold yields for any gap --")
-d = only(decide([dog(2, "1.66.10", "$10.00", stock="לא רווחי"),
+print("\n-- an incumbent that cannot be BOUGHT yields for any gap --")
+d = only(decide([dog(2, "1.66.10", "$10.00", stock="לא זמין"),
                  stellar(3, "1.66.10", "$9.99")]))
 check("out of stock yields to a challenger 0.1% cheaper", d.action, "switch")
 check("...to the Stellar row", d.winner.row, 3)
+check("...and the note names the word", d.reason, "incumbent לא זמין")
 d = only(decide([dog(2, "1.66.10", "—"), stellar(3, "1.66.10", "$99.00")]))
 check("no price yields even to a DEARER challenger", d.action, "switch")
-d = only(decide([dog(2, "1.66.10", "$10.00", stock="לא רווחי"),
+d = only(decide([dog(2, "1.66.10", "$10.00", stock="לא במלאי"),
                  stellar(3, "1.66.10", "$9.99", stock="לא זמין")]))
-check("both unsellable: nothing moves", d.action, "keep")
+check("both unbuyable: nothing moves", d.action, "keep")
 check("...and nothing is ticked", writes_of(d, "chosen"), [])
+
+print("\n-- a MARGIN word on the incumbent is not a reason to flee --")
+# 2026-09-21: a stale לא רווחי on every Stellar row sent 74 SKUs to the dearer
+# esim.dog twin. A supplier that costs MORE cannot make a package profitable,
+# so between two rows that can both be bought only the price rule speaks.
+d = only(decide([stellar(2, "2.34.1", "$0.29", chosen=TICK, stock=UNPROFITABLE_LABEL,
+                         my_price="0.60", final="0.99"),
+                 dog(3, "2.34.1", "$0.58", chosen="")]))
+check("a dearer rival does not take a לא רווחי incumbent", d.action, "keep")
+check("...the tick stays where it was", writes_of(d, "chosen"), [])
+d = only(decide([stellar(2, "2.34.1", "$0.29", chosen=TICK, stock=OVER_CEILING_LABEL,
+                         my_price="0.60", final="0.99"),
+                 dog(3, "2.34.1", "$0.58", chosen="")]))
+check("nor a לא רווחי — מעל תקרה incumbent", d.action, "keep")
+d = only(decide([dog(2, "1.66.10", "$10.00", stock=UNPROFITABLE_LABEL),
+                 stellar(3, "1.66.10", "$9.99")]))
+check("0.1% cheaper is not a switch when the rival does not pay either", d.action, "keep")
+d = only(decide([dog(2, "1.66.10", "$10.00", stock=UNPROFITABLE_LABEL),
+                 stellar(3, "1.66.10", "$8.00")]))
+check("...but a real gap still is", d.action, "switch")
+check("...and the reason is the gap, not the word", d.reason, "20.0% cheaper")
+d = only(decide([dog(2, "1.66.10", "$10.00"),
+                 stellar(3, "1.66.10", "$8.00", stock=UNPROFITABLE_LABEL)]))
+check("a margin word on the RIVAL does not stop it winning either", d.action, "switch")
+check("...onto the Stellar row", d.winner.row, 3)
+# A bidi mark on the word (Sheets adds them to RTL text) is still the word.
+d = only(decide([stellar(2, "2.34.1", "$0.29", gb=1, chosen=TICK, stock="‏לא רווחי",
+                         my_price="0.60", final="0.99"),
+                 dog(3, "2.34.1", "$0.58", gb=1, chosen="")]))
+check("a margin word wearing a bidi mark does not become an availability word", d.action, "keep")
+check("...and is re-judged like any other", writes_of(d, "stock"), [(2, "")])
+
+print("\n-- a DARK incumbent yields to a cheaper rival that pays, tolerance or not --")
+# The 1% tolerance protects a LIVE listing from moving for pennies. An
+# incumbent this run judges unprofitable is sold out on the site, so there is
+# nothing to protect: a rival strictly cheaper that pays takes it. A dearer or
+# equal rival never does — that is the flee the fix exists to stop.
+d = only(decide([dog(2, "1.66.10", "$10.00", gb=10, my_price="11.95", final="12.99"),
+                 stellar(3, "1.66.10", "$9.95", gb=10)]))
+check("19.5% vs 20.1%: the clean rival 0.5% cheaper wins", d.action, "switch")
+check("...and the reason names both facts", d.reason,
+      "incumbent לא רווחי, rival 0.5% cheaper and pays")
+d = only(decide([dog(2, "1.84.30", "$10.05", gb=30, my_price="15.00", final="15.99"),
+                 stellar(3, "1.84.30", "$9.98", gb=30)]))
+check("over the ceiling vs under it, 0.7% apart: switch", d.action, "switch")
+check("...for the ceiling word", d.reason.startswith("incumbent לא רווחי — מעל תקרה"), True)
+d = only(decide([dog(2, "1.66.10", "$10.00", gb=10, my_price="11.00", final="12.99"),
+                 stellar(3, "1.66.10", "$9.95", gb=10)]))
+check("both unprofitable at 0.5% apart: nothing to gain, keep", d.action, "keep")
+d = only(decide([dog(2, "1.66.10", "$10.00", gb=10, my_price="11.95", final="12.99"),
+                 stellar(3, "1.66.10", "$10.00", gb=10)]))
+check("an equal price never takes a dark incumbent", d.action, "keep")
+d = only(decide([dog(2, "1.66.10", "$10.00", gb=10, my_price="11.95", final="12.99"),
+                 stellar(3, "1.66.10", "$10.05", gb=10)]))
+check("nor a dearer one, however clean", d.action, "keep")
+d = only(decide([dog(2, "1.66.10", "$10.00", gb=10, my_price="11.95", final="12.99"),
+                 stellar(3, "1.66.10", "$9.95", gb=10, stock="לא זמין")]))
+check("an unbuyable rival still cannot win", d.action, "keep")
 
 print("\n-- the cheapest challenger, and ties go to the longer plan --")
 d = only(decide([dog(2, "1.0B.10", "$10.00"),
@@ -266,6 +345,87 @@ d = only(decide([dog(2, "1.66.10", "$10.00", my_price="15.96", final="16.99"),
                  stellar(3, "1.66.10", "$8.00")]))
 check("on a switch the winner's P comes off the SKU's S too",
       writes_of(d, "profit"), [(3, "🟢 +$7.96 (+99.5%)")])
+
+print("\n-- Q's margin word, re-judged on every row of a SKU every run --")
+check("the two words are the scraper's own", PROFIT_MARKS,
+      frozenset({"לא רווחי", "לא רווחי — מעל תקרה"}))
+check("gb: a number", gb_of(10), 10.0)
+check("gb: text with a unit", gb_of("10gb"), 10.0)
+check("gb: a fraction", gb_of("0.5GB"), 0.5)
+check("gb: nothing", gb_of(""), None)
+
+# The verdict, in the scraper's order: ceiling first, on cost and size alone.
+check("a 30GB bought at $11.38 is over the ceiling whatever it sells for",
+      profit_mark("1.66.30", stellar(2, "1.66.30", "(€9.90) $11.38", gb=30), 20.0),
+      OVER_CEILING_LABEL)
+check("a regional 30GB is exempt from the ceiling",
+      profit_mark("2.0.30", stellar(2, "2.0.30", "$11.38", gb=30), 20.0), "")
+check("under the ceiling and over 20%: clean",
+      profit_mark("1.66.30", stellar(2, "1.66.30", "$8.74", gb=30), 13.56), "")
+check("under 20%: unprofitable",
+      profit_mark("1.63.5", stellar(2, "1.63.5", "$4.19", gb=5), 4.92), UNPROFITABLE_LABEL)
+check("a 1GB may lose up to 20%",
+      profit_mark("2.34.1", stellar(2, "2.34.1", "$0.70", gb=1), 0.60), "")
+check("...but not 34%",
+      profit_mark("2.30.1", stellar(2, "2.30.1", "$0.91", gb=1), 0.60), UNPROFITABLE_LABEL)
+check("no sell price: not judged, not called unprofitable",
+      profit_mark("1.63.5", stellar(2, "1.63.5", "$4.19", gb=5), None), "")
+check("...but the ceiling needs no sell price",
+      profit_mark("1.66.30", stellar(2, "1.66.30", "$11.38", gb=30), None), OVER_CEILING_LABEL)
+check("no cost: not judged either",
+      profit_mark("1.63.5", stellar(2, "1.63.5", "—", gb=5), 4.92), "")
+
+# The write: only over an empty cell or one of the two words, only on change.
+check("an empty Q gets the word",
+      judge_stock("1.63.5", stellar(2, "1.63.5", "$4.19", gb=5), 4.92),
+      (2, "stock", UNPROFITABLE_LABEL))
+check("a word already there is not rewritten",
+      judge_stock("1.63.5", stellar(2, "1.63.5", "$4.19", gb=5, stock=UNPROFITABLE_LABEL), 4.92),
+      None)
+check("a stale word is cleared when the row pays again",
+      judge_stock("2.34.1", stellar(2, "2.34.1", "$0.29", gb=1, stock=UNPROFITABLE_LABEL), 0.60),
+      (2, "stock", ""))
+check("one margin word is replaced by the other",
+      judge_stock("1.66.30", stellar(2, "1.66.30", "$11.38", gb=30, stock=UNPROFITABLE_LABEL), 20.0),
+      (2, "stock", OVER_CEILING_LABEL))
+check("a supplier's availability word is never touched",
+      judge_stock("1.63.5", stellar(2, "1.63.5", "$4.19", gb=5, stock="לא זמין"), 4.92), None)
+check("nor the owner's own note, even on a row that pays",
+      judge_stock("2.34.1", stellar(2, "2.34.1", "$0.29", gb=1, stock="לא למכור"), 0.60), None)
+check("an unjudged row loses a stale margin word",
+      judge_stock("1.63.5", stellar(2, "1.63.5", "—", gb=5, stock=UNPROFITABLE_LABEL), 4.92),
+      (2, "stock", ""))
+check("...but keeps an availability word",
+      judge_stock("1.63.5", stellar(2, "1.63.5", "—", gb=5, stock="לא זמין"), 4.92), None)
+
+# In decide(): both rows are judged off the SKU's מחיר שלי, each at its own cost.
+d = only(decide([dog(2, "1.63.5", "$3.71", gb=5, my_price="4.92", final="5.49"),
+                 stellar(3, "1.63.5", "$4.19", gb=5)]))
+check("the cheaper dog row at 32.6% is clean, the Stellar row at 17.4% is marked",
+      writes_of(d, "stock"), [(3, UNPROFITABLE_LABEL)])
+check("...and counted", d.judged, 1)
+check("...and shown in the log line", "[Q 3:לא רווחי]" in __import__("choose_supplier")._describe(d), True)
+# The 2026-09-21 shape: the ticked Stellar row wears a stale word, the dog twin
+# was just cleaned by the scraper. Nothing switches, and the word comes off.
+d = only(decide([stellar(2, "2.34.1", "$0.29", gb=1, chosen=TICK, stock=UNPROFITABLE_LABEL,
+                         my_price="0.60", final="0.99"),
+                 dog(3, "2.34.1", "$0.58", gb=1, chosen="", my_price="0.60", final="0.99")]))
+check("the stale word on the ticked Stellar row is cleared", writes_of(d, "stock"), [(2, "")])
+check("...and the SKU stays on Stellar", d.action, "keep")
+d = only(decide([dog(2, "1.66.10", "$10.00", chosen=""),
+                 stellar(3, "1.66.10", "$8.00", stock=UNPROFITABLE_LABEL)]))
+check("a skipped SKU is not judged either", d.writes, [])
+d = only(decide([dog(2, "1.66.10", "$3.08", my_price="", profit=""),
+                 stellar(3, "1.66.10", "$2.48", stock=UNPROFITABLE_LABEL)]))
+check("a SKU with no מחיר שלי clears a margin word rather than keep a verdict nobody made",
+      writes_of(d, "stock"), [(3, "")])
+ds = decide([dog(2, "1.1.10", "$10.00", final="16.99", my_price="15.96"),
+             stellar(3, "1.1.10", "$8.00"),
+             dog(4, "1.2.10", "$10.00", final="16.99", my_price="5.00"),
+             stellar(5, "1.2.10", "$8.00")])
+cap_switches(ds, 1)
+check("a deferred SKU drops its Q writes with the rest",
+      (ds[1].action, ds[1].judged, writes_of(ds[1], "stock")), ("deferred", 0, []))
 
 print("\n-- a carried cell keeps the TYPE the sheet gave it --")
 # The read is UNFORMATTED, so the Python type IS the sheet's type. Nothing is
