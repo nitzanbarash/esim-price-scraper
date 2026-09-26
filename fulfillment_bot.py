@@ -1156,7 +1156,7 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
         s.starttls()
         s.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
         s.send_message(msg)
-    log.info(f"order {order_id}: customer email sent to {to}")
+    log.info(f"order {order_id}: customer email sent")  # the log is public; never the address
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
