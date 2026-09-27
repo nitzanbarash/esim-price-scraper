@@ -73,6 +73,7 @@ HEADER_KEYS = {
     'network':     "Networks",
     'breakout_ip': "Breakout IP",
     'variant':     "וריאנט (אזורי)",
+    'coverage':    "מדינות בחבילה",   # ISO codes of the plan's countries (scraper writes)
     'route':       "Route",
     'profit':      "רווח (כדאיות)",
     'stock':       "במלאי/רווחי",
@@ -415,6 +416,40 @@ def with_validity(url: str, days: int) -> str:
     query = parse_qs(parsed.query)
     query['validity'] = [str(days)]
     return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
+def plan_id_from_url(url: str) -> str:
+    """esim.dog's own id for a selected regional plan — the `plan=rp_…` the
+    page appends to its address when a card is chosen. '' when none."""
+    try:
+        return parse_qs(urlparse(url).query).get('plan', [''])[0].strip()
+    except Exception:
+        return ''
+
+
+def with_plan(url: str, plan_id: str) -> str:
+    """The same link, pinned to one plan. A /regions page opened with its
+    plan id paints that card selected — country list, checkout and all —
+    instead of the truncated card list, so nobody has to find the card again
+    among sixteen. An id the page no longer knows is dropped by the page
+    itself and the list paints as usual: a stale pin costs nothing."""
+    if not plan_id:
+        return url
+    parsed = urlparse(url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query['plan'] = [plan_id]
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
+
+
+def parse_coverage_codes(text: str) -> List[str]:
+    """ISO codes out of a selected plan's panel, in its order. The panel
+    writes every country as "flag / name / CODE / • / tech" — all eighteen,
+    where the card itself showed twelve flags and "+6 more"."""
+    out: List[str] = []
+    for c in re.findall(r"\n([A-Z]{2})\n\u2022", "\n" + (text or "")):
+        if c not in out:
+            out.append(c)
+    return out
 
 
 def force_fixed_gb_tab(url: str) -> str:
@@ -919,40 +954,89 @@ class ESIMScraper:
                 return
         await loc.first.click()
 
-    async def scrape_region(self, page: Page, info: Dict, variant: str) -> Dict:
-        await self.expand_region_plans(page)
-        text = await page.inner_text("body")
-        plans = parse_region_plans(text)
-        if not plans:
-            return {'price': None, 'countries': '', 'gb': '', 'validity': '',
-                    'code': '', 'network': '', 'breakout_ip': '', 'route': '',
-                    'out_of_stock': False,
-                    'note': 'No plans found on region page'}
+    async def preselected_region_plan(self, page: Page) -> Optional[Dict]:
+        """The plan a pinned link opened with, in parse_region_plans' shape,
+        or None when the page is showing the list (it says "← Choose another"
+        only over a selected card)."""
+        body = await page.inner_text("body")
+        if "Choose another" not in body:
+            return None
+        try:
+            text = await page.inner_text("#regional-plan")
+        except Exception:
+            text = body
+        m = re.search(r'\$([\d.]+)\s+([\d.]+GB)\s*/\s*([\dA-Za-z ]+?)\s+(\d+)\s+countries', text, re.S)
+        if not m:
+            return None
+        return {'price': float(m.group(1)), 'gb': m.group(2),
+                'validity': m.group(3).strip(), 'countries': int(m.group(4))}
 
-        chosen = None
+    async def choose_another(self, page: Page) -> None:
+        try:
+            await page.get_by_text(re.compile(r"Choose another", re.I)).first.click()
+            await page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+    async def selected_plan_coverage(self, page: Page) -> List[str]:
+        try:
+            text = await page.inner_text("#regional-plan")
+        except Exception:
+            return []
+        return parse_coverage_codes(text)
+
+    async def scrape_region(self, page: Page, info: Dict, variant: str) -> Dict:
         m = re.search(r'\d+', variant or '')
-        if m:
-            want = int(m.group())
-            matches = [p for p in plans if p['countries'] == want]
-            if matches:
-                chosen = min(matches, key=lambda p: p['price'])
-        if chosen is None:
-            options = ", ".join(f"{p['countries']} מדינות ${p['price']:.2f}" for p in plans)
-            return {'price': None, 'countries': '', 'gb': '', 'validity': '',
-                    'code': '', 'network': '', 'breakout_ip': '', 'route': '',
-                    'out_of_stock': False,
-                    'note': f"בחר וריאנט (מספר מדינות) בעמודת 'וריאנט (אזורי)' — "
-                            f"{len(plans)} חבילות: {options}"}
+        want = int(m.group()) if m else None
+        empty = {'price': None, 'countries': '', 'gb': '', 'validity': '',
+                 'code': '', 'network': '', 'breakout_ip': '', 'route': '',
+                 'out_of_stock': False, 'note': ''}
+
+        # A pinned link (…&plan=rp_…) opens with its card selected and no
+        # list. The count the sheet asks for → that is the plan, read as it
+        # stands. Any other count → esim.dog changed what the id points at;
+        # back to the list, exactly as if the id were not there (a dead id
+        # the page drops by itself, and the list paints as usual).
+        chosen = None
+        pre = await self.preselected_region_plan(page)
+        if pre is not None and (want is None or pre['countries'] == want):
+            chosen, opened = pre, True
+        else:
+            if pre is not None:
+                print(f"  ↩️  Pinned plan shows {pre['countries']} countries, the sheet wants {want} — choosing again")
+                await self.choose_another(page)
+            await self.expand_region_plans(page)
+            text = await page.inner_text("body")
+            plans = parse_region_plans(text)
+            if not plans:
+                return dict(empty, note='No plans found on region page')
+            if want is not None:
+                matches = [p for p in plans if p['countries'] == want]
+                if matches:
+                    chosen = min(matches, key=lambda p: p['price'])
+            if chosen is None:
+                options = ", ".join(f"{p['countries']} מדינות ${p['price']:.2f}" for p in plans)
+                return dict(empty, note=f"בחר וריאנט (מספר מדינות) בעמודת 'וריאנט (אזורי)' — "
+                                        f"{len(plans)} חבילות: {options}")
+            opened = False
 
         price = f"${chosen['price']:.2f}"
         try:
-            await self.open_region_plan(page, chosen)
-            await page.wait_for_timeout(2500)
+            if not opened:
+                await self.open_region_plan(page, chosen)
+                await page.wait_for_timeout(2500)
             real_price = await self.extract_price(page)
             if real_price:
                 price = real_price
         except Exception as e:
             print(f"  ⚠️  Could not open plan, using listed price: {e}")
+
+        # The selected card in esim.dog's own terms: its id (the sheet's link
+        # is pinned to it by the writer) and every country it covers.
+        plan_id = plan_id_from_url(page.url)
+        coverage = await self.selected_plan_coverage(page)
+        if coverage and len(coverage) != chosen['countries']:
+            print(f"  ⚠️  Card says {chosen['countries']} countries, the panel lists {len(coverage)}: {','.join(coverage)}")
 
         net_info = await self.extract_network_info(page)
         if net_info['blocked']:
@@ -973,6 +1057,8 @@ class ESIMScraper:
             'network': net_info['network'],
             'breakout_ip': net_info['breakout_ip'],
             'route': '',
+            'plan_id': plan_id,
+            'coverage': ",".join(coverage),
             'out_of_stock': False,
             'note': "",
         }
@@ -1479,6 +1565,8 @@ class ESIMScraper:
                 put(r, 'code', res['code'])
             if res['countries']:
                 put(r, 'countries', res['countries'])
+            if res.get('coverage'):
+                put(r, 'coverage', res['coverage'])
             if res['gb']:
                 put(r, 'gb', res['gb'])
             put(r, 'source', 'esim.dog')
@@ -1519,6 +1607,17 @@ class ESIMScraper:
             # they disagree with the GB/days columns. Writing the days without
             # the link would leave the two describing different packages and
             # stop every order on this row.
+            # Pin the link to the plan esim.dog itself selected (…&plan=rp_…).
+            # The page then opens on that card, list or no list, so neither
+            # this scraper nor the purchase bot has to find it again among
+            # sixteen — and two cards with the same count stop being a
+            # coin-toss. Only while the link is staying: a day switch below
+            # rewrites it, and the next run pins the new one.
+            if res.get('plan_id') and not alt:
+                pinned = with_plan(it['link'], res['plan_id'])
+                if pinned != it['link']:
+                    put(r, 'link', pinned)
+                    print(f"  📌 Row {r}: link pinned to plan {res['plan_id']}")
             if alt:
                 put(r, 'link', alt['link'])
                 put(r, 'changed',
