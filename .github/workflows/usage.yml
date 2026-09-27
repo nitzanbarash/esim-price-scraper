@@ -44,3 +44,14 @@ jobs:
           # exactly as it was — nothing is retired on a missing key.
           STELLAR_API_KEY: ${{ secrets.STELLAR_API_KEY }}
         run: python usage_bot.py
+
+      # The receipts sheet's colour rules (supplier word colour in
+      # 'מקור - source', paid/discount/free fill in 'מכירה - Sell'). Writes
+      # nothing when they are already in place; a supplier added to the
+      # dropdown gets its colour here. Never allowed to fail the usage run.
+      - name: Receipts colours
+        if: always()
+        continue-on-error: true
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python receipts_colors.py

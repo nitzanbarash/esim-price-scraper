@@ -99,3 +99,8 @@ jobs:
       # discount nobody approved being handed to everyone who asks.
       - name: Coupon sync
         run: python test_coupon_sync.py
+
+      # Which colour rules the receipts sheet gets, and that a second run
+      # rewrites nothing — a rule duplicated every 4 hours would pile up.
+      - name: Receipts colours
+        run: python test_receipts_colors.py
