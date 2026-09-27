@@ -162,7 +162,7 @@ class FakeDog:
         self.substitute_gb = substitute_gb  # what it hands back when GB is gone
         self.asked = []
 
-    async def scrape(self, url, variant=""):
+    async def scrape(self, url, variant="", coverage=""):
         q = parse_qs(urlparse(url).query)
         gb, days = float(q["data"][0]), int(q["validity"][0])
         self.asked.append(days)
@@ -319,7 +319,7 @@ check("and opens nothing", dog2.asked, [])
 
 print("\n-- a price that does not repeat drops to the policy's runner-up --")
 class Flickers(FakeDog):
-    async def scrape(self, url, variant=""):
+    async def scrape(self, url, variant="", coverage=""):
         r = await FakeDog.scrape(self, url, variant)
         # The confirming read of 21d disagrees with the read that won.
         if self.asked.count(21) == 2 and r["price"] == "$3.17":

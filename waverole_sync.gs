@@ -86,6 +86,7 @@ const HEADERS = {
   buy:         ['\u05de\u05d7\u05d9\u05e8 \u05e7\u05e0\u05d9\u05d9\u05d4'],               // what the SUPPLIER charges us (scraper writes it)
   profit:      ['\u05e8\u05d5\u05d5\u05d7 (\u05db\u05d3\u05d0\u05d9\u05d5\u05ea)'],           // derived: net minus buy, in $ and %
   route:       ['Route'],                    // esim.dog's colour / Stellar's package code, per row
+  coverage:    ['\u05de\u05d3\u05d9\u05e0\u05d5\u05ea \u05d1\u05d7\u05d1\u05d9\u05dc\u05d4'],        // ISO codes the regional plan covers (scraper writes it)
 };
 // Fields the sync cannot work without - missing => loud email, not silence.
 // 'chosen' joined the list on 2026-09-17: the tick now decides whether a
@@ -583,6 +584,11 @@ function rowToPackage_(row, map) {
   const fee = num_(row[map.fee]); if (fee !== null) pkg.fee = fee;
   const route = map.route === undefined ? '' : String(row[map.route] || '').trim();
   if (route) pkg.route = route;
+  // The countries this exact plan covers ("AU,HK,ID,..."), as the scraper read
+  // them off the supplier. Sent whole on every row while the column exists, so
+  // a cleared cell clears the site's copy and the page falls back to its own
+  // list; a sheet without the column sends nothing and changes nothing.
+  if (map.coverage !== undefined) pkg.coverage = String(row[map.coverage] || '').trim();
   return pkg;
 }
 

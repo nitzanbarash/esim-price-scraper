@@ -441,6 +441,11 @@ def with_plan(url: str, plan_id: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
 
+def parse_coverage_arg(cell: str) -> List[str]:
+    """The sheet's 'מדינות בחבילה' cell ("AU,HK,…") as ISO codes."""
+    return [c for c in re.split(r"[\s,]+", (cell or "").upper()) if re.fullmatch(r"[A-Z]{2}", c)]
+
+
 def parse_coverage_codes(text: str) -> List[str]:
     """ISO codes out of a selected plan's panel, in its order. The panel
     writes every country as "flag / name / CODE / • / tech" — all eighteen,
@@ -985,7 +990,7 @@ class ESIMScraper:
             return []
         return parse_coverage_codes(text)
 
-    async def scrape_region(self, page: Page, info: Dict, variant: str) -> Dict:
+    async def scrape_region(self, page: Page, info: Dict, variant: str, coverage: str = "") -> Dict:
         m = re.search(r'\d+', variant or '')
         want = int(m.group()) if m else None
         empty = {'price': None, 'countries': '', 'gb': '', 'validity': '',
@@ -997,7 +1002,7 @@ class ESIMScraper:
         # stands. Any other count → esim.dog changed what the id points at;
         # back to the list, exactly as if the id were not there (a dead id
         # the page drops by itself, and the list paints as usual).
-        chosen = None
+        chosen, opened = None, False
         pre = await self.preselected_region_plan(page)
         if pre is not None and (want is None or pre['countries'] == want):
             chosen, opened = pre, True
@@ -1011,14 +1016,35 @@ class ESIMScraper:
             if not plans:
                 return dict(empty, note='No plans found on region page')
             if want is not None:
-                matches = [p for p in plans if p['countries'] == want]
+                matches = sorted((p for p in plans if p['countries'] == want),
+                                 key=lambda p: p['price'])
                 if matches:
-                    chosen = min(matches, key=lambda p: p['price'])
+                    chosen = matches[0]
+                # Several cards with the count, and the sheet knows which
+                # countries it sells: open them cheapest first and keep the
+                # one with THOSE countries. Cheapest-by-count alone would
+                # quietly move the row to another plan (Asia 10GB has two
+                # 12-country cards) and the site would follow it.
+                want_isos = set(parse_coverage_arg(coverage))
+                if want_isos and len(matches) > 1:
+                    for cand in matches:
+                        try:
+                            await self.open_region_plan(page, cand)
+                            await page.wait_for_timeout(2500)
+                        except Exception:
+                            continue
+                        if set(await self.selected_plan_coverage(page)) == want_isos:
+                            chosen, opened = cand, True
+                            break
+                        await self.choose_another(page)
+                        await self.expand_region_plans(page)
+                    else:
+                        print(f"  ⚠️  No {want}-country card covers the sheet's countries — "
+                              f"cheapest by count; 'מדינות בחבילה' will be rewritten")
             if chosen is None:
                 options = ", ".join(f"{p['countries']} מדינות ${p['price']:.2f}" for p in plans)
                 return dict(empty, note=f"בחר וריאנט (מספר מדינות) בעמודת 'וריאנט (אזורי)' — "
                                         f"{len(plans)} חבילות: {options}")
-            opened = False
 
         price = f"${chosen['price']:.2f}"
         try:
@@ -1063,7 +1089,7 @@ class ESIMScraper:
             'note': "",
         }
 
-    async def scrape(self, url: str, variant: str = "") -> Dict:
+    async def scrape(self, url: str, variant: str = "", coverage: str = "") -> Dict:
         print(f"\n🔗 {url}")
         clean_url = force_vpn_false(force_fixed_gb_tab(url))
         if clean_url != url:
@@ -1087,7 +1113,7 @@ class ESIMScraper:
                     await page.goto(clean_url, wait_until='domcontentloaded', timeout=30000)
                     if info['type'] == 'region':
                         await page.wait_for_timeout(5000)
-                        return await self.scrape_region(page, info, variant)
+                        return await self.scrape_region(page, info, variant, coverage)
                     else:
                         try:
                             await page.wait_for_selector("text=Payment Summary", timeout=15000)
@@ -1109,7 +1135,7 @@ class ESIMScraper:
                 finally:
                     await browser.close()
 
-    async def scrape_confirmed(self, link: str, variant: str, expected: str) -> Dict:
+    async def scrape_confirmed(self, link: str, variant: str, expected: str, coverage: str = "") -> Dict:
         """
         Reliable read with confirmation against transient misreads.
         - If the first read matches the stored price → trust it (1 read, fast).
@@ -1123,7 +1149,7 @@ class ESIMScraper:
             except:
                 return None
 
-        r1 = await self.scrape(link, variant)
+        r1 = await self.scrape(link, variant, coverage)
         v1 = r1['price']
         # Stable day-to-day case: matches stored price → done, no extra reads
         if expected and v1 and abs((val(v1) or -1) - (val(expected) or -2)) < 0.001:
@@ -1131,13 +1157,13 @@ class ESIMScraper:
 
         # Needs confirmation (first check or apparent change)
         print(f"  🔁 Confirming read ({v1})...")
-        r2 = await self.scrape(link, variant)
+        r2 = await self.scrape(link, variant, coverage)
         v2 = r2['price']
         if v1 and v2 and abs(val(v1) - val(v2)) < 0.001:
             return r1  # two reads agree
 
         # Third read to break the tie
-        r3 = await self.scrape(link, variant)
+        r3 = await self.scrape(link, variant, coverage)
         v3 = r3['price']
         candidates = [(r1, v1), (r2, v2), (r3, v3)]
         valid = [(r, v) for r, v in candidates if v]
@@ -1269,7 +1295,7 @@ class ESIMScraper:
             async with sem:
                 if _time.time() > deadline:
                     return d, None
-                return d, await self.scrape(with_validity(it['link'], d), it['variant'])
+                return d, await self.scrape(with_validity(it['link'], d), it['variant'], it.get('coverage', ''))
 
         found: List[Dict] = []
         for d, cand in await asyncio.gather(*(price_day(d) for d in probe)):
@@ -1312,7 +1338,7 @@ class ESIMScraper:
             # candidate and the policy runs again over what is left — the whole
             # ladder has already been paid for by this point, and the runner-up
             # is whatever pick() says it is, not whatever is next cheapest.
-            again = await self.scrape(winner['link'], it['variant'])
+            again = await self.scrape(winner['link'], it['variant'], it.get('coverage', ''))
             if not (again.get('price')
                     and abs((val(again['price']) or -1) - winner['price']) < 0.001):
                 print(f"    ✋ {winner['days']}d at {winner['res']['price']} did not "
@@ -1337,7 +1363,10 @@ class ESIMScraper:
         are inserted, moved, or reordered.
         """
         result = self.sheet_service.spreadsheets().values().get(
-            spreadsheetId=SHEET_ID, range='A1:Z').execute()
+            # AZ, not Z: 'מדינות בחבילה' sits at AG, past the side blocks at
+            # Z..AF. Read at Z it was never found, so put() dropped every
+            # coverage write and the list stayed whatever was typed by hand.
+            spreadsheetId=SHEET_ID, range='A1:AZ').execute()
         rows = result.get('values', [])
         if not rows:
             return [], {}
@@ -1380,6 +1409,9 @@ class ESIMScraper:
                     'old_gb': _get('gb'),
                     'old_validity': _get('validity'),
                     'old_code': _get('code'),
+                    # A regional plan's countries as the sheet knows them: the
+                    # tie-break between same-count cards when the pin is lost.
+                    'coverage': _get('coverage'),
                     # Only read to order the work below; never written back.
                     'old_updated': _get('updated'),
                 })
@@ -1472,7 +1504,7 @@ class ESIMScraper:
             if req_gb is not None and req_gb < MIN_SELLABLE_GB:
                 return None                   # judged below, without a read
             t_pkg = _time.time()
-            res = await self.scrape_confirmed(it['link'], it['variant'], it['old_price'])
+            res = await self.scrape_confirmed(it['link'], it['variant'], it['old_price'], it.get('coverage', ''))
             alt = await self.find_alternative(it, res, deadline)
             # A package that takes minutes is the whole story of a run that ran
             # out of time, and the per-row cost is invisible in a total.
