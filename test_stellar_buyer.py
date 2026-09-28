@@ -419,7 +419,7 @@ print("\n   the per-order cap")
 sb.MAX_EUR = 2.0
 site, _, _, _ = scenario([order()], (f5d := StellarFake()))
 check("over the cap -> refused", len(f5d.creates) == 0 and "cap" in site.reports("failed")[0]["reason"])
-sb.MAX_EUR = 25.0
+sb.MAX_EUR = 30.0
 
 print("\n   no sheet row for the SKU")
 site, _, _, _ = scenario([order(sku="9.99.99")], (f5e := StellarFake()))

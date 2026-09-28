@@ -73,7 +73,7 @@ SUPPLIER = "stellar"                 # the sheet's 'מקור' value, compared lo
 WORKER = "gha:stellar"               # what the shared claim records
 ROUTE_PREFIX = "Stellar "            # receipts Route: 'Stellar JC059'
 
-MAX_EUR = float(os.getenv("STELLAR_MAX_EUR", "25"))       # one order
+MAX_EUR = float(os.getenv("STELLAR_MAX_EUR", "30"))       # one order
 MAX_ORDERS_PER_RUN = int(os.getenv("STELLAR_MAX_PER_RUN", "5"))
 PRICE_TOL = 0.005        # a rounding cent over the sheet is not a price rise
 # How far the listing we are about to buy may sit ABOVE the euros the sheet
