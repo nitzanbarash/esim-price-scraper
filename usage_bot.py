@@ -49,6 +49,7 @@ Required environment (GitHub Secrets):
 """
 
 import logging
+import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
@@ -307,6 +308,19 @@ def decide_status(usage: dict | None, bought_at, plan_days: int | None, now=None
     # real expiry — without a cap those rows would be queried every day forever.
     return (EXPIRED if too_old((plan_days + GRACE_DAYS) if plan_days else UNKNOWN_MAX_DAYS)
             else ACTIVE)
+
+
+def unmetered_mail_due(unmetered: int, have_key: bool, now=None) -> bool:
+    """Mail about unmetered Stellar rows? Once a day, and only when it means
+    something. No key = the PC copy, blind to Stellar by design (memory:
+    stellar-key-placement), so every row is unmetered and that is not news.
+    The window 08-12 Israel holds exactly one scheduled run (09:00, cron at
+    06 UTC, even if GitHub starts it late), so a fault that lasts gets one
+    mail a day instead of six, and a one-run blip at 13:00 gets none."""
+    if not unmetered or not have_key:
+        return False
+    now = now or datetime.now(TZ)
+    return 8 <= now.astimezone(TZ).hour < 12
 
 
 def push_to_site(items: list[dict]) -> int:
@@ -645,6 +659,7 @@ def main() -> int:
     # ── decide, then write the sheet ONCE ──
     cells, site_items, counts = [], [], {ACTIVE: 0, USED_UP: 0, EXPIRED: 0}
     skipped = unmetered = 0
+    unmetered_rows: list[str] = []
 
     # ── self-heal the source column ──
     # The migration of 'מקור - source' from a payment rail to a supplier name,
@@ -688,6 +703,8 @@ def main() -> int:
             u = st_usage.get(t["link"]) if t["link"] else None
             if not isinstance(u, dict):
                 unmetered += 1
+                unmetered_rows.append(f"row {t['row']} ({t['order_id']})"
+                                      + ("" if t["link"] else " - no portal link"))
                 if not t["link"]:
                     log.warning(f"row {t['row']} ({t['order_id']}): a Stellar "
                                 "row with no portal link — left untouched")
@@ -772,6 +789,21 @@ def main() -> int:
         # equals the whole fleet is a missing key, not a fleet of dead eSIMs.
         log.info(f"{unmetered} Stellar row(s) unmetered: no key / error / "
                  "unknown shape — every one of them left exactly as it was")
+    if unmetered_mail_due(unmetered, bool(os.getenv("STELLAR_API_KEY", "").strip())):
+        # 2026-09-29: eleven Stellar meters sat frozen for two days behind a
+        # rate limit and the only trace was the log line above. A frozen meter
+        # is invisible to the customer AND to us, so it gets a mail -- but ONE
+        # a day (the 09:00 run), not one per 4-hour run: see unmetered_mail_due.
+        shown = unmetered_rows[:MISMATCH_LIST]
+        extra = len(unmetered_rows) - len(shown)
+        alert("Stellar usage not updating",
+              f"{unmetered} Stellar package(s) could not be metered this run, "
+              "so their GB figure on the sheet and on the order page is frozen:"
+              "\n\n" + "\n".join(f"  · {r}" for r in shown)
+              + (f"\n  ... and {extra} more" if extra else "")
+              + "\n\nThe reason per row is in the GitHub Actions log (usage "
+                "workflow). Rows are left exactly as they were, nothing is "
+                "retired. If this repeats tomorrow, the fault is not a blip.")
     if cells:
         ws.update_cells(cells, value_input_option="USER_ENTERED")
     log.info(f"sheet: {len(cells)} cell(s) updated · still active {counts[ACTIVE]} · "

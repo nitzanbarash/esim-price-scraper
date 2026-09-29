@@ -967,6 +967,16 @@ check("and says how many it did not name", "and 13 more" in body, True)
 check("nothing was written to any of them", ws2.written, [])
 
 
+# ── unmetered Stellar mail: once a day, never without a key ──
+_due, _TZ = usage_bot.unmetered_mail_due, usage_bot.TZ
+check("unmetered: 09:00 run mails", _due(3, True, datetime(2026, 9, 30, 9, 5, tzinfo=_TZ)), True)
+check("unmetered: late-started 09 run still mails", _due(3, True, datetime(2026, 9, 30, 11, 40, tzinfo=_TZ)), True)
+check("unmetered: 13:00 run stays quiet", _due(3, True, datetime(2026, 9, 30, 13, 2, tzinfo=_TZ)), False)
+check("unmetered: 05:00 run stays quiet", _due(3, True, datetime(2026, 9, 30, 5, 2, tzinfo=_TZ)), False)
+check("unmetered: no key (PC) never mails", _due(3, False, datetime(2026, 9, 30, 9, 5, tzinfo=_TZ)), False)
+check("unmetered: nothing unmetered, no mail", _due(0, True, datetime(2026, 9, 30, 9, 5, tzinfo=_TZ)), False)
+check("unmetered: UTC clock read in Israel time", _due(1, True, datetime(2026, 9, 30, 6, 5, tzinfo=timezone.utc)), True)
+
 if _fails:
     print(f"{len(_fails)} FAILED: " + ", ".join(_fails))
     sys.exit(1)
