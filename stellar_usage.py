@@ -58,6 +58,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
@@ -67,6 +69,18 @@ log = logging.getLogger("stellar-usage")
 
 BASE = "https://wholesale.stellarsecurity.com/api/v1"
 TIMEOUT = 30
+
+# Stellar answers `X-RateLimit-Limit: 60` per minute, per IP, and a package
+# costs TWO calls (order, then meter). Found 2026-09-29: the 31st live Stellar
+# package was the first one whose calls landed after the 60th of the minute,
+# and from then on every package past the 30th was "HTTPError -- left
+# untouched" on every run -- always the NEWEST rows, since the sweep walks the
+# sheet top-down. Their meters simply stopped. So calls are paced to a window
+# under the limit, and a 429 that slips through waits and asks once more.
+RATE_LIMIT = 55          # calls allowed per window, a little under Stellar's 60
+RATE_WINDOW = 60.0       # seconds
+RETRY_WAIT = 61.0        # when the 429 names no better time
+_recent: deque = deque()  # monotonic times of the calls made in the window
 GB_MB = 1024.0
 GB_BYTES = float(1024 ** 3)
 
@@ -314,8 +328,47 @@ def _session(key: str, session=None):
     return s
 
 
+def _throttle():
+    """Sleep just long enough to keep this window under RATE_LIMIT calls."""
+    now = time.monotonic()
+    while _recent and now - _recent[0] >= RATE_WINDOW:
+        _recent.popleft()
+    if len(_recent) >= RATE_LIMIT:
+        wait = RATE_WINDOW - (now - _recent[0]) + 0.5
+        log.info(f"stellar: {RATE_LIMIT} calls in the last minute -- pausing {wait:.0f}s")
+        time.sleep(wait)
+    _recent.append(time.monotonic())
+
+
+def _status(e) -> str:
+    """'HTTPError 429' when the exception carries a response, else its name."""
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    return f"{type(e).__name__}{f' {code}' if code else ''}"
+
+
+def _retry_after(resp) -> float:
+    h = getattr(resp, "headers", None) or {}
+    for name in ("Retry-After", "X-RateLimit-Reset"):
+        v = _number(h.get(name))
+        if v is None:
+            continue
+        if v > 1e9:                       # an epoch, not a delay
+            v -= time.time()
+        if 0 < v <= 300:
+            return v + 0.5
+    return RETRY_WAIT
+
+
 def _get(s, url) -> dict:
+    _throttle()
     r = s.get(url, timeout=TIMEOUT)
+    if getattr(r, "status_code", 0) == 429:
+        wait = _retry_after(r)
+        log.info(f"stellar: rate limited (429) -- waiting {wait:.0f}s and asking once more")
+        time.sleep(wait)
+        _recent.clear()
+        _throttle()
+        r = s.get(url, timeout=TIMEOUT)
     r.raise_for_status()
     try:
         return _unwrap(r.json())
@@ -371,7 +424,7 @@ def _one(s, url) -> Result:
     try:
         data = _get(s, f"{BASE}/orders/{oid}")
     except Exception as e:
-        log.warning(f"stellar order {oid}: {type(e).__name__} -- left untouched")
+        log.warning(f"stellar order {oid}: {_status(e)} -- left untouched")
         return None
     esims = data.get("esims") or []
     if not esims:
@@ -396,7 +449,7 @@ def _one(s, url) -> Result:
                 # false may simply have no meter yet. The eSIM record below is
                 # tried next, and a real outage fails there too.
                 log.info(f"stellar meter for an esim of order {oid}: "
-                         f"{type(ex).__name__} -- trying the esim record")
+                         f"{_status(ex)} -- trying the esim record")
             else:
                 got = map_usage(meter)
                 if isinstance(got, dict):
@@ -407,7 +460,7 @@ def _one(s, url) -> Result:
             try:
                 detail = _get(s, f"{BASE}/esims/{sim_id}")
             except Exception as ex:
-                log.warning(f"stellar esim of order {oid}: {type(ex).__name__} "
+                log.warning(f"stellar esim of order {oid}: {_status(ex)} "
                             "-- left untouched")
                 return None
         # Only if the meter did not answer. The eSIM record carries no figures
@@ -435,6 +488,7 @@ def fetch_usage(order_urls, session=None, key: Optional[str] = None) -> dict:
     """
     global _logged_endpoint, _stale_rows
     _logged_endpoint, _stale_rows = False, 0     # one sweep, one endpoint line
+    _recent.clear()
     urls = [u for u in (order_urls or [])]
     if not urls:
         return {}
