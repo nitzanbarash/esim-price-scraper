@@ -245,6 +245,12 @@ PROFIT_MIN_PCT_1GB = -20.0   # 1GB plans are a loss leader; a 20% loss is allowe
 # are not judged by these numbers.
 BUY_CEILINGS = ((30.0, 10.0), (40.0, 14.0), (50.0, 18.0))   # (size from, max buy $)
 OVER_CEILING_LABEL = 'לא רווחי — מעל תקרה'
+# Per-SKU exceptions, approved by the owner BY NAME — the discipline of
+# day_policy.DAY_FLOOR_EXCEPTIONS: the ceilings never widen, a SKU is let past
+# them only when the owner said so for that SKU, and the 20% profit floor
+# still judges it. A deleted row takes its exception with it.
+#   5.212.50  Morocco 50GB on Stellar, cost $18.27, sold at 24.99 (2026-10-01)
+CEILING_EXCEPTIONS = frozenset({'5.212.50'})
 # The same word waverole_sync.gs applyFee_ writes (UNPROFITABLE) when the
 # owner types a sell price; choose_supplier.py keeps it fresh on twin rows.
 UNPROFITABLE_LABEL = 'לא רווחי'
@@ -356,7 +362,8 @@ def is_profitable(my_price: Optional[float], buy: Optional[float],
 
 def buy_ceiling(gb: Optional[float], code: str = '') -> Optional[float]:
     """The most this size may cost and still be sold, or None when no ceiling applies."""
-    if gb is None or REGIONAL_CODE_RE.match((code or '').strip()):
+    code = (code or '').strip()
+    if gb is None or REGIONAL_CODE_RE.match(code) or code in CEILING_EXCEPTIONS:
         return None
     ceiling = None
     for size_from, cap in BUY_CEILINGS:

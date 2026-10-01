@@ -15,8 +15,8 @@ Run:  python test_buy_ceiling.py
 """
 import sys
 
-from esim_price_scraper import (BUY_CEILINGS, OVER_CEILING_LABEL, buy_ceiling,
-                                is_profitable, over_ceiling)
+from esim_price_scraper import (BUY_CEILINGS, CEILING_EXCEPTIONS, OVER_CEILING_LABEL,
+                                buy_ceiling, is_profitable, over_ceiling)
 
 failures = 0
 
@@ -41,6 +41,18 @@ check("exactly $10 is not over", over_ceiling(10.00, 30, '2.34.30'), False)
 check("Germany 40GB at $11.84 is not", over_ceiling(11.84, 40, '2.49.40'), False)
 check("Romania 40GB at $18.85 is", over_ceiling(18.85, 40, '2.40.40'), True)
 check("Thailand 50GB at $23.49 is", over_ceiling(23.49, 50, '1.66.50'), True)
+
+print("\n-- per-SKU exceptions, by name only --")
+check("the list is exactly what the owner approved", CEILING_EXCEPTIONS, frozenset({'5.212.50'}))
+check("Morocco 50GB at $18.27 has no ceiling", buy_ceiling(50, '5.212.50'), None)
+check("Morocco 50GB at $18.27 is not over", over_ceiling(18.27, 50, '5.212.50'), False)
+check("padding does not hide the code", over_ceiling(18.27, 50, ' 5.212.50 '), False)
+check("Morocco 20GB keeps no ceiling of its own", buy_ceiling(20, '5.212.20'), None)
+check("the exception is one SKU, not a country", over_ceiling(18.27, 50, '5.212.500'), True)
+check("nor a size: another 50GB at $18.27 is over", over_ceiling(18.27, 50, '2.34.50'), True)
+check("the profit floor still judges it: 24.99 nets 23.64 on $18.27",
+      is_profitable(23.64, 18.27, 50), True)
+check("and would stop it at $19.71", is_profitable(23.64, 19.71, 50), False)
 check("a 20GB has no ceiling at any price", over_ceiling(99.0, 20, '2.49.20'), False)
 check("no price is not judged", over_ceiling(None, 30, '2.34.30'), False)
 check("no size is not judged", over_ceiling(11.30, None, '2.34.30'), False)
