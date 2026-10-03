@@ -1,0 +1,42 @@
+# Manual look at Stellar's RAW wholesale catalogue for a few countries: every
+# single-country listing, its price, and whether stellar_prices.py can use it
+# (and if not, why). Built 2026-10-04 after the 10-02 catalogue re-sync marked
+# 41 rows "GONE" — whole countries at once — while the retail site still sold
+# the same package codes. Read-only: no sheet, no order, no key that can spend.
+# The prices it prints are the same wholesale euros the 4-hourly run already
+# prints for our own rows.
+name: Stellar inspect (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      countries:
+        description: ISO codes, comma-separated
+        required: true
+        default: "TH,VN,KR,ES,GB,CH,US,MX"
+
+permissions:
+  contents: read
+
+# The whole catalogue is ~60 pages against a 60/minute limit, and a second
+# Stellar client at the same moment has been refused outright. Queue behind
+# the price runs instead of racing them.
+concurrency:
+  group: price-sheet
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -q requests gspread playwright google-auth google-api-python-client
+      - name: raw listings
+        env:
+          STELLAR_READ_KEY: ${{ secrets.STELLAR_READ_KEY }}
+          COUNTRIES: ${{ inputs.countries }}
+        run: python stellar_prices.py --inspect "$COUNTRIES"

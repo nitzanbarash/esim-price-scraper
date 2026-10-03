@@ -340,6 +340,30 @@ check("plan UUID rides along for the buyer", api.by_code["CKH995"][0].plan_id, "
 check("daily-unlimited, unavailable and SKU-less listings are dropped",
       sorted(api.by_code), ["CKH980", "CKH993", "CKH995"])
 check("regional is decided by the plan's own coverage codes", api.regional_codes, {"CKH980"})
+
+print("-- why a code is gone (read-only explanations) --")
+from stellar_prices import drop_reason, explain_gone, drop_summary, inspect_lines
+_raw = [
+    plan("ESIM-GERMANY-10GB-30D-CKH995", 221, 10240, 30),
+    plan("ESIM-THAILAND-10GB-30D-JC047", 300, 10240, 30, codes=("TH",), available=False),
+    plan("THAILAND-10GB-30D-JC081", 300, 10240, 30, codes=("TH",)),
+    plan("ESIM-MOROCCO-3GBD-1D-PW8BZYG4P", 223, 3072, 1, unit="day", configurable=True),
+]
+check("a usable listing has no drop reason", drop_reason(_raw[0]), "")
+check("a switched-off listing says so", drop_reason(_raw[1]), "available=false")
+check("a respelled SKU is named as the reason", drop_reason(_raw[2]).startswith("SKU not in"), True)
+check("per-day billing outranks the rest", drop_reason(_raw[3]), "billed per day")
+check("from_api keeps exactly the listings drop_reason passes",
+      sorted(Catalogue.from_api(_raw).by_code), ["CKH995"])
+_why = explain_gone(_raw, ["JC047", "JC081", "CKH000"])
+check("explain_gone: switched off", "available=false ×1" in _why[1], True)
+check("explain_gone: respelled", "SKU not in" in _why[2], True)
+check("explain_gone: truly absent", "not in the raw catalogue" in _why[0], True)
+check("drop_summary counts every listing once",
+      drop_summary(_raw), "kept 1 | available=false 1 | SKU not in our format 1 | billed per day 1")
+_ins = "\n".join(inspect_lines(_raw, ["th"]))
+check("inspect lists only the asked country", ("JC047" in _ins, "CKH995" in _ins), (True, False))
+check("inspect counts what stellar_prices can use", "2 single-country listings, 0 usable" in _ins, True)
 check("the newest catalogue scan is the snapshot time", api.generated_at, "2026-09-10T05:00:00Z")
 check("binary megabytes land on the sheet's decimal sizes",
       [_gb_from_mb(m) for m in (3072, 10240, 768, 750, 512, 500, 100, 1536, 1500)],
@@ -580,6 +604,10 @@ check("--apply with the key reads the real wholesale price and goes through",
       _run(["--apply"], key="k")[0], "past the guard")
 check("a saved wholesale dump is our real cost, so --apply goes through",
       _run(["--apply", "--plans", _FEED_FILE])[0], "past the guard")
+check("--inspect without the API refuses instead of guessing from the retail feed",
+      _run(["--inspect", "TH"])[0], 2)
+_c, _o = _run(["--inspect", "TH"], key="k")
+check("--inspect with the key prints and exits before the sheet", _c, 0)
 os.unlink(_FEED_FILE)
 
 print()

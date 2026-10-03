@@ -74,6 +74,9 @@ Run:
     python stellar_prices.py --apply      writes to the sheet
     python stellar_prices.py --feed F     read a saved retail feed instead of fetching
     python stellar_prices.py --plans F    read a saved wholesale-API dump instead of fetching
+    python stellar_prices.py --inspect TH,US   every raw wholesale listing of those
+                                          countries and why each is used or not;
+                                          no sheet (stellar-inspect.yml runs it)
 """
 
 from __future__ import annotations
@@ -201,19 +204,11 @@ class Catalogue:
         reads 3GBD-1D, so both the billing unit and the SKU shape drop them."""
         variants, regional, synced = [], set(), ""
         for p in plans:
+            if drop_reason(p):
+                continue
             price = p.get("price") or {}
-            if price.get("billing_unit", "plan") != "plan":
-                continue          # per-day unlimited plans are another product
-            if (p.get("duration") or {}).get("configurable"):
-                continue
-            if not p.get("available", True):
-                continue
             m = _SKU_RE.match(str(p.get("sku") or "").upper())
-            if not m:
-                continue
             mb, days, cents = (p.get("data") or {}).get("megabytes"), p.get("validity_days"), price.get("amount_cents")
-            if mb is None or days is None or cents is None:
-                continue
             code = m.group(4)
             variants.append(Variant(code, _gb_from_mb(int(mb)), int(days), cents / 100.0,
                                     str(p.get("product_slug") or ""), str(p.get("name", "")),
@@ -232,6 +227,96 @@ class Catalogue:
             return None
         now = now or datetime.now(timezone.utc)
         return (now - gen).total_seconds() / 3600
+
+
+def drop_reason(p: dict) -> str:
+    """Why from_api leaves this raw API listing out, or '' when it keeps it.
+
+    from_api asks this and nothing else, so the explanation printed for a
+    'GONE' row can never drift from the filter that made it gone. 'GONE' used
+    to be one word for four different things -- Stellar removed the plan,
+    Stellar switched it off, Stellar changed the SKU spelling, or the plan
+    became a per-day product -- and each needs a different answer from us.
+    """
+    price = p.get("price") or {}
+    if price.get("billing_unit", "plan") != "plan":
+        return "billed per day"          # daily-unlimited: another product
+    if (p.get("duration") or {}).get("configurable"):
+        return "configurable duration"
+    if not p.get("available", True):
+        return "available=false"
+    if not _SKU_RE.match(str(p.get("sku") or "").upper()):
+        return f"SKU not in the ESIM-…-<GB>-<days>D-<code> format ({p.get('sku')!r})"
+    if ((p.get("data") or {}).get("megabytes") is None or p.get("validity_days") is None
+            or price.get("amount_cents") is None):
+        return "no size, days or price"
+    return ""
+
+
+def _listing_text(p: dict) -> str:
+    """Everything a code can hide in: the SKU, the slugs, the name."""
+    return " ".join(str(p.get(k) or "") for k in ("sku", "slug", "product_slug", "name")).upper()
+
+
+def explain_gone(plans: list, codes) -> list[str]:
+    """One line per vanished package code: what the RAW catalogue still says
+    about it. Read-only -- it changes no decision, it only says which of the
+    four 'GONE's this one is."""
+    out = []
+    for code in sorted(set(codes)):
+        hits = [p for p in plans if code in _listing_text(p)]
+        if not hits:
+            out.append(f"  {code:<11} not in the raw catalogue at all — removed (or renamed past recognition)")
+            continue
+        why: dict[str, int] = {}
+        for p in hits:
+            r = drop_reason(p)
+            if not r:
+                m = _SKU_RE.match(str(p.get("sku") or "").upper())
+                r = f"kept, but under code {m.group(4)}" if m else "kept"
+            why[r] = why.get(r, 0) + 1
+        sample = hits[0]
+        out.append(f"  {code:<11} {len(hits)} raw listing(s): "
+                   + "; ".join(f"{r} ×{n}" for r, n in sorted(why.items()))
+                   + f"  — e.g. {sample.get('sku')!r} / {sample.get('name')!r}")
+    return out
+
+
+def drop_summary(plans: list) -> str:
+    """'kept 5816 | available=false 120 | …' over the whole raw read."""
+    tally: dict[str, int] = {}
+    for p in plans:
+        r = drop_reason(p)
+        r = "kept" if not r else ("SKU not in our format" if r.startswith("SKU") else r)
+        tally[r] = tally.get(r, 0) + 1
+    return " | ".join(f"{r} {n}" for r, n in sorted(tally.items(), key=lambda kv: -kv[1]))
+
+
+def inspect_lines(plans: list, countries) -> list[str]:
+    """Every raw listing that covers exactly one of these ISO countries, with
+    the verdict from_api gives it. For looking, not deciding: --inspect."""
+    want = {c.strip().upper() for c in countries if c.strip()}
+    rows = []
+    for p in plans:
+        codes = [str(c).upper() for c in ((p.get("coverage") or {}).get("codes") or [])]
+        cc = codes[0] if len(codes) == 1 else ""
+        if cc not in want:
+            continue
+        mb = (p.get("data") or {}).get("megabytes") or 0
+        cents = (p.get("price") or {}).get("amount_cents")
+        rows.append((cc, mb, p.get("validity_days") or 0, cents if cents is not None else -1, p))
+    out = []
+    for cc in sorted(want):
+        mine = sorted((r for r in rows if r[0] == cc), key=lambda r: r[1:4])
+        kept = sum(1 for r in mine if not drop_reason(r[4]))
+        out.append(f"\n## {cc}: {len(mine)} single-country listings, {kept} usable by stellar_prices")
+        for _, mb, days, cents, p in mine:
+            size = f"{_gb_from_mb(int(mb)):g}GB" if mb else "?GB"
+            eur = f"€{cents / 100:.2f}" if cents >= 0 else "€?"
+            bo = (p.get("coverage") or {}).get("breakout_ip_country_code") or "?"
+            out.append(f"  {size:>6} {days:>3}d {eur:>8}  {str(p.get('sku')):<38} "
+                       f"{drop_reason(p) or 'ok':<24} bo={bo:<3} {p.get('name')}")
+    return out
 
 
 def _gb_from_mb(mb: int) -> float:
@@ -720,6 +805,9 @@ def main(argv=None) -> int:
                     help="write even when the prices are the retail-feed estimate (normally refused)")
     ap.add_argument("--feed", help="read a saved products.index.json (retail feed) instead of fetching")
     ap.add_argument("--plans", help="read a saved wholesale-API dump (JSON list of plans) instead of fetching")
+    ap.add_argument("--inspect", metavar="CC,CC",
+                    help="print every raw wholesale listing of these ISO countries and exit "
+                         "(needs STELLAR_READ_KEY or --plans; never touches the sheet)")
     ap.add_argument("--credentials",
                     default=os.environ.get("SHEETS_CREDENTIALS",
                                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")))
@@ -748,17 +836,23 @@ def main(argv=None) -> int:
               f"if the estimate really is what you want written.")
         return 3
 
+    plans = None                 # the RAW API listings, kept for the explanations
     if a.plans:
         with open(a.plans, encoding="utf-8") as f:
             dump = json.load(f)
-        cat = Catalogue.from_api(dump if isinstance(dump, list) else dump.get("data") or [])
+        plans = dump if isinstance(dump, list) else dump.get("data") or []
+        cat = Catalogue.from_api(plans)
         source = f"saved API dump {a.plans}"
     elif a.feed:
         with open(a.feed, encoding="utf-8") as f:
             cat = Catalogue.from_feed(json.load(f))
         source = f"saved retail feed {a.feed}"
     elif key:
-        cat, source = Catalogue.from_api(fetch_plans(key)), "wholesale API — real cost"
+        plans = fetch_plans(key)
+        cat, source = Catalogue.from_api(plans), "wholesale API — real cost"
+    elif a.inspect:
+        print("🛑 --inspect reads the wholesale API: set STELLAR_READ_KEY or pass --plans")
+        return 2
     else:
         cat = Catalogue.from_feed(fetch_feed())
         source = f"public RETAIL feed / {RETAIL_OVER_WHOLESALE} — an ESTIMATE, no STELLAR_READ_KEY"
@@ -769,6 +863,12 @@ def main(argv=None) -> int:
           + (f" ({age:.1f}h old)" if age is not None else ""))
     if age is not None and age > FEED_STALE_HOURS:
         print(f"⚠️  feed snapshot is {age:.0f} hours old — prices below may already be stale")
+    if plans is not None:
+        print(f"🧮 {len(plans)} raw listings: {drop_summary(plans)}")
+    if a.inspect:
+        for line in inspect_lines(plans or [], a.inspect.split(",")):
+            print(line)
+        return 0
 
     svc = sheets_service(a.credentials)
     values = read_sheet(svc)
@@ -785,6 +885,11 @@ def main(argv=None) -> int:
           f"{len(rows) - len(decisions)} left alone\n")
     for d in decisions:
         print("  " + _describe(d, fx))
+    gone_codes = [d.row.code for d in decisions if d.reason == "gone"]
+    if gone_codes and plans is not None:
+        print(f"\n🔎 what the raw catalogue says about the {len(set(gone_codes))} vanished codes:")
+        for line in explain_gone(plans, gone_codes):
+            print(line)
     stop = sanity(decisions)
     if stop:
         print(f"\n🛑 {stop}")
