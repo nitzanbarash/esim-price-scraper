@@ -722,7 +722,12 @@ class Run:
 
     def catalogue(self) -> sp.Catalogue:
         if self._cat is None:
-            plans = self.st.plans()
+            try:
+                plans = self.st.plans()
+            except sp.CatalogueShortRead as ex:
+                # Half a catalogue is the world being wrong, not the order:
+                # whatever sat on the unread pages would be refused as gone.
+                raise Blocked(str(ex)) from ex
             cat = sp.Catalogue.from_api(plans)
             # A read that makes most coded rows vanish at once is a broken read
             # -- an empty page, a renamed id format, a key answering 200 with

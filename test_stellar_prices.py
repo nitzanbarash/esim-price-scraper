@@ -341,6 +341,95 @@ check("daily-unlimited, unavailable and SKU-less listings are dropped",
       sorted(api.by_code), ["CKH980", "CKH993", "CKH995"])
 check("regional is decided by the plan's own coverage codes", api.regional_codes, {"CKH980"})
 
+print("-- reading the whole catalogue, or failing --")
+from stellar_prices import fetch_plans, CatalogueShortRead
+
+
+class _Pages:
+    """GET /plans the way Stellar pages it: `total` listings, 100 a page."""
+    def __init__(self, total, lie_total=None, throttle_at=None, last_page=None):
+        self.total, self.lie_total, self.calls = total, lie_total, []
+        self.throttle_at, self.last_page, self.headers = throttle_at, last_page, {}
+
+    def get(self, url, params=None, timeout=None):
+        page = params["page"]
+        self.calls.append(page)
+        if self.throttle_at and len(self.calls) == self.throttle_at:
+            return _R(429, {}, {"Retry-After": "7"})
+        last = self.last_page or -(-self.total // 100)
+        lo = (page - 1) * 100
+        data = [{"id": f"p{i}"} for i in range(lo, min(lo + 100, self.total))]
+        return _R(200, {"data": data, "meta": {"current_page": page, "last_page": last,
+                                               "total": self.lie_total or self.total}})
+
+
+class _R:
+    def __init__(self, code, body, headers=None):
+        self.status_code, self._b, self.headers = code, body, headers or {}
+
+    def json(self):
+        return self._b
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _Clock:
+    def __init__(self):
+        self.t, self.slept = 0.0, []
+
+    def sleep(self, s):
+        self.slept.append(s)
+        self.t += s
+
+    def now(self):
+        self.t += 0.3            # each request takes a moment
+        return self.t
+
+
+_c = _Clock()
+_p = _Pages(6042)
+_p.when = []
+_orig_get = _p.get
+_p.get = lambda url, params=None, timeout=None: (_p.when.append(_c.t), _orig_get(url, params, timeout))[1]
+_got = fetch_plans("k", session=_p, sleep=_c.sleep, clock=_c.now)
+check("6,042 listings read as 6,042 -- the 2026-10-02 catalogue no longer stops at 6,000",
+      len(_got), 6042)
+check("...and every country past page 60 is in it", _got[-1]["id"], "p6041")
+_busiest = max(sum(1 for w in _p.when if a <= w < a + 60) for a in _p.when)
+check("61 pages, and no rolling minute asks Stellar more than 55 times",
+      (len(_p.when), _busiest <= 55, any(s > 1 for s in _c.slept)), (61, True, True))
+_c = _Clock()
+_p = _Pages(20000)
+_p.when = []
+_orig_get2 = _p.get
+_p.get = lambda url, params=None, timeout=None: (_p.when.append(_c.t), _orig_get2(url, params, timeout))[1]
+fetch_plans("k", session=_p, sleep=_c.sleep, clock=_c.now)
+check("200 pages -- several windows deep -- still never more than 55 in any minute",
+      max(sum(1 for w in _p.when if a <= w < a + 60) for a in _p.when) <= 55, True)
+_c = _Clock()
+fetch_plans("k", session=_Pages(3400), sleep=_c.sleep, clock=_c.now)
+check("a 34-page catalogue never waits for the window (as fast as before)",
+      max(_c.slept), 0.25)
+_c = _Clock()
+_p = _Pages(500, throttle_at=3)
+check("a 429 waits Stellar's Retry-After and asks the same page again",
+      (len(fetch_plans("k", session=_p, sleep=_c.sleep, clock=_c.now)), _p.calls[:4], 7.5 in _c.slept),
+      (500, [1, 2, 3, 3], True))
+try:
+    fetch_plans("k", session=_Pages(600, lie_total=650), sleep=_c.sleep, clock=_c.now)
+    check("a read short of meta.total is an error", "no error", "CatalogueShortRead")
+except CatalogueShortRead as ex:
+    check("a read short of meta.total is an error, naming both counts",
+          "600 of the 650" in str(ex), True)
+try:
+    fetch_plans("k", session=_Pages(10**6), sleep=_c.sleep, clock=_c.now)
+    check("a catalogue past the runaway guard is an error", "no error", "CatalogueShortRead")
+except CatalogueShortRead as ex:
+    check("a catalogue past the runaway guard is an error, not a silent cut",
+          "raise API_MAX_PAGES" in str(ex), True)
+
 print("-- why a code is gone (read-only explanations) --")
 from stellar_prices import drop_reason, explain_gone, drop_summary, inspect_lines
 _raw = [

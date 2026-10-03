@@ -14,6 +14,10 @@ on:
         description: ISO codes, comma-separated
         required: true
         default: "TH,VN,KR,ES,GB,CH,US,MX"
+      preview:
+        description: Also dry-run the price refresh and the chooser (reads the sheet, writes nothing)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -40,3 +44,9 @@ jobs:
           STELLAR_READ_KEY: ${{ secrets.STELLAR_READ_KEY }}
           COUNTRIES: ${{ inputs.countries }}
         run: python stellar_prices.py --inspect "$COUNTRIES"
+      - name: price refresh, DRY RUN (writes nothing)
+        if: inputs.preview
+        env:
+          STELLAR_READ_KEY: ${{ secrets.STELLAR_READ_KEY }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python stellar_prices.py

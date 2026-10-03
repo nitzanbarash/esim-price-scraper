@@ -101,7 +101,13 @@ from esim_price_scraper import HEADER_KEYS, SHEET_ID, col_letter
 FEED_URL = "https://stellarsecurity.com/assets/esim/products.index.json"   # retail; fallback only
 API_URL = "https://wholesale.stellarsecurity.com/api/v1/plans"
 API_PER_PAGE = 100            # the API's maximum
-API_MAX_PAGES = 60            # 6,000 listings; the catalogue is ~3,400. Also the 60/min budget.
+# A runaway guard, NOT a guess at the catalogue's size. It was 60 (6,000
+# listings) until 2026-10-02, when the catalogue grew past exactly that: the
+# read stopped at 6,000 without a word, and since the API sorts by destination,
+# every country after Singapore read as GONE. See fetch_plans.
+API_MAX_PAGES = 300
+API_CALLS_PER_MINUTE = 55     # Stellar allows 60 a minute per IP (X-RateLimit-Limit)
+API_RETRY_WAIT = 61.0         # a 429 that names no better time
 FX_URL = "https://api.frankfurter.app/latest"
 # Measured 2026-09-09: 58 rows, median 1.2192, stdev 0.0041. Re-measure the
 # day the wholesale API is wired in — a drift here mis-prices every row.
@@ -333,22 +339,84 @@ def fetch_feed() -> dict:
     return r.json()
 
 
-def fetch_plans(key: str) -> list:
-    """Every listing of the wholesale catalogue. ~35 calls at 100 a page against
-    a 60/minute limit; a quarter-second between pages spaces the whole read
-    over ~9 seconds and still asks for well under 60 in any minute."""
-    s = requests.Session()
+class CatalogueShortRead(RuntimeError):
+    """The read ended before the catalogue did. Never a smaller catalogue: a
+    caller that prices or buys off a partial read turns every missing listing
+    into a 'GONE' row or a refused order."""
+
+
+def _retry_after(resp) -> float:
+    h = getattr(resp, "headers", None) or {}
+    for name in ("Retry-After", "X-RateLimit-Reset"):
+        try:
+            v = float(h.get(name))
+        except (TypeError, ValueError):
+            continue
+        if v > 1e9:                       # an epoch, not a delay
+            v -= time.time()
+        if 0 < v <= 300:
+            return v + 0.5
+    return API_RETRY_WAIT
+
+
+def fetch_plans(key: str, session=None, sleep=time.sleep, clock=time.monotonic) -> list:
+    """Every listing of the wholesale catalogue -- ALL of it, or CatalogueShortRead.
+
+    2026-10-02: Stellar's catalogue grew to 6,000+ listings and the old 60-page
+    cap read exactly 6,000 and stopped as if that were the end. The API sorts
+    by destination, so every country after Singapore -- South Korea, Spain,
+    Switzerland, Thailand, the UK, the US, Vietnam -- vanished from the read:
+    41 rows were marked GONE and the chooser moved them to esim.dog at up to
+    2.5x the cost, while every step reported success. So the end of the read is
+    now the API's own last_page, and a read that ends short of meta.total is
+    an error, not a catalogue.
+
+    Pages are paced to API_CALLS_PER_MINUTE in any rolling minute (Stellar
+    allows 60): the first ~55 go out a quarter-second apart as before, and only
+    a catalogue past that waits for the window. A 429 that slips through waits
+    for the time Stellar names and asks once more.
+    """
+    s = session or requests.Session()
     s.headers.update({"Authorization": f"Bearer {key}", "Accept": "application/json"})
-    out, page = [], 1
-    while page <= API_MAX_PAGES:
-        r = s.get(API_URL, params={"per_page": API_PER_PAGE, "page": page}, timeout=60)
+    sent: list[float] = []
+
+    def get(page):
+        # Wait for the OLDEST call to leave the minute, not for the whole
+        # window to empty: the other 54 are still inside it, and forgetting
+        # them sends 55 more at once.
+        while True:
+            now = clock()
+            while sent and now - sent[0] >= 60.0:
+                sent.pop(0)
+            if len(sent) < API_CALLS_PER_MINUTE:
+                break
+            sleep(60.0 - (now - sent[0]) + 0.05)
+        sent.append(clock())
+        return s.get(API_URL, params={"per_page": API_PER_PAGE, "page": page}, timeout=60)
+
+    out, page, total = [], 1, None
+    while True:
+        if page > API_MAX_PAGES:
+            raise CatalogueShortRead(f"the catalogue runs past {API_MAX_PAGES} pages "
+                                     f"({len(out)} listings read) -- raise API_MAX_PAGES")
+        r = get(page)
+        if getattr(r, "status_code", 0) == 429:
+            sleep(_retry_after(r))
+            sent.clear()
+            r = get(page)
         r.raise_for_status()
         body = r.json()
+        meta = body.get("meta") or {}
         out.extend(body.get("data") or [])
-        if page >= int((body.get("meta") or {}).get("last_page") or page):
+        if meta.get("total") is not None:
+            total = int(meta["total"])
+        if page >= int(meta.get("last_page") or page):
             break
         page += 1
-        time.sleep(0.25)
+        sleep(0.25)
+    if total is not None and len(out) < total:
+        raise CatalogueShortRead(f"read {len(out)} of the {total} listings the API says it has "
+                                 f"-- a partial catalogue would mark the rest GONE")
     return out
 
 

@@ -264,7 +264,12 @@ def scenario(orders, stellar: StellarFake, ws: Ws | None = None, rows=None, clai
     downloads.clear()
     sb.fb.send_customer_email = fake_send
     sb.requests.get, sb.requests.post = site.get, site.post
-    sb.sp.fetch_plans = lambda key: (downloads.append(key), list(plans))[1]
+    def _fetch(key):
+        downloads.append(key)
+        if isinstance(plans, Exception):
+            raise plans
+        return list(plans)
+    sb.sp.fetch_plans = _fetch
     sb.stellar_rows = lambda: {r.sku: r for r in (rows if rows is not None else [sheet_row()])}
     sb.fb.alert = lambda s, b: alerts.append((s, b))
     sb.time.sleep = lambda s: sleeps.append(s)
@@ -694,6 +699,15 @@ check("nothing bought, no row, and NO order reported failed",
       bought == 0 and len(ws25.rows) == 1 and not site.reports("failed"), str(site.posts))
 check("one alert about the catalogue, not one per order",
       len(alerts) == 1 and "catalogue" in alerts[0][0], str(alerts))
+
+print("\n25b. a catalogue read that ended early is the same: nothing bought, one alert")
+alerts.clear()
+site, ws25b, bought, _ = scenario([order(), order(oid="WR-TWO")], StellarFake(), rows=many_rows,
+                                  plans=sb.sp.CatalogueShortRead("read 6000 of the 6042 listings"))
+check("a short read buys nothing and reports NO order failed",
+      bought == 0 and len(ws25b.rows) == 1 and not site.reports("failed"), str(site.posts))
+check("...one alert, naming the short read",
+      len(alerts) == 1 and "6000 of the 6042" in alerts[0][1], str(alerts))
 
 # ── 26. a connection that dropped AFTER the request is not a refusal ─────────
 print("\n26. which connection errors can have spent money")
