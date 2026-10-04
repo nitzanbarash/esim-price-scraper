@@ -22,8 +22,10 @@ pinned here without a sheet, a network or a credential:
       incumbent's U is not a readable price, the SKU is skipped rather than
       moved onto a row with no customer price,
     * a carried cell is written with the Python TYPE it was read as,
-    * רווח is filled in on the blank rows of every two-supplier SKU, in the
-      scraper's format, off the SKU's מחיר שלי,
+    * רווח is kept CURRENT on every row of every SKU — refreshed when the cost
+      or the sell price under it moved, in the scraper's format, against the S
+      the row holds once the run is done; on a one-supplier SKU it is the ONLY
+      thing written (owner, 2026-10-04: no margin word there),
     * and the MIRROR: on every run, switch or no switch, every row of a SKU is
       made to quote the same U/S/T/V as the chosen row — but only the cells
       that differ, so a second run in a row writes nothing; never on a SKU with
@@ -41,8 +43,8 @@ from choose_supplier import (
     CARRY, LAST_COL, LOSER_BG, OVER_CEILING_LABEL, PROFIT_MARKS, TICK,
     UNPROFITABLE_LABEL, WINNER_BG, Row, _entered_value, availability_word,
     cap_switches, decide, eligible, final_usd, gb_of, judge_stock, mirror_of,
-    money, profit_mark, profit_text, same_cell, source_of, switch_note, usd,
-    usd_outside_parens,
+    money, price_num, profit_mark, profit_text, profit_writes, same_cell,
+    source_of, switch_note, usd, usd_outside_parens,
 )
 
 _fails: list[str] = []
@@ -63,7 +65,12 @@ def dog(row, sku, price, **kw):
     kw.setdefault("fee", "0.8")
     kw.setdefault("final", "5.99")
     kw.setdefault("discount", "10%")
-    kw.setdefault("profit", "🟢 +$2.32 (+75.3%)")
+    # The P the row would hold after a clean run — its own S against its own
+    # cost — so a test that is not ABOUT P sees no P write. A test that is
+    # passes one.
+    if "profit" not in kw:
+        mine, cost = price_num(kw["my_price"]), usd(price)
+        kw["profit"] = profit_text(mine, cost) if (mine and cost) else ""
     return Row(row=row, sku=sku, source="esim.dog", price=price, **kw)
 
 
@@ -80,6 +87,13 @@ def only(decisions):
 
 def writes_of(d, key):
     return [(row, text) for row, k, text in d.writes if k == key]
+
+
+def but_p(d):
+    """Every write except P's — for the tests about something else. P is kept
+    current on every row of every SKU, skipped ones included, and has its own
+    tests below."""
+    return [w for w in d.writes if w[1] != "profit"]
 
 
 print("-- the price cell: the dollars OUTSIDE the brackets, in either order --")
@@ -328,10 +342,15 @@ check("the untouched Stellar row gets a P off the SKU's S",
       writes_of(d, "profit"), [(3, "🟢 +$2.34 (+76.5%)")])
 check("...and this SKU did not switch", d.action, "keep")
 
+# 2026-10-04: until today a P that was already there was left alone, so a
+# Stellar row's figure froze while its cost moved every four hours (131 of
+# 351 were stale). A P that no longer matches its row is a wrong number.
 d = only(decide([dog(2, "1.66.10", "$3.08", my_price="5.40", profit=""),
-                 stellar(3, "1.66.10", "$2.48", profit="already there")]))
-check("a P that is already filled in is left alone",
-      writes_of(d, "profit"), [(2, "🟢 +$2.32 (+75.3%)")])
+                 stellar(3, "1.66.10", "$2.48", profit="🟢 +$1.00 (+10.0%)")]))
+check("a stale P is brought up to date, not left alone",
+      writes_of(d, "profit"), [(2, "🟢 +$2.32 (+75.3%)"), (3, "🟢 +$2.92 (+117.7%)")])
+check("...in the scraper's literal format (esim_price_scraper.py, the profitability check)",
+      writes_of(d, "profit")[1][1], "🟢 +$2.92 (+117.7%)")
 
 d = only(decide([dog(2, "1.66.10", "$3.08", my_price="", profit=""),
                  stellar(3, "1.66.10", "$2.48")]))
@@ -345,6 +364,154 @@ d = only(decide([dog(2, "1.66.10", "$10.00", my_price="15.96", final="16.99"),
                  stellar(3, "1.66.10", "$8.00")]))
 check("on a switch the winner's P comes off the SKU's S too",
       writes_of(d, "profit"), [(3, "🟢 +$7.96 (+99.5%)")])
+
+print("\n-- P stays current when the bots move a cost (2026-10-04) --")
+# The live case: stellar_prices.py rewrote the Stellar row's cost from $2.13 to
+# $3.50 and P still showed the profit at $2.13. Only the owner typing a price
+# (applyFee_) ever refreshed it.
+rows = [dog(2, "1.66.10", "$4.15", chosen="", my_price="5.22", final="5.49",
+            fee="0.6", discount=""),
+        stellar(3, "1.66.10", "(€3.12) $3.50", chosen=TICK, my_price="5.22",
+                final="5.49", fee="0.6", discount="", profit=profit_text(5.22, 2.39))]
+d = only(decide(rows))
+check("the moved Stellar cost refreshes its P",
+      writes_of(d, "profit"), [(3, profit_text(5.22, 3.50))])
+check("...and nothing else on the SKU moves for it", but_p(d), [])
+for _row, _key, _value in d.writes:
+    setattr({r.row: r for r in rows}[_row], _key, _value)
+check("the next run writes nothing at all", only(decide(rows)).writes, [])
+
+# P is against the S the row HOLDS when the run ends: on a switch the winner
+# is handed the incumbent's S, and its P is computed with that, not its own.
+d = only(decide([dog(2, "1.66.10", "$10.00", my_price="15.96", final="16.99"),
+                 stellar(3, "1.66.10", "$8.00", my_price="9.00",
+                         profit=profit_text(9.00, 8.00))]))
+check("a switch: the winner's P is off the S it is being handed",
+      writes_of(d, "profit"), [(3, profit_text(15.96, 8.00))])
+check("profit_writes reads a pending S before the row's own",
+      profit_writes([stellar(3, "1.1.1", "$1.00", my_price="2.00")],
+                    [(3, "my_price", "3.00")]),
+      [(3, "profit", profit_text(3.00, 1.00))])
+check("...and writes nothing when P already says it",
+      profit_writes([stellar(3, "1.1.1", "$1.00", my_price="2.00",
+                             profit=profit_text(2.00, 1.00))], []), [])
+
+print("\n-- a one-supplier SKU: P kept current, nothing else judged --")
+# Mexico 5GB, Stellar only, on 2026-10-04: cost $4.64 against an S of $3.48.
+# The owner chose to keep the call to take it off sale for himself, so the
+# chooser writes its P and stops: no margin word, no tick, no colour.
+mx = stellar(400, "3.52.5", "(€4.13) $4.64", gb=5, chosen=TICK, my_price=3.48,
+             final=3.99, profit=profit_text(3.48, 2.32))
+d = only(decide([mx]))
+check("a stale P on a one-supplier SKU is refreshed", d.action, "solo")
+check("...with exactly one write: P", d.writes, [(400, "profit", profit_text(3.48, 4.64))])
+check("...no margin word, though it sells at a loss", writes_of(d, "stock"), [])
+check("...no colour, no tick", (d.colours, writes_of(d, "chosen")), ([], []))
+check("...and it is not counted as a two-supplier SKU",
+      "one supplier" in __import__("choose_supplier")._describe(d), True)
+mx.profit = profit_text(3.48, 4.64)
+check("an up-to-date one-supplier SKU produces no decision at all", decide([mx]), [])
+gone = stellar(401, "3.52.10", "—", chosen=TICK, my_price=6.36, final=6.99,
+               profit=profit_text(6.36, 3.86))
+check("a cost that is no longer there clears P rather than keep a stale profit",
+      only(decide([gone])).writes, [(401, "profit", "")])
+check("one supplier and NO tick: P is still kept current",
+      only(decide([stellar(402, "3.52.20", "$12.10", my_price=12.12,
+                           profit="🟢 +$5.00 (+70.0%)")])).writes,
+      [(402, "profit", profit_text(12.12, 12.10))])
+
+print("\n-- a skipped SKU: P is the only thing that moves --")
+d = only(decide([dog(2, "1.66.10", "$10.00", chosen="", my_price="15.96",
+                     profit="🟢 +$1.00 (+10.0%)"),
+                 stellar(3, "1.66.10", "$8.00", my_price="15.96", stock=UNPROFITABLE_LABEL,
+                         profit=profit_text(15.96, 8.00))]))
+check("no tick: skipped", d.action, "skip")
+check("...its stale P is refreshed", writes_of(d, "profit"), [(2, profit_text(15.96, 10.00))])
+check("...and nothing else: no tick, no price, no Q, no colour",
+      (but_p(d), d.colours), ([], []))
+
+print("\n-- the U-unreadable skip refreshes P too --")
+# A ticked row whose U cannot be read, and a cheaper rival: the switch is
+# refused (moving the tick would take the SKU off the site), but its P is not
+# left stale for it.
+rows = [dog(2, "1.66.10", "$10.00", final="—", my_price="15.96", profit="🟢 +$1.00 (+1.0%)"),
+        stellar(3, "1.66.10", "$8.00", my_price="15.96", profit="🟢 +$1.00 (+1.0%)")]
+d = only(decide(rows))
+check("U unreadable on the ticked row: skipped", d.action, "skip")
+check("...and both rows' P brought up to date",
+      writes_of(d, "profit"), [(2, profit_text(15.96, 10.00)), (3, profit_text(15.96, 8.00))])
+check("...with nothing else written", (but_p(d), d.colours), ([], []))
+
+
+def settle(rows, ds):
+    """Apply a run's writes to the rows and ask the next run what it would write."""
+    by_row = {r.row: r for r in rows}
+    for d in ds:
+        for row, key, value in d.writes:
+            setattr(by_row[row], key, value)
+    return [w for d in decide(rows) for w in d.writes]
+
+
+print("\n-- a second run writes nothing, whatever the first one did --")
+rows = [dog(2, "1.66.10", "$10.00", my_price="15.96", final="16.99"),
+        stellar(3, "1.66.10", "$8.00", my_price="9.00", profit=profit_text(9.00, 8.00))]
+ds = decide(rows)
+check("a switch (P off the carried S)", (ds[0].action, settle(rows, ds)), ("switch", []))
+rows = [dog(2, "1.66.10", "$10.00", chosen="", my_price="15.96", profit="x"),
+        stellar(3, "1.66.10", "$8.00", my_price="15.96", profit="x")]
+ds = decide(rows)
+check("a skipped SKU", (ds[0].action, settle(rows, ds)), ("skip", []))
+rows = [stellar(400, "3.52.10", "—", chosen=TICK, my_price=6.36, profit="🟢 +$1.00 (+1.0%)")]
+ds = decide(rows)
+check("a one-supplier SKU whose P was cleared", (ds[0].action, settle(rows, ds)), ("solo", []))
+
+print("\n-- a switch held back by --max-switches still refreshes its P --")
+rows = []
+for i, sku in enumerate(("1.1.10", "1.2.10")):
+    rows.append(dog(2 + i * 2, sku, "$10.00", final="16.99", my_price="15.96"))
+    rows.append(stellar(3 + i * 2, sku, "$8.00", my_price="15.96", profit="🟢 +$1.00 (+1.0%)"))
+ds = decide(rows)
+cap_switches(ds, 1)
+check("the second switch is held", [d.action for d in ds], ["switch", "deferred"])
+check("...its tick, prices and colours stay as they were",
+      (but_p(ds[1]), ds[1].colours, ds[1].mirrored), ([], [], 0))
+check("...but its stale P is refreshed against today's S",
+      writes_of(ds[1], "profit"), [(5, profit_text(15.96, 8.00))])
+
+print("\n-- main(): one-supplier SKUs are counted apart --")
+import contextlib as _cl, io as _io
+import choose_supplier as _cs
+_hdr = [""] * 23
+for _k, _i in {"code": 0, "gb": 2, "source": 3, "validity": 5, "price": 6, "changed": 9,
+               "profit": 15, "stock": 16, "my_price": 18, "fee": 19, "final": 20,
+               "discount": 21, "chosen": 22}.items():
+    _hdr[_i] = _cs.COLUMN_KEYS[_k]
+
+
+def _line(sku, src, price, s, final, tick, profit=""):
+    r = [""] * 23
+    r[0], r[2], r[3], r[5], r[6] = sku, "10gb", src, "30d", price
+    r[15], r[18], r[20], r[22] = profit, s, final, tick
+    return r
+
+
+_values = [_hdr,
+           _line("1.1.10", "esim.dog", "$3.08", 5.40, 5.99, TICK, profit_text(5.40, 3.08)),
+           _line("1.1.10", "Stellar", "$3.06", 5.40, 5.99, "", profit_text(5.40, 3.06)),
+           _line("3.52.10", "Stellar", "$7.09", 6.36, 6.99, TICK, "🟢 +$1.00 (+1.0%)")]
+_real = (_cs.sheets_service, _cs.read_sheet)
+_cs.sheets_service, _cs.read_sheet = (lambda *a, **k: None), (lambda svc: _values)
+_out = _io.StringIO()
+try:
+    with _cl.redirect_stdout(_out):
+        _rc = _cs.main([])
+finally:
+    _cs.sheets_service, _cs.read_sheet = _real
+_o = _out.getvalue()
+check("dry run exits 0", _rc, 0)
+check("the header counts two-supplier SKUs only", "1 SKUs with two supplier rows" in _o, True)
+check("...and reports the one-supplier refresh on its own line",
+      "refreshed on 1 one-supplier SKU (1 cell)" in _o, True)
 
 print("\n-- Q's margin word, re-judged on every row of a SKU every run --")
 check("the two words are the scraper's own", PROFIT_MARKS,
@@ -457,10 +624,17 @@ check("a number cell survives every parser on the way",
       eligible(Row(row=2, sku="1.1.1", source="", price="$1.00", validity=30)), True)
 
 
-print("\n-- a skipped SKU never gets a P either --")
-d = only(decide([dog(2, "1.66.10", "$10.00", my_price="15.96"),
-                 stellar(3, "1.66.10", "$5.00", chosen=TICK)]))
-check("skipped means skipped", d.writes, [])
+print("\n-- two ticks: skipped, and only a stale P moves --")
+# Until 2026-10-04 a skipped SKU had not one cell written. It still has no
+# tick, price, colour or Q written — but a P that no longer matches its row is
+# refreshed, because P decides nothing and a stale one misleads the owner.
+d = only(decide([dog(2, "1.66.10", "$10.00", my_price="15.96", profit="🟢 +$9.99 (+99.9%)"),
+                 stellar(3, "1.66.10", "$5.00", chosen=TICK, my_price="15.96",
+                         profit=profit_text(15.96, 5.00))]))
+check("two ticks is still a skip", d.action, "skip")
+check("...the stale P on the esim.dog row is refreshed",
+      writes_of(d, "profit"), [(2, profit_text(15.96, 10.00))])
+check("...and nothing else is written", (but_p(d), d.colours), ([], []))
 
 
 print("\n-- a BLANK \u05de\u05e7\u05d5\u05e8 is esim.dog, exactly as every other reader says --")
@@ -582,9 +756,9 @@ def twin(**stellar_kw):
     """A ticked, priced esim.dog row and a Stellar row 0.6% cheaper.
 
     Under the 1% gate, so nothing switches and no P is due (both rows already
-    hold one): whatever this SKU writes, the mirror wrote it.
+    hold the right one for S 15.96): whatever this SKU writes, the mirror wrote it.
     """
-    stellar_kw.setdefault("profit", "\U0001f7e2 +$2.34 (+76.5%)")
+    stellar_kw.setdefault("profit", profit_text(15.96, 3.06))
     return [dog(2, "1.66.10", "$3.08", my_price="15.96", fee="1.2",
                 final="16.99", discount="10%"),
             stellar(3, "1.66.10", "$3.06", **stellar_kw)]
@@ -641,14 +815,16 @@ check("...and P is never one of the mirrored keys", "profit" in CARRY, False)
 print("\n-- no readable U on the chosen row: the SKU is skipped whole --")
 d = only(decide([dog(2, "1.66.10", "$3.08", final="—", profit="x"),
                  stellar(3, "1.66.10", "$3.06", profit="x")]))
-check("an unreadable U mirrors nothing", d.writes, [])
+check("an unreadable U mirrors nothing", but_p(d), [])
+check("...while P follows each row's OWN S: the twin has none, so it is cleared",
+      writes_of(d, "profit"), [(2, profit_text(5.40, 3.08)), (3, "")])
 check("...and says which cell to look at", "U unreadable" in d.mirror_note, True)
 check("...and the SKU is otherwise left exactly as it is", d.action, "keep")
 # On a switch this was already the rule, and it still is.
 d = only(decide([dog(2, "1.66.10", "$10.00", final="", profit="x"),
                  stellar(3, "1.66.10", "$8.00", profit="x")]))
 check("...and on a switch the SKU is skipped, as before",
-      (d.action, d.writes, d.mirrored), ("skip", [], 0))
+      (d.action, but_p(d), d.mirrored), ("skip", [], 0))
 d = only(decide([dog(2, "1.66.10", "$10.00"), stellar(3, "1.66.10", "$5.00", chosen=TICK)]))
 check("an ambiguous SKU mirrors nothing either", (d.writes, d.mirrored), ([], 0))
 
@@ -659,7 +835,9 @@ print("\n-- no tick at all: nothing is mirrored and nothing is invented --")
 # meant to sell.
 d = only(decide([dog(2, "2.49.50", "$10.00", chosen="", final="18.99", profit="x"),
                  stellar(3, "2.49.50", "$9.95", profit="x")]))
-check("a SKU with no tick writes nothing", d.writes, [])
+check("a SKU with no tick writes nothing but its P", but_p(d), [])
+check("...and that P is off each row's own numbers",
+      writes_of(d, "profit"), [(2, profit_text(5.40, 10.00)), (3, "")])
 check("...mirrors nothing", d.mirrored, 0)
 check("...and no tick is invented", writes_of(d, "chosen"), [])
 check("...and the log names the missing tick", TICK in (d.reason + d.mirror_note), True)
@@ -670,14 +848,14 @@ print("\n-- a blank source is not automatically the other half of a twin --")
 d = only(decide([dog(2, "1.66.10", "$3.08", final="16.99", my_price="15.96", profit="x"),
                  Row(row=3, sku="1.66.10", source="", price="$3.06",
                      validity="30d", profit="x")]))
-check("a blank-source duplicate under a one-supplier SKU is left alone", d.writes, [])
+check("a blank-source duplicate under a one-supplier SKU is left alone", but_p(d), [])
 # Opposite a Stellar row it IS the other half, and it is filled in.
 d = only(decide([stellar(2, "1.66.10", "$3.08", chosen=TICK, final="16.99",
                          my_price="15.96", profit="x"),
                  Row(row=3, sku="1.66.10", source="", price="$3.06",
                      validity="30d", profit="x")]))
 check("a blank source opposite Stellar is a real twin, and is filled",
-      d.writes, [(3, "final", "16.99"), (3, "my_price", "15.96")])
+      but_p(d), [(3, "final", "16.99"), (3, "my_price", "15.96")])
 
 print("\n-- on a switch: the winner is carried, the rest are mirrored --")
 d = only(decide([dog(2, "1.0B.10", "$10.00", my_price="15.96", fee="1.2",
@@ -721,7 +899,7 @@ d = only(decide([dog(2, "1.66.10", "$3.08", my_price=15.96, fee=1.2, final=16.99
                      discount="10%"),
                  stellar(3, "1.66.10", "$3.06", my_price=15.96, fee=1.2,
                          final="16.99", discount="10%", profit="x")]))
-check("the text of a number is rewritten as the number", d.writes, [(3, "final", 16.99)])
+check("the text of a number is rewritten as the number", but_p(d), [(3, "final", 16.99)])
 
 print("\n-- mirror_of on its own --")
 chosen = dog(2, "1.66.10", "$3.08", final="16.99", my_price="15.96")

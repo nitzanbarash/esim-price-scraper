@@ -45,7 +45,8 @@ Who the incumbent is
 --------------------
 The tick, if there is exactly one. Two ticks is not a single answer, and the
 SKU is SKIPPED and logged. A guess here moves real money to the wrong supplier;
-a skip only leaves the sheet as the owner last had it.
+a skip only leaves the sheet as the owner last had it — tick, prices, colours
+and Q; only the display-only profit figure P is kept current (below).
 
 NO tick at all is not a gap to fill — since 2026-09-17 the tick IS the listing
 (memory: tick-is-the-listing): the sync hides a SKU whose rows carry no tick,
@@ -53,7 +54,7 @@ so a row with no tick is a package the owner has taken OFF THE SITE, and the
 chooser must not put it back. It used to treat the esim.dog row as the
 incumbent and write a tick onto whichever rival beat it; that would have
 re-listed a delisted package within four hours, every time. Such a SKU is now
-skipped whole, and the log says why.
+skipped the same way (P alone refreshed), and the log says why.
 
 What a switch writes, in one batchUpdate so the row can never be half-switched:
     W   the tick on the winner, cleared on every other row of the SKU
@@ -76,11 +77,26 @@ What a switch writes, in one batchUpdate so the row can never be half-switched:
         leave the same stripe. X and beyond are never touched: the free columns
         and then the reference blocks live there (memory: price-sheet-column-tail).
 
-And on EVERY multi-row SKU, switch or no switch, P (רווח (כדאיות)) is filled in
-wherever it is blank — the Stellar rows have always been blank there, so the
-owner has never been able to compare the two rows on the one number that matters.
-It is written in the scraper's own format, off the SKU's מחיר שלי, and only
-where that price exists.
+And on EVERY row of EVERY SKU, switch or no switch, P (רווח (כדאיות)) is kept
+CURRENT: recomputed each run against the row's own cost and written only where
+the number changed. Until 2026-10-04 it was filled only where BLANK, so a
+Stellar row's P stood still while stellar_prices.py moved its cost every four
+hours — 131 of 351 profit figures were stale, and the only thing that ever
+refreshed one was the owner typing a price (applyFee_). The S it is computed
+against is the one the row will HOLD when this run finishes (after the carry
+and the mirror), which is also what the scraper and applyFee_ read off the row,
+so the three writers agree and a run after any of them writes nothing. Two
+known exceptions, both a single extra write and neither on the sheet today:
+an EXACT rounding tie (applyFee_'s JS toFixed rounds 6.25% up, Python's format
+rounds it to even — the chooser's figure wins one cell later), and a display
+format on S with fewer than two decimals (the scraper reads S FORMATTED, the
+chooser raw). With no
+cost or no S the row has no profit to show, and P is cleared, exactly as
+applyFee_ clears it. P is display only: refreshing it moves no tick and takes
+nothing off sale, so it is the ONE thing written on a SKU that is otherwise
+skipped, and on a SKU with only ONE supplier row (Mexico, Morocco, the 75 and
+100GB plans) — where, by the owner's choice (2026-10-04), nothing else is
+judged: no tick, no mirror, no margin word in Q.
 
 THE MIRROR, also on every run, switch or no switch
 --------------------------------------------------
@@ -103,8 +119,8 @@ Three things the mirror will not do:
       has only ONE supplier. A blank מקור reads as esim.dog, so that row is a
       duplicate line, not the other half of a twin.
 
-P is never mirrored — it is RECOMPUTED per row, off the SKU's own מחיר שלי and
-that row's OWN cost, exactly as it always was. Two suppliers cost different
+P is never mirrored — it is RECOMPUTED per row, off the SKU's own מחיר שלי (the
+S the mirror leaves on that row) and that row's OWN cost. Two suppliers cost different
 money, so one P copied onto both rows would be a lie on one of them.
 
 THE MARGIN WORD IN Q, also on every run, on every row of a multi-row SKU
@@ -405,6 +421,26 @@ def profit_text(my_price: float, cost: float) -> str:
     return f"{emoji} {sign}${abs(profit_abs):.2f} ({sign}{abs(profit_pct):.1f}%)"
 
 
+def profit_writes(group: list[Row], pending: list) -> list:
+    """The P writes that bring every row of one SKU up to date — none when P
+    already says the right thing, so a second run writes nothing.
+
+    `pending` is what this run is already writing on the SKU (a switch's carry,
+    the mirror): P is computed against the S each row will HOLD when the run
+    finishes, not the S it holds as it was read. That is what makes P agree
+    with the scraper's and applyFee_'s, both of which read S off the row.
+    """
+    after = {row: value for row, key, value in pending if key == "my_price"}
+    out = []
+    for r in group:
+        mine = price_num(after.get(r.row, r.my_price))
+        cost = usd(r.price)
+        want = profit_text(mine, cost) if (mine and cost) else ""
+        if not same_cell(want, r.profit):
+            out.append((r.row, "profit", want))
+    return out
+
+
 def money(v: Optional[float]) -> str:
     """A cost, for a human. A side with NO price reads '—', never '$0.00': the
     two say opposite things, and '$0.00' says the wrong one — free."""
@@ -488,7 +524,7 @@ def switch_note(old: Row, new: Row) -> str:
 @dataclass
 class Decision:
     sku: str
-    action: str = "keep"            # 'switch' | 'keep' | 'skip' | 'deferred'
+    action: str = "keep"            # 'switch' | 'keep' | 'skip' | 'deferred' | 'solo'
     reason: str = ""
     incumbent: Optional[Row] = None
     winner: Optional[Row] = None
@@ -501,6 +537,8 @@ class Decision:
                                     # reason is a rule and not just "already
                                     # matches" — the owner has to be told
     judged: int = 0                 # Q margin words written or cleared this run
+    group: list = field(default_factory=list, repr=False)   # the rows, as read — so a
+                                    # deferred switch can still refresh its P
 
     @property
     def old_cost(self) -> Optional[float]:
@@ -528,11 +566,12 @@ def _incumbent(rows: list[Row]) -> tuple[Optional[Row], str]:
         return None, f"{len(ticked)} rows ticked in נבחר"
     if ticked:
         return ticked[0], ""
-    return None, f"no {TICK} on any row — the SKU is off the site; left alone"
+    return None, f"no {TICK} on any row — the SKU is off the site; left alone (P only)"
 
 
 def decide(rows: list[Row]) -> list[Decision]:
-    """Pure: rows in, one Decision per multi-row SKU out. No sheet, no network."""
+    """Pure: rows in, Decisions out — one per multi-row SKU, plus a 'solo' one
+    for each one-supplier SKU whose P needs refreshing. No sheet, no network."""
     groups: dict[str, list[Row]] = {}
     for r in rows:
         sku = (r.sku or "").strip()
@@ -542,11 +581,21 @@ def decide(rows: list[Row]) -> list[Decision]:
     out: list[Decision] = []
     for sku, group in groups.items():
         if len(group) < 2:
-            continue                       # one supplier: nothing to choose
+            # One supplier: nothing to choose and nothing to mirror. Q is not
+            # judged here either — the owner chose (2026-10-04) to keep the
+            # call to take a one-supplier package off sale for himself. Only
+            # its profit figure is kept current.
+            refresh = profit_writes(group, [])
+            if refresh:
+                out.append(Decision(sku=sku, action="solo", writes=refresh))
+            continue
         inc, why = _incumbent(group)
         if inc is None:
-            out.append(Decision(sku=sku, action="skip", reason=why))
-            continue                       # and NOT one cell of this SKU is touched
+            # Not one tick, colour, price or Q word of this SKU is touched —
+            # only P, which is display and decides nothing.
+            out.append(Decision(sku=sku, action="skip", reason=why,
+                                writes=profit_writes(group, [])))
+            continue
 
         others = [r for r in group if r is not inc]
         rivals = [r for r in others if eligible(r)]
@@ -576,7 +625,7 @@ def decide(rows: list[Row]) -> list[Decision]:
                 if usd(winner.price) >= floor:
                     reason = f"incumbent {dark}, rival {reason} and pays"
 
-        d = Decision(sku=sku, incumbent=inc, winner=winner, reason=reason)
+        d = Decision(sku=sku, incumbent=inc, winner=winner, reason=reason, group=group)
         carried: dict = {}          # what a switch hands the winner this run
         if winner is not inc:
             # The carry gate, read BEFORE anything is written. U is the price
@@ -591,7 +640,8 @@ def decide(rows: list[Row]) -> list[Decision]:
                 out.append(Decision(
                     sku=sku, action="skip", incumbent=inc,
                     reason=f"U unreadable ({seen}) — the ticked row has no "
-                           f"customer price to carry"))
+                           f"customer price to carry",
+                    writes=profit_writes(group, [])))
                 continue
             d.action = "switch"
             if text(winner.chosen).strip() != TICK:
@@ -624,18 +674,17 @@ def decide(rows: list[Row]) -> list[Decision]:
             d.mirror_note = (f"no {TICK} in נבחר — nothing "
                              f"is mirrored until one row is chosen")
 
-        # P, on every multi-row SKU: the Stellar rows have never had one.
-        # NOT mirrored, and never copied off the chosen row: it is recomputed
-        # from the SKU's own מחיר שלי against THIS row's cost, because the two
-        # suppliers are not paid the same money for the same package.
-        if mine is not None:
-            for r in group:
-                cost = usd(r.price)
-                if not text(r.profit).strip() and cost:
-                    d.writes.append((r.row, "profit", profit_text(mine, cost)))
+        # P on every row, kept current — AFTER the carry and the mirror, so it
+        # is computed against the S each row will hold when the run ends.
+        # NOT mirrored, and never copied off the chosen row: each row against
+        # its OWN cost, because the two suppliers are not paid the same money
+        # for the same package.
+        d.writes.extend(profit_writes(group, d.writes))
 
-        # Q's margin word, on every row of the SKU, off the same two inputs P
-        # is: the ticked row's verdict is what the site shows as sold out, and
+        # Q's margin word, on every row of the SKU, off the SKU's מחיר שלי (the
+        # ticked row's — which is every row's S once the mirror has run; P uses
+        # each row's own S, so the two differ only where the mirror declined):
+        # the ticked row's verdict is what the site shows as sold out, and
         # the other row's is what the next switch will inherit. Both stay
         # fresh here because nothing else refreshes a Stellar row's.
         for r in group:
@@ -652,7 +701,9 @@ def cap_switches(decisions: list[Decision], limit: int) -> int:
     left. limit <= 0 is unlimited and changes nothing.
 
     A deferred SKU is not a half-switch: every write and every colour it had is
-    dropped, so the sheet keeps the state the owner last had for it. The order
+    dropped, so the sheet keeps the state the owner last had for it — except P,
+    which is display only and is recomputed against the S the rows hold NOW
+    (no carry, no mirror), so a held switch does not leave a stale figure. The order
     is the sheet's own, top to bottom, so a phased run walks down the sheet.
     """
     if limit <= 0:
@@ -665,7 +716,7 @@ def cap_switches(decisions: list[Decision], limit: int) -> int:
             done += 1
             continue
         d.action = "deferred"
-        d.writes = []            # including this SKU's רווח fills: all or nothing
+        d.writes = profit_writes(d.group, [])   # P only, against today's S
         d.colours = []
         d.mirrored = 0           # and its mirror: the row it would copy FROM is
         d.mirror_note = ""       # the one this run is no longer going to choose
@@ -821,17 +872,19 @@ _MARK = {"switch": "\u2194", "keep": " ", "deferred": "\u23f8"}
 
 
 def _describe(d: Decision) -> str:
+    profits = sum(1 for _, key, _ in d.writes if key == "profit")
+    p_tail = f"   [+{profits} P]" if profits else ""
     if d.action == "skip":
-        return f"  {d.sku:<10} \u23ed  SKIPPED \u2014 {d.reason}"
+        return f"  {d.sku:<10} \u23ed  SKIPPED \u2014 {d.reason}{p_tail}"
+    if d.action == "solo":
+        return f"  {d.sku:<10} \u00b7  one supplier \u2014 P only{p_tail}"
     inc, win = d.incumbent, d.winner
     head = (f"  {d.sku:<10} {_MARK[d.action]} {source_of(inc):<9} {money(d.old_cost):>8}"
             f"  \u2192  {source_of(win):<9} {money(d.new_cost):>8}")
-    profits = sum(1 for _, key, _ in d.writes if key == "profit")
     tail = f"   {d.reason}" if d.reason else ""
     if d.action == "deferred":
         tail += "   [held by --max-switches]"
-    if profits:
-        tail += f"   [+{profits} P]"
+    tail += p_tail
     if d.mirrored:
         tail += f"   [⇉{d.mirrored} mirrored]"
     if d.mirror_note:
@@ -873,7 +926,8 @@ def main(argv=None) -> int:
 
     decisions = decide(rows)
     left = cap_switches(decisions, a.max_switches)
-    print(f"\U0001f4cb {len(rows)} rows, {len(decisions)} SKUs with two supplier rows "
+    solo = [d for d in decisions if d.action == "solo"]
+    print(f"\U0001f4cb {len(rows)} rows, {len(decisions) - len(solo)} SKUs with two supplier rows "
           f"(tolerance {day_policy.DAY_TOL * 100:.0f}%)\n")
     for d in decisions:
         print(_describe(d))
@@ -883,12 +937,17 @@ def main(argv=None) -> int:
     skipped = [d for d in decisions if d.action == "skip"]
     cells = sum(len(d.writes) for d in decisions)
     profits = sum(1 for d in decisions for _, key, _ in d.writes if key == "profit")
+    solo_p = sum(len(d.writes) for d in solo)
     mirrored = sum(d.mirrored for d in decisions)
     mirror_skus = sum(1 for d in decisions if d.mirrored)
     judged = sum(d.judged for d in decisions)
     print(f"\n\U0001f4ca switched {len(switched)} / kept {len(kept)} / skipped {len(skipped)}"
           f" | {cells} cells ({profits} of them \u05e8\u05d5\u05d5\u05d7, {judged} of them "
           f"Q) | {sum(len(d.colours) for d in decisions)} rows recoloured")
+    if solo:
+        print(f"\U0001f4b2 \u05e8\u05d5\u05d5\u05d7 refreshed on {len(solo)} one-supplier SKU"
+              f"{'' if len(solo) == 1 else 's'} ({solo_p} cell{'' if solo_p == 1 else 's'})"
+              f" \u2014 nothing else on them is touched")
     # The mirror is counted on its own line: it is not a switch, it moves no
     # money between suppliers, and on a quiet day it is the only thing the run
     # does. Zero here means every row of every SKU already quotes the SKU price.
@@ -902,7 +961,7 @@ def main(argv=None) -> int:
         print(f"\u23f8  --max-switches {a.max_switches}: {left} more switch"
               f"{'es' if left != 1 else ''} left for a later run, untouched")
     for d in skipped:
-        print(f"   \u23ed  {d.sku}: {d.reason} \u2014 left exactly as it is")
+        print(f"   \u23ed  {d.sku}: {d.reason} \u2014 tick, prices and Q left exactly as they are")
 
     if not a.apply:
         print("\n(dry run \u2014 nothing written; add --apply to write)")
