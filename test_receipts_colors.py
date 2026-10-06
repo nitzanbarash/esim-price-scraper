@@ -3,7 +3,10 @@ import unittest
 
 import receipts_colors as rc
 
-HEADER = ["מייל - Mail"] + [""] * 20 + [rc.COL_SOURCE, "", rc.COL_BUY, rc.COL_SALE, rc.COL_SELL]
+# The real tab's shape: usage in E, source in V, buy/sale/sell in X/Y/Z.
+HEADER = (["מייל - Mail", "", "", "", rc.COL_USAGE] + [""] * 16
+          + [rc.COL_SOURCE, "", rc.COL_BUY, rc.COL_SALE, rc.COL_SELL])
+USAGE_ORDER = [rc.USAGE_GREY, rc.USAGE_BLUE, rc.USAGE_RED, rc.USAGE_YELLOW, rc.USAGE_GREEN]
 
 
 def sheet(rules=()):
@@ -67,6 +70,102 @@ class Colors(unittest.TestCase):
     def test_missing_column_changes_nothing(self):
         with self.assertRaises(SystemExit):
             rc.desired_rules(HEADER[:-1], [], 0, 993)
+        with self.assertRaises(SystemExit):
+            rc.desired_rules([h for h in HEADER if h != rc.COL_USAGE], [], 0, 993)
+
+
+class Usage(unittest.TestCase):
+    """The 'GB (0/X) - ניצול' bands. The sheet evaluates the formulas; here the
+    Python twin (usage_band) stands in for them, and the rules themselves are
+    checked for range, colour, order and the shape that keeps them from erroring."""
+
+    def band(self, text):
+        return rc.usage_band(text)
+
+    def test_each_band_on_the_owner_s_own_cells(self):
+        self.assertEqual(self.band("0 / 10"), rc.USAGE_GREY)
+        self.assertEqual(self.band("3.407 / 10"), rc.USAGE_GREEN)
+        self.assertEqual(self.band("5.562 / 10"), rc.USAGE_YELLOW)
+        self.assertEqual(self.band("9.626 / 10"), rc.USAGE_RED)
+        self.assertEqual(self.band("10 / 10"), rc.USAGE_BLUE)
+
+    def test_band_edges(self):
+        self.assertEqual(self.band("0.0 / 5"), rc.USAGE_GREY)          # a decimal zero is zero
+        self.assertEqual(self.band("0.029 / 10"), rc.USAGE_GREEN)      # anything used is green
+        self.assertEqual(self.band("5 / 10"), rc.USAGE_GREEN)          # exactly 50% is still green
+        self.assertEqual(self.band("5.001 / 10"), rc.USAGE_YELLOW)
+        self.assertEqual(self.band("8 / 10"), rc.USAGE_YELLOW)         # exactly 80% is still yellow
+        self.assertEqual(self.band("4 / 5"), rc.USAGE_YELLOW)
+        self.assertEqual(self.band("8.001 / 10"), rc.USAGE_RED)
+        self.assertEqual(self.band("9.999 / 10"), rc.USAGE_RED)
+        self.assertEqual(self.band("10.486 / 10.486"), rc.USAGE_BLUE)  # finished, decimal total
+        self.assertEqual(self.band("11 / 10"), rc.USAGE_BLUE)          # over the top is finished too
+
+    def test_spacing_is_tolerated(self):
+        for text in ("3.4/10", " 3.4 /10", "3.4/ 10 ", "  3.4  /  10  "):
+            self.assertEqual(self.band(text), rc.USAGE_GREEN, text)
+        self.assertEqual(self.band("10/10"), rc.USAGE_BLUE)
+        self.assertEqual(self.band(" 0 /10"), rc.USAGE_GREY)
+
+    def test_zero_total_is_grey_never_blue_and_never_divides(self):
+        self.assertEqual(self.band("0 / 0"), rc.USAGE_GREY)
+        self.assertIsNone(self.band("3 / 0"))     # garbage: no band, no error
+
+    def test_blank_and_garbage_get_no_band(self):
+        for text in ("", None, "   ", "abc", "10", "10GB", "/ 10", "3 /", "n/a", "1,5 / 10",
+                     "3.4 / 10 / 2", "-3 / 10"):
+            self.assertIsNone(self.band(text), repr(text))
+
+    def test_rules_range_colour_and_order(self):
+        rules = [r for r in rc.desired_rules(HEADER, [], 0, 993)
+                 if r["ranges"][0]["startColumnIndex"] == 4]
+        self.assertEqual([rc._hex(r["booleanRule"]["format"]["backgroundColor"]) for r in rules],
+                         USAGE_ORDER)
+        for r in rules:
+            self.assertEqual(r["ranges"][0], {"sheetId": 0, "startRowIndex": 1, "endRowIndex": 993,
+                                              "startColumnIndex": 4, "endColumnIndex": 5})
+            cond = r["booleanRule"]["condition"]
+            self.assertEqual(cond["type"], "CUSTOM_FORMULA")
+            f = cond["values"][0]["userEnteredValue"]
+            self.assertTrue(f.startswith("=IFERROR(AND(") and f.endswith(",FALSE)"), f)
+            self.assertIn("$E2", f)
+            self.assertIn("REGEXEXTRACT(TO_TEXT($E2)", f)
+            self.assertNotIn("/VALUE", f)         # compared by product, never divided
+            self.assertNotIn("backgroundColor", str(r["booleanRule"]["format"].get("textFormat")))
+        # The formulas read with the same regexes the twin reads with.
+        for f in (rules[0]["booleanRule"]["condition"]["values"][0]["userEnteredValue"],):
+            self.assertIn(rc.USED_RE, f)
+            self.assertIn(rc.TOTAL_RE, f)
+        self.assertEqual([c for _, c in rc.usage_formulas("$E2")], USAGE_ORDER)
+
+    def test_rules_follow_the_header(self):
+        moved = HEADER[:]
+        moved.insert(0, "new")              # the owner inserts a column: E -> F
+        rules = [r for r in rc.desired_rules(moved, [], 0, 993)
+                 if r["ranges"][0]["startColumnIndex"] == 5]
+        self.assertEqual(len(rules), 5)
+        for r in rules:
+            self.assertIn("$F2", r["booleanRule"]["condition"]["values"][0]["userEnteredValue"])
+
+    def test_usage_rules_are_added_beside_the_existing_ten(self):
+        # The sheet as it stood on 2026-10-06: three Status rules the owner
+        # made, then this script's two on V and five on Z. The usage rules
+        # must ADD to those, and a second run must then write nothing.
+        status = [dict(STATUS_RULE) for _ in range(3)]
+        ours = [r for r in rc.desired_rules(HEADER, ["esim.dog", "Stellar"], 0, 993)
+                if r["ranges"][0]["startColumnIndex"] in (21, 25)]
+        self.assertEqual(len(ours), 7)
+        have = status + ours
+        reqs = rc.plan(sheet(have), HEADER, ["esim.dog", "Stellar"])
+        dels = [q["deleteConditionalFormatRule"]["index"] for q in reqs
+                if "deleteConditionalFormatRule" in q]
+        self.assertTrue(all(i >= 3 for i in dels), dels)          # Status rules untouched
+        adds = [q["addConditionalFormatRule"]["rule"] for q in reqs if "addConditionalFormatRule" in q]
+        self.assertEqual(len(adds), 12)
+        self.assertEqual(sum(1 for r in adds if r["ranges"][0]["startColumnIndex"] == 4), 5)
+        applied = status + adds
+        self.assertEqual(len(applied), 15)
+        self.assertEqual(rc.plan(sheet(applied), HEADER, ["esim.dog", "Stellar"]), [])
 
 
 if __name__ == "__main__":

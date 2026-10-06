@@ -46,7 +46,8 @@ jobs:
         run: python usage_bot.py
 
       # The receipts sheet's colour rules (supplier word colour in
-      # 'מקור - source', paid/discount/free fill in 'מכירה - Sell'). Writes
+      # 'מקור - source', paid/discount/free fill in 'מכירה - Sell', the
+      # grey/green/yellow/red/blue usage bands in 'GB (0/X) - ניצול'). Writes
       # nothing when they are already in place; a supplier added to the
       # dropdown gets its colour here. Never allowed to fail the usage run.
       - name: Receipts colours

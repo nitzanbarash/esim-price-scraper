@@ -177,6 +177,10 @@ H_REGION, H_PLAN, H_ROUTE = "אזור - Region", "חבילה - Plan", "Route"
 H_STATUS, H_SOURCE = "סטטוס - Status", "מקור - source"
 H_PURCHASE = "רכישה - Purchase"
 H_BUY, H_SALE, H_SELL = "קנייה - Buy", "הנחה - Sale", "מכירה - Sell"
+# The buyer's phone model, as the site hands it on the order ('device'; from
+# 2026-10). Blank until the site carries it; a sheet without the column just
+# skips the cell (append_row).
+H_DEVICE = "דגם טלפון - Device"
 
 # Two columns, two questions. They were one column until 2026-09-10, and the
 # one column answered the wrong one:
@@ -884,7 +888,8 @@ class Run:
                 H_PURCHASE: source_text(o.get("source") or ""),
                 H_BUY: f"{v.wholesale_eur * fx_of(row):.2f}$",
                 H_SELL: (f"{float(o['paid_usd']):.2f}$" if o.get("paid_usd") not in (None, "") else ""),
-                H_SALE: discount_text(o.get("list_usd"), o.get("paid_usd"))}
+                H_SALE: discount_text(o.get("list_usd"), o.get("paid_usd")),
+                H_DEVICE: o.get("device") or ""}
 
         if code in (200, 201, 202) and data.get("id"):
             sid = str(data["id"])

@@ -1,6 +1,8 @@
-"""The receipts sheet's colours: who sold it, and what the customer paid.
+"""The receipts sheet's colours: who sold it, what the customer paid, and
+how much of the package is gone.
 
-Two columns carry a colour the owner reads at a glance (set 2026-09-27):
+Three columns carry a colour the owner reads at a glance (the first two set
+2026-09-27, the usage bands 2026-10-06):
 
   'מקור - source'  the WORD is coloured (no fill), one colour per SUPPLIER —
                    Stellar blue, esim.dog purple, as the owner typed them.
@@ -13,6 +15,11 @@ Two columns carry a colour the owner reads at a glance (set 2026-09-27):
                    darker red = 'refund',
                    blue-grey = sold with a discount ('הנחה - Sale' says N%),
                    green = paid in full.
+  'GB (0/X) - ניצול'  the cell is FILLED by how much of "used / total" is gone:
+                   grey = untouched (0), green = up to half, yellow = past
+                   half, red = past 80%, blue = finished (used >= total).
+                   These are the bands the owner painted by hand until now;
+                   usage_band() below is the same rule in Python.
 
 They are conditional-format rules, not painted cells, so a row is coloured the
 moment ANY writer adds it — the PC bot, the Stellar buyer, a row typed by hand
@@ -20,7 +27,7 @@ moment ANY writer adds it — the PC bot, the Stellar buyer, a row typed by hand
 painted by hand before this existed.
 
 Rules are found by the column's HEADER, because the owner reorders columns.
-This script owns every rule whose range is exactly one of those two columns
+This script owns every rule whose range is exactly one of those three columns
 from row 2 to the grid's last row, and nothing else (the Status column keeps its own rules).
 It is idempotent: when the sheet already matches, it writes nothing.
 
@@ -31,6 +38,7 @@ usage.yml runs it every 4 hours, which is how a new supplier gets its colour.
 """
 
 import json
+import re
 import sys
 
 from fulfillment_bot import RECEIPTS_SHEET_ID, sheet_client
@@ -39,6 +47,7 @@ COL_SOURCE = "מקור - source"
 COL_SELL = "מכירה - Sell"
 COL_BUY = "קנייה - Buy"
 COL_SALE = "הנחה - Sale"
+COL_USAGE = "GB (0/X) - ניצול"
 
 # Text colours. Spelled as the dropdown spells them; matched case-insensitively.
 SUPPLIER_COLORS = {
@@ -54,11 +63,89 @@ RED = "#f4cccc"
 DISCOUNT = "#d0e0e3"
 GREEN = "#d9ead3"
 
+# The usage bands, as the owner painted them. The cell reads "used / total"
+# (usage_bot writes f"{used:g} / {total:g}", stellar_buyer "0 / N" at purchase).
+USAGE_GREY = "#efefef"      # untouched: used == 0
+USAGE_GREEN = GREEN         # used, up to half
+USAGE_YELLOW = "#fff2cc"    # past half, up to 80%
+USAGE_RED = RED             # past 80%, not finished
+USAGE_BLUE = "#c9daf8"      # finished: used >= total
+USAGE_HALF, USAGE_HOT = 0.5, 0.8
+# One regex each for the two numbers. Both insist the WHOLE cell is
+# "number / number" (spaces around the slash or not): anything else -- a bare
+# number, words, a second slash -- matches neither and gets no colour. The
+# same two strings drive the Sheets formulas and the Python twin, so the two
+# cannot drift apart.
+_NUM = "[0-9]+(?:\\.[0-9]+)?"
+USED_RE = f"^\\s*({_NUM})\\s*/\\s*{_NUM}\\s*$"
+TOTAL_RE = f"^\\s*{_NUM}\\s*/\\s*({_NUM})\\s*$"
+
 
 def _num(ref: str) -> str:
     """The first number in a cell, whether it holds 6, '6$' or '14.51$'."""
     return ('VALUE(REGEXEXTRACT(SUBSTITUTE(TO_TEXT(%s),",",""),'
             '"[0-9]+(?:\\.[0-9]+)?"))' % ref)
+
+
+def _used(ref: str) -> str:
+    """The number before the slash of a 'used / total' cell (an error otherwise)."""
+    return 'VALUE(REGEXEXTRACT(TO_TEXT(%s),"%s"))' % (ref, USED_RE)
+
+
+def _total(ref: str) -> str:
+    """The number after the slash of a 'used / total' cell (an error otherwise)."""
+    return 'VALUE(REGEXEXTRACT(TO_TEXT(%s),"%s"))' % (ref, TOTAL_RE)
+
+
+def usage_formulas(ref: str) -> list[tuple[str, str]]:
+    """(formula, colour) for the usage column, in the order they are installed.
+
+    Sheets stops at the FIRST rule whose formula is true, but these five do
+    not lean on that: each formula is true for exactly one band and false for
+    the other four, so the colours survive the owner dragging the rules
+    about. The order is still the one a reader expects, from untouched to
+    finished-and-beyond:
+      grey    used = 0           (a 'total' of 0 lands here, never in blue)
+      blue    total > 0, used >= total
+      red     0.8*total < used < total
+      yellow  0.5*total < used <= 0.8*total
+      green   0 < used <= 0.5*total
+    Both numbers must parse, or the whole thing is FALSE: a blank cell, a bare
+    number, or words raise inside REGEXEXTRACT and IFERROR swallows that.
+    Percentages are compared as used > total*k, never used/total > k, so a
+    zero total divides nothing and an exact 50% or 80% ('5 / 10', '8 / 10')
+    is the lower band, as the owner reads it.
+    """
+    u, t = _used(ref), _total(ref)
+    return [
+        (f"=IFERROR(AND({u}=0,{t}>=0),FALSE)", USAGE_GREY),
+        (f"=IFERROR(AND({t}>0,{u}>={t}),FALSE)", USAGE_BLUE),
+        (f"=IFERROR(AND({u}>{t}*{USAGE_HOT},{u}<{t}),FALSE)", USAGE_RED),
+        (f"=IFERROR(AND({u}>{t}*{USAGE_HALF},{u}<={t}*{USAGE_HOT}),FALSE)", USAGE_YELLOW),
+        (f"=IFERROR(AND({u}>0,{u}<={t}*{USAGE_HALF}),FALSE)", USAGE_GREEN),
+    ]
+
+
+def usage_band(text) -> str | None:
+    """The colour the Sheets rules give a usage cell, computed here: the same
+    two regexes, the same comparisons in the same order. None = no band (a
+    blank, a bare number, words, or 'used' with a total of 0)."""
+    cell = "" if text is None else str(text)
+    mu, mt = re.search(USED_RE, cell), re.search(TOTAL_RE, cell)
+    if not mu or not mt:
+        return None
+    u, t = float(mu.group(1)), float(mt.group(1))
+    if u == 0 and t >= 0:
+        return USAGE_GREY
+    if t > 0 and u >= t:
+        return USAGE_BLUE
+    if u > t * USAGE_HOT and u < t:
+        return USAGE_RED
+    if u > t * USAGE_HALF and u <= t * USAGE_HOT:
+        return USAGE_YELLOW
+    if u > 0 and u <= t * USAGE_HALF:
+        return USAGE_GREEN
+    return None
 
 
 def _rgb(hexcolor: str) -> dict:
@@ -101,11 +188,11 @@ def desired_rules(header: list[str], dropdown: list[str], sheet_id: int,
                   rows: int) -> list[dict]:
     """The rules, in priority order (the first one that matches a cell wins)."""
     col = {h: i for i, h in enumerate(header)}
-    missing = [c for c in (COL_SOURCE, COL_SELL, COL_BUY, COL_SALE) if c not in col]
+    missing = [c for c in (COL_SOURCE, COL_SELL, COL_BUY, COL_SALE, COL_USAGE) if c not in col]
     if missing:
         raise SystemExit(f"receipts sheet has no column {missing} — nothing changed")
-    src, sell, buy, sale = (col[c] for c in (COL_SOURCE, COL_SELL, COL_BUY, COL_SALE))
-    V, Z, X, Y = ("$%s2" % _letter(i) for i in (src, sell, buy, sale))
+    src, sell, buy, sale, use = (col[c] for c in (COL_SOURCE, COL_SELL, COL_BUY, COL_SALE, COL_USAGE))
+    V, Z, X, Y, E = ("$%s2" % _letter(i) for i in (src, sell, buy, sale, use))
 
     def rule(column, formula, color, text=False):
         fmt = ({"textFormat": {"foregroundColor": _rgb(color)}} if text
@@ -132,6 +219,7 @@ def desired_rules(header: list[str], dropdown: list[str], sheet_id: int,
                    f'TO_TEXT({Y}),"^\\s*([0-9]+(?:\\.[0-9]+)?)\\s*%"))>0,FALSE))', DISCOUNT),
         rule(sell, f"=IFERROR({_num(Z)}>0,FALSE)", GREEN),
     ]
+    rules += [rule(use, formula, color) for formula, color in usage_formulas(E)]
     return rules
 
 

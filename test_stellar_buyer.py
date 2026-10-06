@@ -3,7 +3,7 @@
 Pins the Stellar buyer: which order is placed, under which idempotency key,
 what the site is handed back, and -- above all -- when NOTHING is bought.
 Offline: the site, Stellar and both sheets are faked with their real payload
-shapes (the wholesale OpenAPI 1.6.0, /api/orders, the 25-column receipts tab).
+shapes (the wholesale OpenAPI 1.6.0, /api/orders, the receipts tab's columns).
 
 Run: python test_stellar_buyer.py
 """
@@ -158,7 +158,8 @@ class StellarFake:
 HDR = ["מייל - Mail", "תאריך - Date", 'מק"ט - SUK', "איחסון - GB", "GB (0/X) - ניצול", "מס׳ הזמנה",
        "QR", "Activation Code", "SM-DP+ Address", "", "Link - esim.dog", "Link - waverole",
        "מס סידורי -ICCID", "גישה - APN", "אזור - Region", "חבילה - Plan", "Route", "הופעל - Activated",
-       "סטטוס - Status", "רכישה - Purchase", "מקור - source", "", "קנייה - Buy", "הנחה - Sale", "מכירה - Sell"]
+       "סטטוס - Status", "רכישה - Purchase", "מקור - source", "", "קנייה - Buy", "הנחה - Sale", "מכירה - Sell",
+       "דגם טלפון - Device"]
 
 
 class Ws:
@@ -226,10 +227,13 @@ def token(d=None, gb=10):
     return "https://www.waverole.com/?order=" + base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
 
 
-def order(oid="WR-TEST01", sku="1.62.10", paid=6.99, list_usd=6.99, d=None, source="paypal"):
+def order(oid="WR-TEST01", sku="1.62.10", paid=6.99, list_usd=6.99, d=None, source="paypal",
+          device=""):
+    # 'device' is on the order only when the site knew one: older orders have no key at all.
     return {"order_id": oid, "sku": sku, "customer_email": "buyer@example.com", "paid_usd": paid,
             "ts": "2026-09-10T01:00:00Z", "status": "pending", "order_url": token(d), "source": source,
-            "supplier": "stellar", "list_usd": list_usd, "code": "JC059", "stale_alert_rung": 0}
+            "supplier": "stellar", "list_usd": list_usd, "code": "JC059", "stale_alert_rung": 0,
+            **({"device": device} if device else {})}
 
 
 alerts: list[tuple[str, str]] = []
@@ -1095,6 +1099,16 @@ print("\n   a queue that answers nothing new ends the run quietly")
 site, _, bought, _ = scenario([order()], (f32c := StellarFake()))
 check("the same order is not bought a second time", bought == 1 and len(f32c.creates) == 1)
 
+
+print("\n33. the buyer's phone model rides along into 'דגם טלפון - Device'")
+# The site puts the phone the buyer named at checkout on the order (from
+# 2026-10); the row keeps it beside the eSIM, so a "does not work on my phone"
+# mail is read against the model before the supplier is blamed.
+_, ws33, _, _ = scenario([order(device="iPhone 15 Pro")], StellarFake())
+check("the model is in its column", ws33.col(2, sb.H_DEVICE) == "iPhone 15 Pro", ws33.col(2, sb.H_DEVICE))
+check("...and the row is still a delivered one", ws33.col(2, sb.H_STATUS) == sb.ST_ACTIVE)
+_, ws33b, _, _ = scenario([order()], StellarFake())
+check("an order that names no phone leaves the cell blank", ws33b.col(2, sb.H_DEVICE) == "")
 
 
 # ── summary (last, so it gates the exit code) ────────────────────────────────
