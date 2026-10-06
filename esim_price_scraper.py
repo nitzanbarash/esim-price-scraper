@@ -243,14 +243,24 @@ PROFIT_MIN_PCT_1GB = -20.0   # 1GB plans are a loss leader; a 20% loss is allowe
 # not for sale, and the site sync reads any non-empty stock cell as sold out.
 # The regional bundles (1.0A, 1.0B, 2.0, 2.0B) sell on their own ladder and
 # are not judged by these numbers.
-BUY_CEILINGS = ((30.0, 10.0), (40.0, 14.0), (50.0, 18.0))   # (size from, max buy $)
+# Each band is CLOSED at the next size the owner named: 30 up to 40, 40 up to
+# 50, 50 up to 75. The 75 and 100GB plans (added later, Stellar only) were
+# never given a cap, and an open-ended last band silently handed them the
+# 50GB one — which never bit only because one-supplier SKUs were not judged
+# until 2026-10-06. From 75GB up nothing is judged until the owner names a cap.
+BUY_CEILINGS = ((30.0, 40.0, 10.0), (40.0, 50.0, 14.0), (50.0, 75.0, 18.0))   # (size from, size to, max buy $)
 OVER_CEILING_LABEL = 'לא רווחי — מעל תקרה'
 # Per-SKU exceptions, approved by the owner BY NAME — the discipline of
 # day_policy.DAY_FLOOR_EXCEPTIONS: the ceilings never widen, a SKU is let past
 # them only when the owner said so for that SKU, and the 20% profit floor
 # still judges it. A deleted row takes its exception with it.
 #   5.212.50  Morocco 50GB on Stellar, cost $18.27, sold at 24.99 (2026-10-01)
-CEILING_EXCEPTIONS = frozenset({'5.212.50'})
+#   1.66.40   Thailand 40GB on Stellar, cost $14.13 — 13 cents over the cap at
+#             +40%, ticked and selling. Added 2026-10-06, the day one-supplier
+#             rows started being judged, so that fix would not pull a package
+#             the owner had knowingly left on sale. PENDING the owner's word:
+#             remove this line to let the cap take it off.
+CEILING_EXCEPTIONS = frozenset({'5.212.50', '1.66.40'})
 # The same word waverole_sync.gs applyFee_ writes (UNPROFITABLE) when the
 # owner types a sell price; choose_supplier.py keeps it fresh on twin rows.
 UNPROFITABLE_LABEL = 'לא רווחי'
@@ -365,11 +375,10 @@ def buy_ceiling(gb: Optional[float], code: str = '') -> Optional[float]:
     code = (code or '').strip()
     if gb is None or REGIONAL_CODE_RE.match(code) or code in CEILING_EXCEPTIONS:
         return None
-    ceiling = None
-    for size_from, cap in BUY_CEILINGS:
-        if float(gb) >= size_from:
-            ceiling = cap
-    return ceiling
+    for size_from, size_to, cap in BUY_CEILINGS:
+        if size_from <= float(gb) < size_to:
+            return cap
+    return None
 
 
 def over_ceiling(buy: Optional[float], gb: Optional[float], code: str = '') -> bool:

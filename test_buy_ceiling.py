@@ -30,9 +30,11 @@ def check(label, got, want):
 
 print("-- the ceilings, on their boundaries --")
 for gb, want in ((1, None), (5, None), (10, None), (20, None), (29.9, None),
-                 (30, 10.0), (39, 10.0), (40, 14.0), (49, 14.0), (50, 18.0), (100, 18.0)):
+                 (30, 10.0), (39, 10.0), (40, 14.0), (49, 14.0), (50, 18.0), (74.9, 18.0),
+                 (75, None), (100, None)):
     check(f"ceiling({gb}GB)", buy_ceiling(gb, '2.34.30'), want)
-check("the table itself is what the owner said", BUY_CEILINGS, ((30.0, 10.0), (40.0, 14.0), (50.0, 18.0)))
+check("the table itself is what the owner said", BUY_CEILINGS,
+      ((30.0, 40.0, 10.0), (40.0, 50.0, 14.0), (50.0, 75.0, 18.0)))
 
 print("\n-- over or not --")
 check("Spain 30GB at $11.30 is over", over_ceiling(11.30, 30, '2.34.30'), True)
@@ -43,7 +45,10 @@ check("Romania 40GB at $18.85 is", over_ceiling(18.85, 40, '2.40.40'), True)
 check("Thailand 50GB at $23.49 is", over_ceiling(23.49, 50, '1.66.50'), True)
 
 print("\n-- per-SKU exceptions, by name only --")
-check("the list is exactly what the owner approved", CEILING_EXCEPTIONS, frozenset({'5.212.50'}))
+check("the list is exactly what was approved by name", CEILING_EXCEPTIONS,
+      frozenset({'5.212.50', '1.66.40'}))
+check("Thailand 40GB at $14.13 (13 cents over, +40%, 2026-10-06 — pending the owner's word)",
+      over_ceiling(14.13, 40, '1.66.40'), False)
 check("Morocco 50GB at $18.27 has no ceiling", buy_ceiling(50, '5.212.50'), None)
 check("Morocco 50GB at $18.27 is not over", over_ceiling(18.27, 50, '5.212.50'), False)
 check("padding does not hide the code", over_ceiling(18.27, 50, ' 5.212.50 '), False)

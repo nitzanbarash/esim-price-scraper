@@ -185,4 +185,6 @@ jobs:
         timeout-minutes: 5
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          # The off-sale alert (choose_supplier.mail_live_q_changes); missing = log line only.
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: python choose_supplier.py --apply

@@ -43,8 +43,9 @@ from choose_supplier import (
     CARRY, LAST_COL, LOSER_BG, OVER_CEILING_LABEL, PROFIT_MARKS, TICK,
     UNPROFITABLE_LABEL, WINNER_BG, Row, _entered_value, availability_word,
     cap_switches, decide, eligible, final_usd, gb_of, judge_stock, mirror_of,
-    money, price_num, profit_mark, profit_text, profit_writes, same_cell,
-    source_of, switch_note, usd, usd_outside_parens,
+    live_q_changes, money, price_num, profit_mark, profit_text, profit_writes,
+    same_cell, source_of, switch_note, usd, usd_outside_parens, Decision,
+    _describe,
 )
 
 _fails: list[str] = []
@@ -283,9 +284,11 @@ check("and the cheaper dog row wins it back", d.winner.row, 2)
 check("the note reads Stellar first",
       writes_of(d, "changed"), [(2, "↔ ספק: Stellar → esim.dog ($10.00 → $8.00)")])
 
-print("\n-- a one-supplier SKU is not a choice: untouched --")
-check("Stellar only", decide([stellar(2, "1.66.10", "$5.00")]), [])
-check("esim.dog only", decide([dog(2, "1.66.10", "$5.00")]), [])
+print("\n-- a one-supplier SKU is not a choice: no tick moves, but its live row IS judged --")
+check("Stellar only, unticked: nothing", decide([stellar(2, "1.66.10", "$5.00")]), [])
+check("esim.dog only, ticked, 8% margin: Q says so",
+      only(decide([dog(2, "1.66.10", "$5.00")])).writes, [(2, "stock", UNPROFITABLE_LABEL)])
+check("esim.dog only, ticked, 35% margin: nothing", decide([dog(2, "1.66.10", "$4.00")]), [])
 check("a row with no SKU dot is ignored", decide([dog(2, "header", "$5.00"),
                                                   dog(3, "header", "$4.00")]), [])
 
@@ -396,21 +399,58 @@ check("...and writes nothing when P already says it",
       profit_writes([stellar(3, "1.1.1", "$1.00", my_price="2.00",
                              profit=profit_text(2.00, 1.00))], []), [])
 
-print("\n-- a one-supplier SKU: P kept current, nothing else judged --")
-# Mexico 5GB, Stellar only, on 2026-10-04: cost $4.64 against an S of $3.48.
-# The owner chose to keep the call to take it off sale for himself, so the
-# chooser writes its P and stops: no margin word, no tick, no colour.
+print("\n-- a one-supplier SKU: P kept current, and the LIVE row's margin judged --")
+# Mexico 5GB, Stellar only, 2026-10-04: cost $4.64 against an S of $3.48 — and
+# it stayed on sale for days, because nothing judged a one-supplier Stellar
+# row. Since 2026-10-06 the ticked row gets the word a twin row would.
 mx = stellar(400, "3.52.5", "(€4.13) $4.64", gb=5, chosen=TICK, my_price=3.48,
              final=3.99, profit=profit_text(3.48, 2.32))
 d = only(decide([mx]))
 check("a stale P on a one-supplier SKU is refreshed", d.action, "solo")
-check("...with exactly one write: P", d.writes, [(400, "profit", profit_text(3.48, 4.64))])
-check("...no margin word, though it sells at a loss", writes_of(d, "stock"), [])
+check("...P is written", writes_of(d, "profit"), [(400, profit_text(3.48, 4.64))])
+check("...and the loss gets its word in Q", writes_of(d, "stock"), [(400, UNPROFITABLE_LABEL)])
+check("...counted as judged", d.judged, 1)
 check("...no colour, no tick", (d.colours, writes_of(d, "chosen")), ([], []))
-check("...and it is not counted as a two-supplier SKU",
-      "one supplier" in __import__("choose_supplier")._describe(d), True)
+check("...and it is not counted as a two-supplier SKU", "one supplier" in _describe(d), True)
+check("...the summary line names the word", "[Q 400:" in _describe(d), True)
 mx.profit = profit_text(3.48, 4.64)
+mx.stock = UNPROFITABLE_LABEL
 check("an up-to-date one-supplier SKU produces no decision at all", decide([mx]), [])
+check("the cost falls back under the floor: our word is cleared",
+      only(decide([stellar(400, "3.52.5", "$2.50", gb=5, chosen=TICK, my_price=3.48,
+                           final=3.99, profit=profit_text(3.48, 2.50),
+                           stock=UNPROFITABLE_LABEL)])).writes, [(400, "stock", "")])
+check("a supplier's or the owner's own word in Q is not ours to touch",
+      decide([stellar(400, "3.52.5", "$4.64", gb=5, chosen=TICK, my_price=3.48,
+                      final=3.99, profit=profit_text(3.48, 4.64), stock="לא במלאי")]), [])
+check("a 40GB bought at $14.13: over the $14 cap, whatever the margin",
+      writes_of(only(decide([stellar(401, "2.34.40", "$14.13", gb=40, chosen=TICK,
+                                     my_price=19.80, final=21.99,
+                                     profit=profit_text(19.80, 14.13))])), "stock"),
+      [(401, OVER_CEILING_LABEL)])
+check("100GB has no cap: the floor alone judges it, and +51% clears it",
+      decide([stellar(402, "1.66.100", "$25.20", gb=100, chosen=TICK, my_price=38.00,
+                      final=39.99, profit=profit_text(38.00, 25.20))]), [])
+check("Japan 100GB at a 5% loss: the floor catches it",
+      writes_of(only(decide([stellar(403, "1.81.100", "$39.93", gb=100, chosen=TICK,
+                                     my_price=38.04, final=39.99,
+                                     profit=profit_text(38.04, 39.93))])), "stock"),
+      [(403, UNPROFITABLE_LABEL)])
+
+print("\n-- the off-sale alert lists only rows that END the run ticked --")
+mx = stellar(400, "3.52.5", "$4.64", gb=5, chosen=TICK, my_price=3.48, final=3.99,
+             profit=profit_text(3.48, 4.64))
+ch = live_q_changes(decide([mx]), [mx])
+check("Mexico is in the mail", [(c[0], c[1], c[2], c[5], c[6]) for c in ch],
+      [("3.52.5", 400, "Stellar", "", UNPROFITABLE_LABEL)])
+check("...with its cost and sell price", (ch[0][3], ch[0][4]), (4.64, 3.48))
+fake = Decision(sku="x.1.10", writes=[(2, "chosen", ""), (3, "chosen", TICK),
+                                      (2, "stock", UNPROFITABLE_LABEL),
+                                      (3, "stock", UNPROFITABLE_LABEL)])
+check("after a switch only the newly ticked row counts as live",
+      [c[1] for c in live_q_changes([fake], [dog(2, "x.1.10", "$10.00", chosen=TICK),
+                                              stellar(3, "x.1.10", "$9.00")])], [3])
+check("no changes, no mail", live_q_changes([], [mx]), [])
 gone = stellar(401, "3.52.10", "—", chosen=TICK, my_price=6.36, final=6.99,
                profit=profit_text(6.36, 3.86))
 check("a cost that is no longer there clears P rather than keep a stale profit",
@@ -510,8 +550,8 @@ finally:
 _o = _out.getvalue()
 check("dry run exits 0", _rc, 0)
 check("the header counts two-supplier SKUs only", "1 SKUs with two supplier rows" in _o, True)
-check("...and reports the one-supplier refresh on its own line",
-      "refreshed on 1 one-supplier SKU (1 cell)" in _o, True)
+check("...and reports the one-supplier SKUs on their own line",
+      "one-supplier SKU touched (2 cells: P refreshed, 1 Q word)" in _o, True)
 
 print("\n-- Q's margin word, re-judged on every row of a SKU every run --")
 check("the two words are the scraper's own", PROFIT_MARKS,

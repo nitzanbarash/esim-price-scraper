@@ -94,9 +94,12 @@ chooser raw). With no
 cost or no S the row has no profit to show, and P is cleared, exactly as
 applyFee_ clears it. P is display only: refreshing it moves no tick and takes
 nothing off sale, so it is the ONE thing written on a SKU that is otherwise
-skipped, and on a SKU with only ONE supplier row (Mexico, Morocco, the 75 and
-100GB plans) — where, by the owner's choice (2026-10-04), nothing else is
-judged: no tick, no mirror, no margin word in Q.
+skipped. A SKU with only ONE supplier row (Mexico, Morocco, the 75 and 100GB
+plans) has nothing to choose and nothing to mirror, but its ticked row IS on
+sale, so its margin word in Q is judged like any other live row (since
+2026-10-06 — until then nothing judged a one-supplier Stellar row, and Mexico
+sold at a loss for days after Stellar repriced it). The run then mails the
+owner the live rows whose word changed, see live_q_changes().
 
 THE MIRROR, also on every run, switch or no switch
 --------------------------------------------------
@@ -581,13 +584,24 @@ def decide(rows: list[Row]) -> list[Decision]:
     out: list[Decision] = []
     for sku, group in groups.items():
         if len(group) < 2:
-            # One supplier: nothing to choose and nothing to mirror. Q is not
-            # judged here either — the owner chose (2026-10-04) to keep the
-            # call to take a one-supplier package off sale for himself. Only
-            # its profit figure is kept current.
-            refresh = profit_writes(group, [])
-            if refresh:
-                out.append(Decision(sku=sku, action="solo", writes=refresh))
+            # One supplier: nothing to choose and nothing to mirror. But the
+            # ticked row is ON SALE, and until 2026-10-06 nobody judged its
+            # margin — the scraper judges esim.dog rows only, stellar_prices.py
+            # writes no Q word, and the 10-04 rule left it to the owner — so
+            # Mexico sold at a loss for days after Stellar repriced it. Now a
+            # live row gets the same ceiling-then-floor verdict as a twin row;
+            # an unticked row is off the site already and is left alone.
+            writes = profit_writes(group, [])
+            judged = 0
+            r = group[0]
+            if text(r.chosen).strip():
+                w = judge_stock(sku, r, price_num(r.my_price))
+                if w:
+                    writes.append(w)
+                    judged = 1
+            if writes:
+                out.append(Decision(sku=sku, action="solo", writes=writes,
+                                    judged=judged, group=group))
             continue
         inc, why = _incumbent(group)
         if inc is None:
@@ -877,7 +891,12 @@ def _describe(d: Decision) -> str:
     if d.action == "skip":
         return f"  {d.sku:<10} \u23ed  SKIPPED \u2014 {d.reason}{p_tail}"
     if d.action == "solo":
-        return f"  {d.sku:<10} \u00b7  one supplier \u2014 P only{p_tail}"
+        line = f"  {d.sku:<10} \u00b7  one supplier{p_tail}"
+        if d.judged:
+            words = ", ".join(f"{row}:{value or 'cleared'}"
+                              for row, key, value in d.writes if key == "stock")
+            line += f"   [Q {words}]"
+        return line
     inc, win = d.incumbent, d.winner
     head = (f"  {d.sku:<10} {_MARK[d.action]} {source_of(inc):<9} {money(d.old_cost):>8}"
             f"  \u2192  {source_of(win):<9} {money(d.new_cost):>8}")
@@ -894,6 +913,97 @@ def _describe(d: Decision) -> str:
                           for row, key, value in d.writes if key == "stock")
         tail += f"   [Q {words}]"
     return head + tail
+
+
+# ── the off-sale alert ───────────────────────────────────────────────────────
+# A Q word on a TICKED row takes the package off sale within the hour (the
+# sync reads any non-empty Q as sold out), and clearing it puts the package
+# back. Until 2026-10-06 both happened silently — the only symptom of a loss
+# catalogue going dark, or of one staying LIVE at a loss, was the revenue
+# line. So: one mail per run, only when a live row's word changed, over the
+# same Gmail SMTP fulfillment_bot.alert() uses (the secret is already in
+# Actions). No password = one log line, never a failed run.
+GMAIL_USER = os.getenv("GMAIL_USER", "waverolesupply@gmail.com")
+ALERTS_EMAIL = os.getenv("ALERTS_EMAIL", "uper.request@gmail.com")
+ALERT_PREFIX = "[chooser] "
+
+
+def live_q_changes(decisions: list[Decision], rows: list[Row]) -> list[tuple]:
+    """Every Q write that lands on a row the run leaves TICKED:
+    (sku, sheet row, supplier, cost, מחיר שלי, old word, new word).
+
+    'Ticked' is judged after the run's own tick moves — a switch writes the
+    new word on the row it is ticking, and that is the one on sale."""
+    by_row = {r.row: r for r in rows}
+    ticked = {r.row: bool(text(r.chosen).strip()) for r in rows}
+    for d in decisions:
+        for row, key, value in d.writes:
+            if key == "chosen":
+                ticked[row] = bool(text(value).strip())
+    out = []
+    for d in decisions:
+        for row, key, value in d.writes:
+            if key == "stock" and ticked.get(row):
+                r = by_row[row]
+                out.append((d.sku, row, source_of(r), usd(r.price),
+                            price_num(r.my_price), stock_word(r), value))
+    return out
+
+
+def mail_live_q_changes(changes: list[tuple]) -> bool:
+    """Mail the owner, in Hebrew, which live packages went off sale (or back on)."""
+    if not changes:
+        return False
+    off = [c for c in changes if c[6]]
+    back = [c for c in changes if not c[6]]
+
+    def line(c):
+        sku, row, src, cost, mine, old, new = c
+        return (f"{sku}  (שורה {row}, {src})  "
+                f"קנייה {money(cost)}  מחיר שלי {money(mine)}"
+                f"  →  {new or 'חזר למכירה'}"
+                + (f"  (היה: {old})" if old else ""))
+
+    parts = []
+    if off:
+        parts.append(f"{len(off)} חבילות ירדו מהמכירה")
+    if back:
+        parts.append(f"{len(back)} חזרו למכירה")
+    subject = " / ".join(parts) + " (רווחיות)"
+    body = ("הבוט שבוחר ספק שינה את "
+            "מילת הרווחיות (Q) על שורות "
+            "שמסומנות ב-וי ולכן מוצגות באתר. "
+            "הסנכרון השעתי מעביר את זה לאתר "
+            "(מילה ב-Q = אזל מהמלאי).\n\n")
+    if off:
+        body += "ירדו מהמכירה:\n" + "\n".join(line(c) for c in off) + "\n\n"
+    if back:
+        body += "חזרו למכירה:\n" + "\n".join(line(c) for c in back) + "\n\n"
+    body += ("כללים: רצפת רווח 20% ממחיר הקנייה "
+             "(1GB: מותר הפסד עד 20%), תקרת קנייה "
+             "30GB $10 / 40GB $14 / 50GB $18. כדי להחזיר חבילה "
+             "למכירה: להעלות את מחיר שלי (S) "
+             "מעל הרצפה — המילה תימחק בריצה הבאה.\n")
+    print(f"\u2709  {subject}")
+    pw = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "")
+    if not pw:
+        print("   (no GMAIL_APP_PASSWORD \u2014 the alert was not mailed)")
+        return False
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["From"] = GMAIL_USER
+        msg["To"] = ALERTS_EMAIL
+        msg["Subject"] = ALERT_PREFIX + subject
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+            s.starttls()
+            s.login(GMAIL_USER, pw)
+            s.send_message(msg)
+        return True
+    except Exception as exc:              # noqa: BLE001
+        print(f"   (alert mail failed: {exc})")
+        return False
 
 
 def main(argv=None) -> int:
@@ -945,9 +1055,10 @@ def main(argv=None) -> int:
           f" | {cells} cells ({profits} of them \u05e8\u05d5\u05d5\u05d7, {judged} of them "
           f"Q) | {sum(len(d.colours) for d in decisions)} rows recoloured")
     if solo:
-        print(f"\U0001f4b2 \u05e8\u05d5\u05d5\u05d7 refreshed on {len(solo)} one-supplier SKU"
-              f"{'' if len(solo) == 1 else 's'} ({solo_p} cell{'' if solo_p == 1 else 's'})"
-              f" \u2014 nothing else on them is touched")
+        solo_q = sum(d.judged for d in solo)
+        print(f"\U0001f4b2 {len(solo)} one-supplier SKU{'' if len(solo) == 1 else 's'} "
+              f"touched ({solo_p} cell{'' if solo_p == 1 else 's'}: P refreshed, "
+              f"{solo_q} Q word{'' if solo_q == 1 else 's'}) \u2014 no tick, no mirror")
     # The mirror is counted on its own line: it is not a switch, it moves no
     # money between suppliers, and on a quiet day it is the only thing the run
     # does. Zero here means every row of every SKU already quotes the SKU price.
@@ -968,6 +1079,7 @@ def main(argv=None) -> int:
         return 0
     n = apply(svc, decisions, col)
     print(f"\n\u2705 wrote {n} requests")
+    mail_live_q_changes(live_q_changes(decisions, rows))
     return 0
 
 
