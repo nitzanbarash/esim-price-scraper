@@ -10,7 +10,12 @@ name: Order fulfillment (delivery emails)
 # two buyers would share the claim worker name and could buy twice.
 on:
   schedule:
-    - cron: "*/5 * * * *"    # every 5 minutes (public repo — free)
+    # A BACKSTOP only: the sheet script (waverole_sync.gs fulfillmentTick)
+    # dispatches this every 5 minutes, and every minute while an order waits.
+    # GitHub's own cron is throttled on a public repo anyway (~5 fires a day)
+    # and each extra fire can only pile a second pending run onto the group
+    # below, which GitHub then cancels as "superseded". 5 -> 15 on 2026-10-06.
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}       # manual run from the Actions tab; the sheet script ticks this
 
 permissions:
@@ -24,7 +29,13 @@ concurrency:
 jobs:
   fulfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The job clock starts when the job is CREATED, before a runner is
+    # assigned. On 2026-10-05 a GitHub incident held runners for 10-15 min and
+    # three ticks died at the old 15-minute cap having run nothing ("The job
+    # was not acquired by Runner") - a red run and an email for a delay that
+    # was not ours. So the job cap is a loose backstop and the bot step below
+    # carries the real limit.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -35,8 +46,11 @@ jobs:
 
       # No browser any more: the bot reads the supplier's JSON endpoint
       # directly, which cut this job from ~2 minutes to a few seconds.
+      # Only what fulfillment_bot.py imports (gspread, requests): playwright
+      # and google-api-python-client were still installed here ~290 times a
+      # day, 5-10 s each and up to 4 minutes on a slow PyPI (2026-10-01).
       - name: Install dependencies
-        run: pip install -q gspread requests playwright google-auth google-api-python-client
+        run: pip install -q gspread requests google-auth
 
       # Backstop for a lost order-paid dispatch (token missing, GitHub
       # answered 404, the run cancelled behind another): if a Stellar order
@@ -49,18 +63,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DISPATCH_URL: https://api.github.com/repos/${{ github.repository }}/actions/workflows/stellar-buy.yml/dispatches
         run: |
-          n=$(curl -sf -H "Authorization: Bearer $ORDERS_TOKEN" \
+          n=$(curl -sf -m 20 -H "Authorization: Bearer $ORDERS_TOKEN" \
                 "https://www.waverole.com/api/orders?status=pending&supplier=stellar" \
               | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("orders") or []))' 2>/dev/null || echo 0)
           echo "pending Stellar orders: $n"
           if [ "${n:-0}" -gt 0 ]; then
-            curl -sf -o /dev/null -X POST \
+            curl -sf -m 20 -o /dev/null -X POST \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "$DISPATCH_URL" -d '{"ref":"main"}' && echo "stellar-buy.yml dispatched"
           fi
 
+      # A normal run is 3-7 s of bot time; the slowest seen in 7 days was
+      # 125 s (a slow Gmail SEARCH). The bot's own IMAP_TIMEOUT is the hang
+      # guard; this cap is what turns a hung socket into a red run instead of
+      # a 30-minute wait.
       - name: Run fulfillment bot
+        timeout-minutes: 5
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}

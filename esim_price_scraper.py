@@ -273,6 +273,13 @@ REGIONAL_CODE_RE = re.compile(r'^\d+\.0[A-Z]?\.')
 # Stopping ourselves keeps the last save and the summary. Healthy runs take
 # 17-26 minutes, so this only fires when something is genuinely wrong.
 SCRAPE_BUDGET_MIN = float(os.environ.get('SCRAPE_BUDGET_MIN', 45))
+# How long past the budget the verdict loop waits for a package that is
+# already in flight. The budget used to be checked only when a package
+# COMPLETED, and the loop takes packages in row order, so one 3-minute read
+# (plus its validity scan) could carry the run 6 minutes past the budget and
+# into the step cap, which saves nothing. After this grace the read is
+# abandoned and what is done is flushed.
+SCRAPE_GRACE_SEC = float(os.environ.get('SCRAPE_GRACE_SEC', 240))
 
 def route_name_key(name: str) -> str:
     """'🎁 Amber' -> 'Amber'. Strips emoji and spacing the site decorates with."""
@@ -1530,7 +1537,21 @@ class ESIMScraper:
             return res, alt
 
         reads = prefetched(items, fetch, SCRAPE_CONCURRENCY)
-        async for it, fetched in reads:
+        while True:
+            # The next package in row order - but never more than the grace
+            # past the deadline, whatever its read is doing.
+            try:
+                it, fetched = await asyncio.wait_for(
+                    reads.__anext__(),
+                    timeout=max(1.0, deadline + SCRAPE_GRACE_SEC - _time.time()))
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                skipped = len(items) - done
+                print(f"\n⏳ {SCRAPE_BUDGET_MIN:g}-minute budget + {SCRAPE_GRACE_SEC:.0f}s grace "
+                      f"— a read still in flight is abandoned; stopping with "
+                      f"{skipped} of {len(items)} packages unchecked.")
+                break
             # Out of time: save, say exactly what was left unchecked, and stop.
             if _time.time() > deadline:
                 skipped = len(items) - done

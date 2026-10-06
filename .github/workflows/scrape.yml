@@ -21,7 +21,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # The 07:00 UTC cron above was meant as the daily run, but since the sheet
+  # script's dailyScrape dispatches this workflow at 10:00 Israel every day
+  # the cron has been a SECOND hour-long scrape every afternoon (it drifts to
+  # 12:00-15:30 UTC), holding the price-sheet group so the 4-hourly Stellar
+  # refresh queued 43 minutes behind it on 2026-10-01. From 2026-10-06 the
+  # cron is a backstop: it runs only when no scrape has SUCCEEDED in the last
+  # 16 hours (a budget-cut run exits 1, so an incomplete morning still gets
+  # its second chance). A dispatched run is never gated.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      skip: ${{ steps.fresh.outputs.skip }}
+    steps:
+      - name: Did a scrape already succeed in the last 16 hours?
+        id: fresh
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          since=$(date -u -d '16 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          n=$(gh api --method GET "repos/${{ github.repository }}/actions/workflows/scrape.yml/runs" \
+                -f status=success -f per_page=5 -f created=">=$since" \
+                --jq '.workflow_runs | length' 2>/dev/null || echo 0)
+          echo "successful scrapes since $since: ${n:-0}"
+          if [ "${n:-0}" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "A scrape already ran today - this scheduled backstop is skipped."
+          fi
+
   scrape:
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     runs-on: ubuntu-latest
     # Backstop only. Every step below carries its own limit, so the job limit
     # should never be what stops us — if it is, a step is missing a timeout.
@@ -30,8 +62,9 @@ jobs:
     # 90 on 2026-09-09 with the Stellar step and 90 -> 95 on 2026-09-10 with the
     # supplier choice: at 90 a slow scraper would have eaten the 5 minutes that
     # last step needs, and 'if: always()' cannot save a step from a job timeout —
-    # the job kills everything, including the run's log.
-    timeout-minutes: 95
+    # the job kills everything, including the run's log. 95 -> 110 on
+    # 2026-10-06 (scraper 68 -> 75, Stellar 6 -> 10: 6 + 8 + 75 + 10 + 5 = 104).
+    timeout-minutes: 110
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -88,9 +121,20 @@ jobs:
       # across 83 rows, about 13 minutes at DAY_SCAN_CONCURRENCY 5. The step cap
       # moves with it and both still sit under the job's ceiling — 75 since
       # 2026-09-08, when the budget went to 62 and this cap to 68.
+      # 68 -> 75 on 2026-10-06: the 62-minute budget used to be checked only
+      # when a package COMPLETED, and the verdict loop waits for packages in
+      # row order, so one 3-minute read plus its validity scan ran the step
+      # into this cap on 5 of 14 days (the last ~30 packages' prices were then
+      # never flushed). The scraper now abandons an in-flight read
+      # SCRAPE_GRACE_SEC after the deadline and saves; this cap only has to
+      # cover budget + grace + the final flush.
       - name: Run scraper
-        timeout-minutes: 68
+        timeout-minutes: 75
         env:
+          # Unbuffered stdout: with block buffering the last minutes before a
+          # step-cap kill were lost from the log, exactly the minutes that
+          # explain the kill.
+          PYTHONUNBUFFERED: "1"
           # 58 -> 62 on 2026-09-08, alongside the concurrency raise above.
           # Both of that day's runs hit 58 with three rows left, so the work
           # no longer fits in the old budget even once the reads speed up.
@@ -98,6 +142,9 @@ jobs:
           # saves what it has and names what it skipped, the step cap kills
           # the run between two saves and explains nothing.
           SCRAPE_BUDGET_MIN: "62"
+          # How long past the budget the run waits for a package already in
+          # flight before saving without it (see the step cap above).
+          SCRAPE_GRACE_SEC: "240"
           # 3 -> 4 on 2026-09-10. This is now an ORDER knob, not a cost one:
           # BROWSER_SLOTS below is what caps the actual number of Chromiums, so
           # raising this deepens the queue instead of the process count.
@@ -143,10 +190,13 @@ jobs:
       # stellar-key-placement). Without it the script will not write anything:
       # its only remaining source is the public RETAIL feed, and it refuses to
       # write estimates off it - it says so in this log and exits 3.
+      # 6 -> 10 on 2026-10-06: since ad65d36 reads the WHOLE catalogue (7,000+
+      # listings, 70+ pages at Stellar's 55-a-minute pace) the step takes
+      # 90-290 s; the 10-04 22:54 run was killed one tick after its last write.
       - name: Refresh Stellar prices
         id: stellar
         if: always()
-        timeout-minutes: 6
+        timeout-minutes: 10
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           STELLAR_READ_KEY: ${{ secrets.STELLAR_READ_KEY }}

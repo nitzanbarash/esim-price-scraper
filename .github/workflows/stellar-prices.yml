@@ -48,9 +48,11 @@ jobs:
       # stellar-key-placement). Without it the script will not write anything:
       # its only remaining source is the public RETAIL feed, and it refuses to
       # write estimates off it — it says so in this log and exits 3.
+      # 5 -> 10 on 2026-10-06: the whole-catalogue read (ad65d36) takes 90-290 s
+      # and the 10-04 22:54 run was killed one tick after its last write.
       - name: Refresh Stellar prices
         id: stellar
-        timeout-minutes: 5
+        timeout-minutes: 10
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           STELLAR_READ_KEY: ${{ secrets.STELLAR_READ_KEY }}
