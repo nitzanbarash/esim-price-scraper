@@ -250,17 +250,10 @@ PROFIT_MIN_PCT_1GB = -20.0   # 1GB plans are a loss leader; a 20% loss is allowe
 # until 2026-10-06. From 75GB up nothing is judged until the owner names a cap.
 BUY_CEILINGS = ((30.0, 40.0, 10.0), (40.0, 50.0, 14.0), (50.0, 75.0, 18.0))   # (size from, size to, max buy $)
 OVER_CEILING_LABEL = 'לא רווחי — מעל תקרה'
-# Per-SKU exceptions, approved by the owner BY NAME — the discipline of
-# day_policy.DAY_FLOOR_EXCEPTIONS: the ceilings never widen, a SKU is let past
-# them only when the owner said so for that SKU, and the 20% profit floor
-# still judges it. A deleted row takes its exception with it.
-#   5.212.50  Morocco 50GB on Stellar, cost $18.27, sold at 24.99 (2026-10-01)
-#   1.66.40   Thailand 40GB on Stellar, cost $14.13 — 13 cents over the cap at
-#             +40%, ticked and selling. Added 2026-10-06, the day one-supplier
-#             rows started being judged, so that fix would not pull a package
-#             the owner had knowingly left on sale. PENDING the owner's word:
-#             remove this line to let the cap take it off.
-CEILING_EXCEPTIONS = frozenset({'5.212.50', '1.66.40'})
+# No per-SKU exceptions. The owner, 2026-10-06, when asked about one: "there is
+# no exceptions list - only 1GB packages are exceptions" (the loss-leader
+# allowance, PROFIT_MIN_PCT_1GB above). A 40GB bought at $14.13 is over the
+# $14 cap however well it sells; the way back on sale is the cost, not a name.
 # The same word waverole_sync.gs applyFee_ writes (UNPROFITABLE) when the
 # owner types a sell price; choose_supplier.py keeps it fresh on twin rows.
 UNPROFITABLE_LABEL = 'לא רווחי'
@@ -380,7 +373,7 @@ def is_profitable(my_price: Optional[float], buy: Optional[float],
 def buy_ceiling(gb: Optional[float], code: str = '') -> Optional[float]:
     """The most this size may cost and still be sold, or None when no ceiling applies."""
     code = (code or '').strip()
-    if gb is None or REGIONAL_CODE_RE.match(code) or code in CEILING_EXCEPTIONS:
+    if gb is None or REGIONAL_CODE_RE.match(code):
         return None
     for size_from, size_to, cap in BUY_CEILINGS:
         if size_from <= float(gb) < size_to:

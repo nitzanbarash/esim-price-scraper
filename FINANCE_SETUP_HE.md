@@ -1,3 +1,5 @@
+> **RETIRED 2026-10-06** - the owner keeps one dashboard, the site HQ (/hq-8bcbe8e0). This system is kept for reference only; finance.yml no longer runs on a schedule.
+
 # מערכת הכספים — הפעלה
 
 מערכת נפרדת לגמרי מהאתר ומהבוטים שמוכרים. היא לא צריכה לרוץ כל הזמן:

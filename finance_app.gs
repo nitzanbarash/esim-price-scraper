@@ -1,3 +1,5 @@
+// RETIRED 2026-10-06 - the owner keeps one dashboard, the site HQ (/hq-8bcbe8e0).
+// This Apps Script web app and finance_bot.py are kept for reference only.
 /**
  * Waverole — כספים.  Bot #7: the books, with a face.
  *

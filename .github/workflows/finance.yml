@@ -8,8 +8,10 @@ name: Finance (books)
 # that has happened the job finishes green and simply reports that there is
 # nothing to write to yet.
 on:
-  schedule:
-    - cron: "0 2 * * *"      # 02:00 UTC = 05:00 Israel — after the day is done
+  # RETIRED 2026-10-06: the owner keeps ONE dashboard, the site's HQ
+  # (/hq-8bcbe8e0). This bot had nothing to write to anyway - the
+  # 'Waverole - kesafim' spreadsheet was never created, so every daily run
+  # computed the books and discarded them. Manual runs only.
   workflow_dispatch: {}
 
 concurrency:
