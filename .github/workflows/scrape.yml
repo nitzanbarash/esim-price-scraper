@@ -167,6 +167,12 @@ jobs:
           # actually moves. If 8 still does not fit, the next honest fix is to
           # stop launching a browser per probe, NOT to raise this to 20.
           DAY_SCAN_CONCURRENCY: "8"
+          # How often a row whose own day SELLS prices the rest of its window,
+          # in days (2026-10-07). The window was 84% of a run's page loads and
+          # 146 of 192 scans were rows like that; with 192 rows the morning run
+          # ran out of its 62 minutes two days running. A row whose day does
+          # not sell is still searched on every run. "1" restores every day.
+          DAY_SCAN_EVERY: "2"
           # The service-account JSON is stored as a repo secret, never in the code.
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
         run: python esim_price_scraper.py

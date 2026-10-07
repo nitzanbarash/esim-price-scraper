@@ -39,7 +39,8 @@ import os
 import sys
 import re
 import time as _time
-from datetime import datetime
+import zlib
+from datetime import datetime, timezone
 from typing import Optional, Dict, List, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from playwright.async_api import async_playwright, Page
@@ -155,6 +156,32 @@ DAY_LADDER = (1, 3, 5, 7, 10, 14, 15, 20, 21, 25, 30, 31)
 # outer loop stays sequential — this is what keeps a 12-rung scan costing about
 # two reads instead of twelve, and the 45-minute budget survivable.
 DAY_SCAN_CONCURRENCY = int(os.environ.get('DAY_SCAN_CONCURRENCY', 4))
+
+# How often a row whose held day SELLS prices the rest of its window, in days.
+# 2026-10-07: the window had become 84% of a run's page loads (1,031 of 1,234
+# on 10-06), and 146 of that run's 192 scans were rows whose own day was
+# selling fine. Those scans moved 1 row that afternoon and 8 the next morning,
+# by cents, and with 192 rows the morning run no longer fit its 62 minutes two
+# days running. So the healthy re-check is spread: each row takes its turn
+# every DAY_SCAN_EVERY days, keyed by SKU so re-sorting the sheet does not move
+# it. A row whose day cannot be sold today, or sits outside its window, is
+# still searched on every run; that is the case the search exists for.
+DAY_SCAN_EVERY = max(1, int(os.environ.get('DAY_SCAN_EVERY', 2)))
+
+
+def day_scan_due(key: str, today: Optional[int] = None,
+                 every: Optional[int] = None) -> bool:
+    """Is today this healthy row's turn to price the rest of its window?
+    key is the row's SKU (its link when it has none); today is a date ordinal
+    (UTC), every overrides DAY_SCAN_EVERY."""
+    every = DAY_SCAN_EVERY if every is None else max(1, int(every))
+    if every == 1:
+        return True
+    if today is None:
+        today = datetime.now(timezone.utc).date().toordinal()
+    return zlib.crc32(key.encode('utf-8')) % every == today % every
+
+
 # Packages read at once. Each read is its own Chromium, so they cannot collide;
 # the verdicts stay sequential. 149 rows one at a time overran a 62-minute
 # budget on 2026-09-08..10 (memory: scrape-workflow-budget said "concurrency,
@@ -220,8 +247,18 @@ async def prefetched(items, fetch, n):
             spawn()
             yield it, out
     finally:
-        for _, task in queue:
+        pending = [task for _, task in queue]
+        for task in pending:
             task.cancel()
+        # And wait for them, briefly. A cancelled read closes its browser in
+        # its own `finally`, and that close is a round trip to the playwright
+        # driver. Left un-awaited, the next thing to touch these tasks was
+        # asyncio.run()'s exit, which cancels EVERY task at once (the drivers'
+        # pipe readers too) and then waits for closes nobody can answer any
+        # more. On 10-06 and 10-07 that wait held a run that had already saved
+        # its rows for 13 minutes, until the step cap killed it as 'timed out'.
+        if pending:
+            await asyncio.wait(pending, timeout=CANCEL_WAIT_SEC)
 
 # The owner's profitability bar, lifted out of run() so the fallback judges a
 # candidate by exactly the same rule that judges the package it would replace.
@@ -273,6 +310,9 @@ SCRAPE_BUDGET_MIN = float(os.environ.get('SCRAPE_BUDGET_MIN', 45))
 # into the step cap, which saves nothing. After this grace the read is
 # abandoned and what is done is flushed.
 SCRAPE_GRACE_SEC = float(os.environ.get('SCRAPE_GRACE_SEC', 240))
+# How long a budget stop waits for the reads it cancels to close their
+# browsers before it saves and leaves without them (see prefetched()).
+CANCEL_WAIT_SEC = 30.0
 
 def route_name_key(name: str) -> str:
     """'🎁 Amber' -> 'Amber'. Strips emoji and spacing the site decorates with."""
@@ -1208,7 +1248,9 @@ class ESIMScraper:
 
         Called for every row, not only the broken ones, because the policy runs
         both ways: it moves a row off the day it holds, and moves it back the
-        moment 30 days is the right answer again.
+        moment 30 days is the right answer again. Since 2026-10-07 a row whose
+        held day sells is searched on its turn (DAY_SCAN_EVERY), a row whose
+        day does not on every run.
 
         The reads are still the 2026-09-07 design — the whole window priced at
         once, because a preference you cannot price is not a preference, and
@@ -1295,6 +1337,14 @@ class ESIMScraper:
 
         probe = [d for d in days if d != current]
         if not probe:
+            return None
+        # The day we hold sells today, so the rest of the window is priced on
+        # this row's turn only. A run limited to SCRAPE_ONLY_SKUS is someone
+        # checking a row by hand, and it always searches.
+        if best is not None and not SCRAPE_ONLY_SKUS \
+                and not day_scan_due(code or it['link']):
+            print(f"  ⏭ {current}d sells — the other days of this row are "
+                  f"priced every {DAY_SCAN_EVERY} days, not today")
             return None
         why = ("" if best is not None
                else " (which we cannot sell today)" if primary_ok is False
@@ -1743,7 +1793,14 @@ async def main():
     # half-checked sheet is worse than a red one: it tells the owner to stop
     # looking at the exact moment the prices went stale.
     if skipped:
-        sys.exit(1)
+        # Everything worth keeping is in the sheet by now. sys.exit() here
+        # would hand the process to asyncio.run()'s teardown, which waits
+        # without limit for every task still alive; prefetched() now closes
+        # the reads it cancels, and this makes sure nothing it missed can hold
+        # the step until its cap again. The runner reaps any stray browser.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
 
 
 if __name__ == "__main__":

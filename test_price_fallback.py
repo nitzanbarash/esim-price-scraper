@@ -44,6 +44,12 @@ from esim_price_scraper import (
 
 _fails: list[str] = []
 
+# Every test below is about what a search FINDS, so every row is on its turn.
+# Whose turn it is (2026-10-07, DAY_SCAN_EVERY) has its own tests further down
+# and calls the real rule by this name.
+real_day_scan_due = scraper.day_scan_due
+scraper.day_scan_due = lambda key, *a, **k: True
+
 
 def check(name, got, want):
     if got == want:
@@ -468,6 +474,114 @@ check("never more than BROWSER_SLOTS browsers alive", census.peak['browser'], SL
 # reads really did run together and that every slot was handed back.
 check("and the slots were all in use", census.peak['driver'] > 1, True)
 check("nothing left running", census.live, {'driver': 0, 'browser': 0})
+
+print("\n-- whose turn it is to price the window --")
+# 2026-10-07: 146 of a run's 192 scans were rows whose own day was selling,
+# 84% of its page loads, and the run stopped fitting its budget. A healthy row
+# now prices the rest of its window every DAY_SCAN_EVERY days, on a day of its
+# own (keyed by SKU, so re-sorting the sheet does not move it).
+check("every day when the knob is 1",
+      all(real_day_scan_due(k, d, every=1) for k in ("2.39.10", "x") for d in range(9)), True)
+turns = [real_day_scan_due("2.39.10", d, every=2) for d in range(739000, 739012)]
+check("every other day for one SKU",
+      all(turns[i] != turns[i + 1] for i in range(len(turns) - 1)), True)
+turns3 = [real_day_scan_due("2.39.10", d, every=3) for d in range(739000, 739012)]
+check("one day in three at 3", [sum(turns3[i:i + 3]) for i in range(0, 12, 3)], [1, 1, 1, 1])
+share = sum(real_day_scan_due(f"1.{n}.10", 739000, every=2) for n in range(400)) / 400
+check("about half the catalogue on any one day", 0.4 < share < 0.6, True)
+check("the default is every second day", scraper.DAY_SCAN_EVERY, 2)
+
+print("\n-- a row whose day sells is searched on its turn, a broken one always --")
+HEALTHY = {(10.0, 30): 4.00, (10.0, 31): 3.00, (10.0, 25): 3.10}
+kept_due = scraper.day_scan_due
+try:
+    scraper.day_scan_due = lambda key, *a, **k: False
+    alt, asked = search(HEALTHY, 10.0, 30, "6.00")
+    check("not its turn: the day it holds stays", alt, None)
+    check("...and no other day is opened", asked, [])
+
+    # The case the search exists for does not wait for a turn.
+    alt, asked = search(ITALY, 10.0, 30, "6.50", substitute_gb=9.0)
+    check("a day that cannot be sold is searched anyway", (alt or {}).get("days"), 21)
+
+    kept_only = scraper.SCRAPE_ONLY_SKUS
+    scraper.SCRAPE_ONLY_SKUS = ["2.39.10"]
+    try:
+        alt, asked = search(HEALTHY, 10.0, 30, "6.00")
+        check("a run limited by hand (SCRAPE_ONLY_SKUS) always searches",
+              (alt or {}).get("days"), 31)
+    finally:
+        scraper.SCRAPE_ONLY_SKUS = kept_only
+
+    scraper.day_scan_due = lambda key, *a, **k: True
+    alt, asked = search(HEALTHY, 10.0, 30, "6.00")
+    check("its turn: the window is priced and the better day taken",
+          (alt or {}).get("days"), 31)
+finally:
+    scraper.day_scan_due = kept_due
+
+print("\n-- a budget stop closes the reads it abandons, then leaves --")
+# 2026-10-06 and 10-07: both runs stopped at 62 minutes and saved (185 and 173
+# of 192 rows), then sat 13 more minutes until the step cap killed them as
+# 'timed out'. The cancelled reads were never awaited, so asyncio.run()'s exit
+# cancelled the playwright drivers' readers along with them and then waited
+# for browser closes that could no longer be answered.
+import time as _t
+
+async def budget_stop(hang_cleanup=False):
+    closed = []
+    never = asyncio.Event()
+
+    async def fetch(it):
+        try:
+            if it == 0:
+                return "read"
+            await asyncio.sleep(3600)            # still in flight at the stop
+        finally:
+            if it != 0:
+                if hang_cleanup:
+                    await never.wait()           # a browser that never answers
+                await asyncio.sleep(0.01)        # the close round trip
+                closed.append(it)
+
+    reads = scraper.prefetched(range(4), fetch, 4)
+    first = await reads.__anext__()
+    t = _t.monotonic()
+    await reads.aclose()
+    return first, sorted(closed), _t.monotonic() - t
+
+first, closed, took = asyncio.run(budget_stop())
+check("the package already read is kept", first, (0, "read"))
+check("every abandoned read closed its browser before the save", closed, [1, 2, 3])
+check("...without waiting out the reads themselves", took < 5, True)
+
+kept_wait = scraper.CANCEL_WAIT_SEC
+scraper.CANCEL_WAIT_SEC = 0.2
+try:
+    first, closed, took = asyncio.run(budget_stop(hang_cleanup=True))
+finally:
+    scraper.CANCEL_WAIT_SEC = kept_wait
+check("a read that never closes is waited for only CANCEL_WAIT_SEC", took < 2, True)
+
+exits = []
+kept_cls, kept_exit = scraper.ESIMScraper, scraper.os._exit
+
+class _Cut:
+    def __init__(self, left):
+        self.left = left
+
+    async def run(self):
+        return self.left
+
+try:
+    scraper.os._exit = exits.append
+    scraper.ESIMScraper = lambda: _Cut(19)
+    asyncio.run(scraper.main())
+    scraper.ESIMScraper = lambda: _Cut(0)
+    asyncio.run(scraper.main())
+finally:
+    scraper.ESIMScraper, scraper.os._exit = kept_cls, kept_exit
+check("a budget-cut run leaves at once with exit code 1, a full one does not", exits, [1])
 
 print("\n-- the policy table itself --")
 # The ladder stays here: it is a fact about esim.dog's URLs (which day numbers
