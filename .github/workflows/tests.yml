@@ -99,6 +99,13 @@ jobs:
       - name: Price ranges
         run: python test_price_ranges.py
 
+      # The SAME rule in the sheet's own script, applied the moment the owner
+      # types a cost, a price, a range or a tick. Two copies that disagree
+      # make the price flip every four hours, so this one is checked against
+      # the Python on thousands of cases, then edited like the owner edits.
+      - name: Sheet script (price ranges on a hand edit)
+        run: node test_waverole_sync.js
+
       # What a coupon row MEANS before it is pushed to the till. A blank 'active'
       # cell that read as true, or a percent-formatted 10 that read as 0.1, is a
       # discount nobody approved being handed to everyone who asks.

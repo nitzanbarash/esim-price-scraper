@@ -13,6 +13,10 @@
  *  1. INSTANT site update whenever a relevant cell is edited in the sheet
  *     (installable onEdit trigger). NOTE: programmatic writes (the daily
  *     scraper) do NOT fire onEdit - that's what the daily full sync is for.
+ *     Since 2026-10-07 the edit also runs the PRICE RANGE rule (applyFee_):
+ *     type a buy price, a sell price, a range or move the tick and the sell
+ *     price moves inside the range at once - the move the chooser would
+ *     otherwise make on its next 4-hourly run.
  *  2. Daily 10:00 Israel: starts the GitHub scraper, then a full site sync
  *     45 minutes later (after the scrape finished writing fresh data).
  *  3. Daily 12:00 Israel: WATCHDOG - verifies the live site data is fresh;
@@ -52,6 +56,7 @@
  *   runScrapeNow   - trigger the GitHub scraper now
  *   checkSiteFresh - run the freshness watchdog now
  *   syncCouponsNow - push the coupon tab and pull the use counters now
+ *   checkPriceRanges - prove the paste prices like the chooser (log only)
  */
 
 const ENDPOINT = 'https://www.waverole.com/api/update-packages';
@@ -83,6 +88,7 @@ const HEADERS = {
   my_price:    ['\u05de\u05d7\u05d9\u05e8 \u05e9\u05dc\u05d9'],                // what actually lands, after the real cut
   price:       ['\u05de\u05d7\u05d9\u05e8 \u05e1\u05d5\u05e4\u05d9', '\u05db\u05d5\u05dc\u05dc \u05de\u05e2\u05de'],    // FINAL customer price (incl. VAT + fee)
   sale:        ['\u05de\u05d1\u05e2\u05e6\u05e2\u05d9\u05dd (\u05d0\u05d7\u05d5\u05d6\u05d9\u05dd)'],         // empty/0 cancels the sale
+  range:       ['\u05d8\u05d5\u05d5\u05d7 \u05de\u05d7\u05d9\u05e8\u05d9\u05dd'],          // '5.99 - 7.99': the sell price follows the cost inside it; blank = hands off
   buy:         ['\u05de\u05d7\u05d9\u05e8 \u05e7\u05e0\u05d9\u05d9\u05d4'],               // what the SUPPLIER charges us (scraper writes it)
   profit:      ['\u05e8\u05d5\u05d5\u05d7 (\u05db\u05d3\u05d0\u05d9\u05d5\u05ea)'],           // derived: net minus buy, in $ and %
   route:       ['Route'],                    // esim.dog's colour / Stellar's package code, per row
@@ -229,16 +235,170 @@ function profitText_(net, buy) {
   };
 }
 
+// -- the price range: the sell price follows the cost (2026-10-07) ----
+//
+// A JavaScript copy of price_ranges.py, so a HAND edit gets the same answer
+// the chooser's 4-hourly run would give - at once, not up to four hours
+// later. The owner's words: the price automation has to be instant, like the
+// rest of this sheet. Type a new buy price, a new range, a new sell price or
+// move the tick, and the sell price lands where the rule puts it before the
+// edit is pushed to the site.
+//
+// The rule, per package, inside the '5.99 - 7.99' range in its own column:
+//   * every size but 1GB: a 50-cent grid ending in .49/.99. Margin under 30%
+//     of cost -> UP as many steps as it takes; over 200% and above the low
+//     end -> DOWN one step. Easy up, hard down.
+//   * 1GB: 0.99-1.49 on a 10-cent grid ending in 9 - the LOWEST step that
+//     loses at most 10 cents after the processor's real fee.
+//   * no step pays -> the price stays and Q says OVER_RANGE (site: sold out).
+// Margin is judged on the net (S), as P reads it. A blank range cell is the
+// off switch: that package is priced by hand, judged by the old 20% floor.
+//
+// test_price_ranges.py holds the cases; checkPriceRanges() below runs the
+// same ones here, and the two copies must stay in step.
+const RANGE_RAISE_BELOW_PCT = 30;    // margin under this -> price goes up
+const RANGE_LOWER_ABOVE_PCT = 200;   // margin over this -> one step down
+const RANGE_STEP_CENTS      = 50;    // .49 / .99
+const RANGE_STEP_CENTS_1GB  = 10;    // .x9
+const RANGE_LOSS_1GB        = 0.10;  // 1GB may lose this much, fee included
+const RANGE_EPS             = 1e-6;
+const OVER_RANGE   = '\u05dc\u05d0 \u05e8\u05d5\u05d5\u05d7\u05d9 \u2014 \u05de\u05e2\u05dc \u05d8\u05d5\u05d5\u05d7';
+// The scraper's proportion rule (2026-09-17): from 30GB up, a package bought
+// above its size's ceiling is not for sale, whatever it sells for. Judged
+// first, on the buy price alone; regional bundles are exempt. The same
+// closed bands as esim_price_scraper.py BUY_CEILINGS.
+const OVER_CEILING = '\u05dc\u05d0 \u05e8\u05d5\u05d5\u05d7\u05d9 \u2014 \u05de\u05e2\u05dc \u05ea\u05e7\u05e8\u05d4';
+const BUY_CEILINGS = [[30, 40, 10], [40, 50, 14], [50, 75, 18]];   // [size from, size to, max buy $]
+const REGIONAL_CODE_RE = /^\d+\.0[A-Z]?\./;
+// The three margin words the bots own in Q. Any other word there (the
+// scraper's out-of-stock, the owner's own note) is more specific than ours
+// and is never written over - the same rule as choose_supplier.judge_stock.
+const PROFIT_MARKS = [UNPROFITABLE, OVER_CEILING, OVER_RANGE];
+const BIDI_RE = /[\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+const RANGE_RE = /^\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)\s*[-\u2013\u2014~]+\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)\s*$/;
+
+function isOneGb_(gb) { return gb !== null && gb !== undefined && gb <= 1; }
+
+function netOf_(price) { return Math.round((price - realFee_(price)) * 100) / 100; }
+
+function marginPct_(price, cost) { return (netOf_(price) - cost) / cost * 100; }
+
+function pays_(price, cost, gb) {
+  if (isOneGb_(gb)) return netOf_(price) - cost >= -RANGE_LOSS_1GB - RANGE_EPS;
+  return marginPct_(price, cost) >= RANGE_RAISE_BELOW_PCT - RANGE_EPS;
+}
+
+// The grid is worked in whole cents: 0.1 + 0.2 is not 0.3 in floating point.
+function onGrid_(c, gb) { return isOneGb_(gb) ? c % 10 === 9 : c % 50 === 49; }
+function cents_(v) { return Math.round(v * 100); }
+function gridUp_(v, gb) { let c = cents_(v); while (!onGrid_(c, gb)) c++; return c / 100; }
+function gridDown_(v, gb) { let c = cents_(v); while (c > 0 && !onGrid_(c, gb)) c--; return c / 100; }
+
+// Every grid price inside [lo, hi], ascending. A range typed off the grid
+// ('6 - 8') is snapped inwards; one too narrow to hold a step is [].
+function rangeSteps_(lo, hi, gb) {
+  const step = isOneGb_(gb) ? RANGE_STEP_CENTS_1GB : RANGE_STEP_CENTS;
+  const out = [];
+  for (let c = cents_(gridUp_(lo, gb)); c <= cents_(gridDown_(hi, gb)); c += step) out.push(c / 100);
+  return out;
+}
+
+// '5.99 - 7.99' -> [5.99, 7.99]; anything else -> null (= no automation).
+// Both ends positive and in order; a single number is not a range.
+function parseRange_(cell) {
+  if (typeof cell !== 'string') return null;   // a number, or a date Sheets made of '6-8'
+  const m = RANGE_RE.exec(cell.replace(BIDI_RE, ''));
+  if (!m) return null;
+  const lo = parseFloat(m[1].replace(',', '.')), hi = parseFloat(m[2].replace(',', '.'));
+  if (!(lo > 0) || hi < lo) return null;
+  return [lo, hi];
+}
+
+// The price U should hold now, or null when nothing in the range pays.
+// Moves FROM `current` (null = unknown): up as far as it takes to pay, down
+// one step over 200%. 1GB ignores it - the lowest paying step, every time.
+function reprice_(gb, cost, current, lo, hi) {
+  const grid = rangeSteps_(lo, hi, gb);
+  if (!grid.length || !(cost > 0)) return null;
+  if (isOneGb_(gb)) {
+    for (let k = 0; k < grid.length; k++) if (pays_(grid[k], cost, gb)) return grid[k];
+    return null;
+  }
+  const top = grid[grid.length - 1];
+  let cur;
+  if (current === null || current === undefined || current < grid[0]) cur = grid[0];
+  else if (current > top) cur = top;
+  else cur = Math.min(gridUp_(current, gb), top);
+  if (!pays_(cur, cost, gb)) {
+    for (let k = 0; k < grid.length; k++) if (grid[k] > cur && pays_(grid[k], cost, gb)) return grid[k];
+    return null;
+  }
+  if (marginPct_(cur, cost) > RANGE_LOWER_ABOVE_PCT + RANGE_EPS && cur > grid[0]) {
+    return grid[grid.indexOf(cur) - 1];        // cur is on the grid by now
+  }
+  return cur;
+}
+
+function overCeiling_(buy, gb, sku) {
+  if (!buy || gb === null || REGIONAL_CODE_RE.test(sku)) return false;
+  for (let k = 0; k < BUY_CEILINGS.length; k++) {
+    const b = BUY_CEILINGS[k];
+    if (gb >= b[0] && gb < b[1]) return buy > b[2] + 1e-9;
+  }
+  return false;
+}
+
+// What Q should say about this row's margin - one of PROFIT_MARKS, or ''.
+// choose_supplier.profit_mark in the same order: the ceiling on cost, then
+// the range (is there ANY step that pays at this row's cost?), and with no
+// range the old floor on the row's own net. No cost = not judged = ''.
+function profitMark_(sku, buy, gb, net, rng) {
+  if (overCeiling_(buy, gb, sku)) return OVER_CEILING;
+  if (rng && buy) return reprice_(gb, buy, null, rng[0], rng[1]) === null ? OVER_RANGE : '';
+  if (net && buy && profitText_(net, buy).pct < profitFloorPct_(gb)) return UNPROFITABLE;
+  return '';
+}
+
+// Runnable from the Apps Script editor (Run > checkPriceRanges): the cases of
+// test_price_ranges.py, so a paste can be proven to price like the chooser.
+function checkPriceRanges() {
+  const cases = [   // [gb, cost, current, lo, hi, want]
+    [1, 0.55, null, 0.99, 1.49, 0.99], [1, 0.70, null, 0.99, 1.49, 0.99],
+    [1, 0.71, null, 0.99, 1.49, 1.09], [1, 0.87, null, 0.99, 1.49, 1.19],
+    [1, 1.18, null, 0.99, 1.49, 1.49], [1, 1.19, null, 0.99, 1.49, null],
+    [1, 1.18, 0.99, 0.99, 1.49, 1.49],          // 1GB ignores where it is
+    [10, 4.30, 5.99, 5.99, 7.99, 6.49],         // 5.99 makes 26%: up to 6.49
+    [10, 4.80, 5.99, 5.99, 7.99, 6.99],
+    [10, 6.50, 5.99, 5.99, 7.99, null],         // nothing in the range pays
+    [10, 1.50, 6.99, 5.99, 7.99, 6.49],         // > 200%: one step down
+    [10, 1.50, 5.99, 5.99, 7.99, 5.99],         // ... never below the low end
+    [10, 4.30, 6.75, 5.99, 7.99, 6.99],         // off the grid -> snapped up
+    [10, 4.30, 9.99, 5.99, 7.99, 7.99]          // over the top -> clamped
+  ];
+  const bad = cases.filter(function (c) { return reprice_(c[0], c[1], c[2], c[3], c[4]) !== c[5]; });
+  const ranges = [['5.99 - 7.99', [5.99, 7.99]], ['\u200f5.99\u2013$7.99', [5.99, 7.99]],
+                  ['7.99 - 5.99', null], ['5.99', null], [5.99, null], ['', null]];
+  const badR = ranges.filter(function (c) {
+    return JSON.stringify(parseRange_(c[0])) !== JSON.stringify(c[1]);
+  });
+  Logger.log(bad.length + badR.length === 0
+    ? 'price ranges: all ' + (cases.length + ranges.length) + ' cases pass'
+    : 'price ranges FAILED: ' + JSON.stringify({
+        reprice: bad.map(function (c) { return { c: c, got: reprice_(c[0], c[1], c[2], c[3], c[4]) }; }),
+        parse: badR.map(function (c) { return { cell: c[0], got: parseRange_(c[0]) }; }) }));
+}
+
 // One setValues per group of neighbouring cells, instead of one call per cell.
 //
 // The catch is column R, '<---- ' + do-not-touch: it sits between Q and S, so
-// the derived cells fall into TWO blocks, P..Q and S..V, and they are written
-// by two separate calls on purpose. A single block from P to V would cover R
-// and overwrite it on every edit - value-preserving or not, that column is
-// spoken for.
+// the derived cells fall into TWO blocks, P..Q and S..W (net, fee, price,
+// range, sale - the range sits between price and sale since 2026-10-07), and
+// they are written by two separate calls on purpose. A single block from P
+// to W would cover R and overwrite it on every edit - value-preserving or
+// not, that column is spoken for.
 //
 // Inside a block, a cell we are not changing is written back with the value
-// already in it; that write-back is what lets four cells go out in one call.
+// already in it; that write-back is what lets five cells go out in one call.
 // The block is skipped entirely when nothing in it actually differs.
 //
 // The contiguity check is the safety rail: if a group's own columns ever stop
@@ -270,28 +430,37 @@ function writeGroup_(sheet, row, dataRow, cols, want) {
 
 // Final price typed -> ladder fee, real net, profit and the twin rows follow.
 //
-// Runs on any edit that touches the final-price column OR the sale-percentage
-// column, one row or a pasted block. Clearing the price clears every derived
-// cell: a row with no sell price is not for sale, and a stale net beside an
-// empty price reads as one. Programmatic writes do not fire onEdit, so writing
-// these cells here cannot re-enter.
+// Runs on any edit that touches the final-price column, the sale-percentage
+// column, the buy price, the price range or the tick - one row or a pasted
+// block. Clearing the price clears every derived cell: a row with no sell
+// price is not for sale, and a stale net beside an empty price reads as one.
+// Programmatic writes do not fire onEdit, so writing these cells here cannot
+// re-enter.
 //
 // TWINS: one SKU can occupy several rows - one per supplier - but there is
 // only ONE customer price for a package; which supplier we buy from is our
 // business and never changes what the buyer pays. So the typed price, its
-// sale percentage and the two derived fee cells are copied to every row that
-// carries the same SKU. Before this, pricing a package meant typing the same
-// number twice, and a tick moved to the other supplier's row could publish
-// the price the owner had NOT updated.
+// sale percentage, its range and the two derived fee cells are copied to
+// every row that carries the same SKU. Before this, pricing a package meant
+// typing the same number twice, and a tick moved to the other supplier's row
+// could publish the price the owner had NOT updated.
 //
-// A SALE-ONLY edit counts. V is a column the owner edits on its own all the
-// time - a discount goes on, a discount comes off, the price itself does not
-// move - and while this function only watched U, that edit reached the twin
-// rows never. The site then sold the same package at two different discounts
-// depending on which supplier row carried the tick. So V alone fires it too,
-// and propagates V alone: with U untouched the fee, the net and the profit
-// are all still correct, and recomputing them would only invite a rounding
-// difference against what the scraper wrote this morning.
+// THE RANGE (2026-10-07): with a range on the SKU the price is not only what
+// was typed - it is what reprice_() makes of it, at the cost of the TICKED
+// row (the one the site sells). So a new buy price, a new range or a moved
+// tick can move the sell price too, at once, the same move the chooser would
+// make on its next 4-hourly run. A typed price inside the range that pays is
+// kept as typed; one that does not is corrected, and a toast says so.
+//
+// A SALE-ONLY edit counts. The sale percentage is a column the owner edits
+// on its own all the time - a discount goes on, a discount comes off, the
+// price itself does not move - and while this function only watched U, that
+// edit reached the twin rows never. The site then sold the same package at
+// two different discounts depending on which supplier row carried the tick.
+// So the sale alone fires it too, and propagates the sale alone: the range
+// rule and the margin are judged on the full price, so with U untouched the
+// fee, the net and the profit are all still correct, and recomputing them
+// would only invite a rounding difference against what the scraper wrote.
 //
 // The whole sheet is read once (A .. last mapped column) rather than the
 // edited block alone, because a twin can sit anywhere; the writes are per row
@@ -308,9 +477,12 @@ function applyFee_(sheet, map, e) {
   if (map.price === undefined) return reached;
   const c1 = e.range.getColumn(), c2 = e.range.getLastColumn();
   const hits = function (idx) { return idx !== undefined && idx + 1 >= c1 && idx + 1 <= c2; };
-  const hitU = hits(map.price);          // the final price was typed
-  const hitV = hits(map.sale);           // the sale percentage was typed
-  if (!hitU && !hitV) return reached;
+  const hitU     = hits(map.price);      // the final price was typed
+  const hitV     = hits(map.sale);       // the sale percentage was typed
+  const hitBuy   = hits(map.buy);        // a buy price was typed
+  const hitRange = hits(map.range);      // a price range was typed
+  const hitTick  = hits(map.chosen);     // the tick moved: the site sells another row's cost
+  if (!hitU && !hitV && !hitBuy && !hitRange && !hitTick) return reached;
   const first = Math.max(2, e.range.getRow());
   const last  = e.range.getLastRow();
   if (last < first) return reached;
@@ -319,92 +491,128 @@ function applyFee_(sheet, map, e) {
   const width = Math.max.apply(null, Object.values(map)) + 1;
   const data  = sheet.getRange(2, 1, lastRow - 1, width).getValues();   // one read
 
-  // What was just typed, per SKU. With no SKU column there are no twins to
+  // Every row of every edited SKU. With no SKU column there are no twins to
   // find, so each edited row answers only for itself.
   const keyOf = function (i, row) {
     return map.sku === undefined ? '#' + row : String(data[i][map.sku] || '').trim();
   };
-  const typed = {};
+  const typed = {};          // key -> the edited row that answers for the SKU
   for (let row = first; row <= Math.min(last, lastRow); row++) {
-    const i = row - 2;
-    const key = keyOf(i, row);
-    if (!key) continue;                       // spacer row, not a package
-    typed[key] = {
-      price: data[i][map.price],
-      sale:  map.sale === undefined ? null : data[i][map.sale]
-    };
+    const key = keyOf(row - 2, row);
+    if (key) typed[key] = row - 2;           // blank = spacer row, not a package
   }
-
+  const groups = {};         // key -> every data index of that SKU
   for (let i = 0; i < data.length; i++) {
-    const row = i + 2;
-    const key = keyOf(i, row);
-    if (!key || !typed.hasOwnProperty(key)) continue;
+    const key = keyOf(i, i + 2);
+    if (key && typed.hasOwnProperty(key)) (groups[key] = groups[key] || []).push(i);
+  }
+  const blank = function (v) { return String(v === null || v === undefined ? '' : v).trim() === ''; };
+  const ticked = function (i) { return map.chosen !== undefined && !blank(data[i][map.chosen]); };
+  const moves = [];
+
+  Object.keys(groups).forEach(function (key) {
+    const rows = groups[key];
     const src = typed[key];
-    reached.push(row);          // every row of an edited SKU, written or not
+    const chosen = rows.filter(ticked)[0];   // undefined: the package is off the site
 
-    // Sale-only edit: carry V across the twins and stop. Nothing else on the
-    // row was derived from V, so nothing else on the row is stale.
-    if (!hitU) {
-      if (map.sale === undefined || map.sku === undefined) continue;
-      const wantV = {};
-      wantV[map.sale] = src.sale;
-      writeGroup_(sheet, row, data[i], [map.sale], wantV);
-      continue;
-    }
-
-    const price = num_(src.price);
-    const net = price === null ? null
-              : Math.round((price - realFee_(price)) * 100) / 100;
-
-    // S..V, one call. U is the customer price, verbatim as typed - copied,
-    // never re-formatted: these are text cells and re-writing one as a number
-    // changes what the sheet renders and what every reader parses back out.
-    // V, the sale percentage, belongs to the package and not to the supplier.
-    // T is the ladder fee the customer is shown, S what actually lands after
-    // the processor's real cut.
-    const wantA = {};
-    if (map.sku !== undefined) {
-      wantA[map.price] = src.price;
-      if (map.sale !== undefined) wantA[map.sale] = src.sale;
-    }
-    if (map.fee !== undefined)      wantA[map.fee] = price === null ? '' : tableFee_(price);
-    if (map.my_price !== undefined) wantA[map.my_price] = net === null ? '' : net;
-    writeGroup_(sheet, row, data[i],
-                [map.my_price, map.fee, map.price, map.sale], wantA);
-
-    // P / Q, one call. Profit against THIS row's buy price: each supplier row
-    // keeps its own, because the two rows cost different money at the same
-    // sell price, and that difference is the whole point of the comparison.
-    const buy = map.buy === undefined ? null : firstDollar_(data[i][map.buy]);
-    const judged = !!net && !!buy;
-    const wantB = {};
-    if (map.profit !== undefined) {
-      wantB[map.profit] = judged ? profitText_(net, buy).text : '';
-    }
-    if (map.stock !== undefined) {
-      const gb = num_(data[i][map.gb]);        // '5gb' -> 5
-      const bad = judged && profitText_(net, buy).pct < profitFloorPct_(gb);
-      const now = String(data[i][map.stock] || '').trim();
-      // An unpriced or unquoted row is not called unprofitable - it has not
-      // been judged.
-      //
-      // And this column is SHARED. The scraper parks its own words here
-      // (out-of-stock, fewer-days-than-promised, regional-only - all Hebrew,
-      // none of them ours) and the owner takes a row off sale by hand, in his
-      // own words. Every one of those means the row is already not for sale
-      // for a reason more specific than ours, so the marker goes in only
-      // where the cell is EMPTY - never over a word somebody else put there.
-      // Clearing stays as narrow as it always was: the only word this
-      // function erases is the one it wrote itself.
-      if (bad) {
-        if (now === '') wantB[map.stock] = UNPROFITABLE;
-      } else if (now === UNPROFITABLE) {
-        wantB[map.stock] = '';
+    // The range: as typed, else the ticked row's, else a twin's - the cell
+    // the owner filled on the other supplier's row still counts, and is
+    // copied to the rest (choose_supplier.sku_range does the same).
+    let rangeCell;
+    if (map.range !== undefined) {
+      if (hitRange) rangeCell = data[src][map.range];
+      else {
+        const holder = [chosen].concat(rows).filter(function (i) {
+          return i !== undefined && !blank(data[i][map.range]);
+        })[0];
+        if (holder !== undefined) rangeCell = data[holder][map.range];
       }
     }
-    writeGroup_(sheet, row, data[i], [map.profit, map.stock], wantB);
-  }
+    const rng = rangeCell === undefined ? null : parseRange_(rangeCell);
+
+    // The price: as typed, else the one the SKU already sells at.
+    const priceAt = hitU ? src : (chosen !== undefined ? chosen : src);
+    let priceCell = data[priceAt][map.price];
+    let price = num_(priceCell);
+    let moved = false;
+    if (rng && chosen !== undefined && map.buy !== undefined && (hitU || hitBuy || hitRange || hitTick)) {
+      const cost = firstDollar_(data[chosen][map.buy]);
+      const gb = map.gb === undefined ? null : num_(data[chosen][map.gb]);
+      const want = cost ? reprice_(gb, cost, price, rng[0], rng[1]) : null;
+      if (want !== null && (price === null || Math.abs(want - price) >= 0.005)) {
+        moves.push(key + ' ' + (price === null ? '-' : price.toFixed(2)) + ' \u2192 ' + want.toFixed(2));
+        priceCell = want;
+        price = want;
+        moved = true;
+      }
+    }
+    const writePrice = hitU || moved;
+    const net = price === null ? null : netOf_(price);
+
+    rows.forEach(function (i) {
+      const row = i + 2;
+      reached.push(row);        // every row of an edited SKU, written or not
+
+      // S..W, one call. U is the customer price, copied verbatim as typed -
+      // never re-formatted: these are text cells and re-writing one as a
+      // number changes what the sheet renders and what every reader parses
+      // back out. Only a price the range rule MOVED is written as a number,
+      // as the chooser writes it. The sale percentage and the range belong
+      // to the package and not to the supplier. T is the ladder fee the
+      // customer is shown, S what actually lands after the processor's cut.
+      const wantA = {};
+      if (writePrice) {
+        if (map.sku !== undefined || moved) wantA[map.price] = priceCell;
+        if (map.fee !== undefined)      wantA[map.fee] = price === null ? '' : tableFee_(price);
+        if (map.my_price !== undefined) wantA[map.my_price] = net === null ? '' : net;
+      }
+      if (hitV && map.sale !== undefined && map.sku !== undefined) wantA[map.sale] = data[src][map.sale];
+      if (rangeCell !== undefined && map.sku !== undefined) wantA[map.range] = rangeCell;
+      writeGroup_(sheet, row, data[i], [map.my_price, map.fee, map.price, map.range, map.sale], wantA);
+
+      // A sale-only edit stops here: nothing P or Q reads has changed.
+      if (!writePrice && !hitBuy && !hitRange && !hitTick) return;
+
+      // P / Q, one call. Profit against THIS row's buy price: each supplier
+      // row keeps its own, because the two rows cost different money at the
+      // same sell price, and that difference is the whole point of the
+      // comparison. The net is the one the row holds once this edit is done.
+      const buy = map.buy === undefined ? null : firstDollar_(data[i][map.buy]);
+      const rowNet = writePrice ? net : num_(data[i][map.my_price]);
+      const wantB = {};
+      if (map.profit !== undefined) {
+        wantB[map.profit] = rowNet && buy ? profitText_(rowNet, buy).text : '';
+      }
+      if (map.stock !== undefined) {
+        const gb = map.gb === undefined ? null : num_(data[i][map.gb]);
+        const now = String(data[i][map.stock] || '').replace(BIDI_RE, '').trim();
+        // An unpriced or unquoted row is not called unprofitable - it has not
+        // been judged.
+        //
+        // And this column is SHARED. The scraper parks its own words here
+        // (out-of-stock, fewer-days-than-promised, regional-only - all Hebrew,
+        // none of them ours) and the owner takes a row off sale by hand, in
+        // his own words. Every one of those means the row is already not for
+        // sale for a reason more specific than ours, so only an EMPTY cell or
+        // one of the bots' own margin words (PROFIT_MARKS) is ever written -
+        // never a word somebody else put there.
+        if (now === '' || PROFIT_MARKS.indexOf(now) >= 0) {
+          const mark = profitMark_(key, buy, gb, rowNet, rng);
+          if (mark !== now) wantB[map.stock] = mark;
+        }
+      }
+      writeGroup_(sheet, row, data[i], [map.profit, map.stock], wantB);
+    });
+  });
   SpreadsheetApp.flush();   // the sync below reads these cells back
+  if (moves.length) {
+    // The owner just typed something and the sheet answered with a price the
+    // owner did not type - say why, or it reads as the sheet fighting back.
+    try {
+      e.source.toast(moves.slice(0, 6).join('\n') + (moves.length > 6 ? '\n+' + (moves.length - 6) : ''),
+        '\u05d8\u05d5\u05d5\u05d7 \u05de\u05d7\u05d9\u05e8\u05d9\u05dd: \u05d4\u05de\u05d7\u05d9\u05e8 \u05e2\u05d5\u05d3\u05db\u05df', 10);
+    } catch (err) {}
+  }
   return reached;
 }
 
@@ -810,8 +1018,10 @@ function onEditPush(e) {
     const watched = Object.values(map).map(i => i + 1);
     const c1 = e.range.getColumn(), c2 = e.range.getLastColumn();
     if (!watched.some(c => c >= c1 && c <= c2)) return;   // not a synced column
-    const reached = applyFee_(sheet, map, e) || [];
+    // The tick first: a moved tick changes which row's cost the range rule
+    // prices against, and applyFee_ must read the one-tick state.
     enforceChoice_(sheet, map, e);
+    const reached = applyFee_(sheet, map, e) || [];
     const rows = [];
     for (let r = Math.max(2, e.range.getRow()); r <= e.range.getLastRow(); r++) rows.push(r);
     // The twin rows applyFee_ just rewrote. buildPackages_ turns a row into

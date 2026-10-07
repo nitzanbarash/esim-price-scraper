@@ -12,7 +12,11 @@ given on 2026-10-07, is a RANGE per package in a column of its own
 
 The low end is the price the package should ideally sell at and the lowest it
 may ever go; the high end is the price past which the package is too dear to
-sell at all. Inside the range the bot moves U on the chooser's 4-hourly run:
+sell at all. Inside the range the bot moves U on the chooser's 4-hourly run
+— and the sheet's own script (waverole_sync.gs applyFee_, a JavaScript copy
+of this rule) makes the same move the moment the owner types a cost, a
+price, a range or moves the tick; test_waverole_sync.js holds the two
+copies to the same answers:
 
   * every package but 1GB: prices sit on a 50-cent grid ending in .49/.99.
     The price goes UP, as many steps as it takes, the moment the margin falls
