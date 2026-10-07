@@ -26,9 +26,14 @@ moment ANY writer adds it — the PC bot, the Stellar buyer, a row typed by hand
 — and a corrected price re-colours itself. The colours are the ones the owner
 painted by hand before this existed.
 
-Rules are found by the column's HEADER, because the owner reorders columns.
-This script owns every rule whose range is exactly one of those three columns
-from row 2 to the grid's last row, and nothing else (the Status column keeps its own rules).
+Rules are found by the column's HEADER, because the owner reorders columns —
+and a Sheets rule does NOT follow a column that is moved by cut/paste (2026-10-07:
+Status, source and Sell moved one column right; every rule stayed put and
+painted the neighbour). So this script owns two kinds of rule: any rule on one
+of its columns (row 2 to the grid's last row), and any rule anywhere whose
+formula is one of its own with a different column letter — those stranded
+copies are deleted and rewritten on the named column. The Status column's
+three colours (the owner's hand rules until 10-07) are owned the same way.
 It is idempotent: when the sheet already matches, it writes nothing.
 
     python receipts_colors.py            # apply
@@ -48,6 +53,7 @@ COL_SELL = "מכירה - Sell"
 COL_BUY = "קנייה - Buy"
 COL_SALE = "הנחה - Sale"
 COL_USAGE = "GB (0/X) - ניצול"
+COL_STATUS = "סטטוס - Status"
 
 # Text colours. Spelled as the dropdown spells them; matched case-insensitively.
 SUPPLIER_COLORS = {
@@ -71,6 +77,12 @@ USAGE_YELLOW = "#fff2cc"    # past half, up to 80%
 USAGE_RED = RED             # past 80%, not finished
 USAGE_BLUE = "#c9daf8"      # finished: used >= total
 USAGE_HALF, USAGE_HOT = 0.5, 0.8
+
+# The Status fills, as the owner painted them (usage_bot writes these words).
+STATUS_ACTIVE = "#c6e8c9"   # פעיל
+STATUS_DONE = "#c9ddf4"     # נוצל / הסתיים
+STATUS_FAULT = "#ffeda8"    # תקלה
+STATUS_WORDS = ("פעיל", "נוצל", "הסתיים", "תקלה")
 # One regex each for the two numbers. Both insist the WHOLE cell is
 # "number / number" (spaces around the slash or not): anything else -- a bare
 # number, words, a second slash -- matches neither and gets no colour. The
@@ -188,11 +200,12 @@ def desired_rules(header: list[str], dropdown: list[str], sheet_id: int,
                   rows: int) -> list[dict]:
     """The rules, in priority order (the first one that matches a cell wins)."""
     col = {h: i for i, h in enumerate(header)}
-    missing = [c for c in (COL_SOURCE, COL_SELL, COL_BUY, COL_SALE, COL_USAGE) if c not in col]
+    names = (COL_SOURCE, COL_SELL, COL_BUY, COL_SALE, COL_USAGE, COL_STATUS)
+    missing = [c for c in names if c not in col]
     if missing:
         raise SystemExit(f"receipts sheet has no column {missing} — nothing changed")
-    src, sell, buy, sale, use = (col[c] for c in (COL_SOURCE, COL_SELL, COL_BUY, COL_SALE, COL_USAGE))
-    V, Z, X, Y, E = ("$%s2" % _letter(i) for i in (src, sell, buy, sale, use))
+    src, sell, buy, sale, use, status = (col[c] for c in names)
+    V, Z, X, Y, E, S = ("$%s2" % _letter(i) for i in (src, sell, buy, sale, use, status))
 
     def rule(column, formula, color, text=False):
         fmt = ({"textFormat": {"foregroundColor": _rgb(color)}} if text
@@ -220,6 +233,11 @@ def desired_rules(header: list[str], dropdown: list[str], sheet_id: int,
         rule(sell, f"=IFERROR({_num(Z)}>0,FALSE)", GREEN),
     ]
     rules += [rule(use, formula, color) for formula, color in usage_formulas(E)]
+    rules += [
+        rule(status, f'=TRIM({S})="פעיל"', STATUS_ACTIVE),
+        rule(status, f'=OR(TRIM({S})="נוצל",TRIM({S})="הסתיים")', STATUS_DONE),
+        rule(status, f'=TRIM({S})="תקלה"', STATUS_FAULT),
+    ]
     return rules
 
 
@@ -238,12 +256,33 @@ def _key(r: dict) -> str:
     ], ensure_ascii=False)
 
 
-def _owned(r: dict, columns: set[int]) -> bool:
+_COLREF = re.compile(r"\$[A-Z]{1,3}2\b")
+
+
+def _shape(r: dict) -> str:
+    """A rule's condition with the column letters blanked: the same rule on
+    any column has the same shape, which is how a copy stranded by a column
+    move is recognised."""
+    c = r.get("booleanRule", {}).get("condition", {})
+    return json.dumps([c.get("type"),
+                       [_COLREF.sub("$_2", v.get("userEnteredValue", ""))
+                        for v in c.get("values", [])]], ensure_ascii=False)
+
+
+# The owner's hand-made Status rules (TEXT_EQ, no formula), so the first run
+# after 2026-10-07 picks them up too.
+_LEGACY_SHAPES = {json.dumps(["TEXT_EQ", [w]], ensure_ascii=False) for w in STATUS_WORDS} | {
+    json.dumps(["CUSTOM_FORMULA", ['=OR($_2="נוצל",$_2="הסתיים")']], ensure_ascii=False)}
+
+
+def _owned(r: dict, columns: set[int], shapes: set[str] = frozenset()) -> bool:
     rngs = r.get("ranges", [])
-    return (len(rngs) == 1 and "booleanRule" in r
-            and rngs[0].get("startRowIndex", 0) == 1
-            and rngs[0].get("startColumnIndex") in columns
-            and rngs[0].get("endColumnIndex") == rngs[0].get("startColumnIndex") + 1)
+    if len(rngs) != 1 or "booleanRule" not in r:
+        return False
+    one = rngs[0].get("endColumnIndex") == rngs[0].get("startColumnIndex") + 1
+    on_my_column = (rngs[0].get("startRowIndex", 0) == 1 and one
+                    and rngs[0].get("startColumnIndex") in columns)
+    return on_my_column or (one and _shape(r) in shapes)
 
 
 def plan(meta: dict, header: list[str], dropdown: list[str]) -> list[dict]:
@@ -254,8 +293,9 @@ def plan(meta: dict, header: list[str], dropdown: list[str]) -> list[dict]:
     rows = meta["properties"]["gridProperties"]["rowCount"]
     want = desired_rules(header, dropdown, sheet_id, rows)
     cols = {r["ranges"][0]["startColumnIndex"] for r in want}
+    shapes = {_shape(r) for r in want} | _LEGACY_SHAPES
     have = meta.get("conditionalFormats", [])
-    mine = [i for i, r in enumerate(have) if _owned(r, cols)]
+    mine = [i for i, r in enumerate(have) if _owned(r, cols, shapes)]
     if [_key(have[i]) for i in mine] == [_key(r) for r in want]:
         return []
     reqs = [{"deleteConditionalFormatRule": {"sheetId": sheet_id, "index": i}}
