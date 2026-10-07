@@ -94,6 +94,11 @@ jobs:
       - name: Choose supplier
         run: python test_choose_supplier.py
 
+      # The sell price, moved inside the owner's range by the cost. A wrong
+      # step here is a package sold at a loss, or one priced off the site.
+      - name: Price ranges
+        run: python test_price_ranges.py
+
       # What a coupon row MEANS before it is pushed to the till. A blank 'active'
       # cell that read as true, or a percent-formatted 10 that read as 0.1, is a
       # discount nobody approved being handed to everyone who asks.

@@ -150,6 +150,16 @@ protects a LIVE listing from moving for pennies — protects nothing. A rival
 that is cheaper by any amount AND pays on its own verdict takes such a SKU;
 a dearer or equal rival never does, which is the whole point.
 
+The sell price itself (2026-10-07, price_ranges.py). A SKU with a range in
+'טווח מחירים' (V) has its U moved by the cost of the row the tick sits on —
+up to the first 50-cent step that pays 30% of cost, down one step a run while
+it pays over 200%; 1GB to the lowest 10-cent step inside 0.99–1.49 that loses
+at most 10c — with S and T rewritten the way applyFee_ would. A range on a
+SKU also replaces the 20% floor in the verdict above: 'לא רווחי — מעל טווח'
+when no price in the range pays at a row's cost (the ceiling is still judged
+first). A blank range cell is the owner's hands-off; the range rides the
+carry and the mirror like U does. Every move is in the summary and the mail.
+
 Run:
     python choose_supplier.py            dry run — prints the table, writes nothing
     python choose_supplier.py --apply    writes to the sheet
@@ -170,6 +180,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import day_policy
+import price_ranges
+from price_ranges import OVER_RANGE_LABEL, RANGE_HEADER
 from esim_price_scraper import (
     HEADER_KEYS, OVER_CEILING_LABEL, SHEET_ID, UNPROFITABLE_LABEL,
     is_profitable, over_ceiling,
@@ -182,7 +194,7 @@ SOURCES = frozenset({"esim.dog", "stellar"})
 # The two words Q may hold about a row's MARGIN rather than its supply. Both
 # are derived — from the row's cost, the SKU's sell price and its size — so
 # they are recomputed here on every run and never read as "cannot buy".
-PROFIT_MARKS = frozenset({UNPROFITABLE_LABEL, OVER_CEILING_LABEL})
+PROFIT_MARKS = frozenset({UNPROFITABLE_LABEL, OVER_CEILING_LABEL, OVER_RANGE_LABEL})
 
 # A blank מקור is not an unknown supplier — it is esim.dog. Every other reader
 # of this sheet already says so: waverole_sync.gs rowToPackage_ (blank source
@@ -194,11 +206,12 @@ DEFAULT_SOURCE = "esim.dog"
 TICK = "✓"                    # the mark the sync looks for in נבחר
 WINNER_BG = "#d8efd3"              # the sheet's own green
 LOSER_BG = "#f2f2f2"               # the sheet's own grey
-# Colour A..W and stop — 23 columns, the same width enforceChoice_ paints
-# (waverole_sync.gs: max mapped column + 1, and נבחר is the last mapped one).
-# X..AH are the owner's free columns and AI.. the reference blocks; a wider
-# stripe would paint over them (memory: price-sheet-column-tail).
-LAST_COL = 23
+# Colour A..X and stop — 24 columns, the same width enforceChoice_ paints
+# (waverole_sync.gs: max mapped column + 1, and נבחר is the last mapped one;
+# X since 'טווח מחירים' went in at V on 2026-10-07). Y.. are the owner's free
+# columns and the reference blocks; a wider stripe would paint over them
+# (memory: price-sheet-column-tail).
+LAST_COL = 24
 
 # Columns W/T/U/V are the owner's, not the scraper's, so they are not in
 # HEADER_KEYS. Everything is still found by header TEXT — the owner reorders
@@ -206,17 +219,21 @@ LAST_COL = 23
 EXTRA_HEADERS = {
     "fee":      "סליקה",              # T
     "final":    "מחיר סופי",           # U — what the customer pays
-    "discount": "מבעצעים (אחוזים)",    # V
-    "chosen":   "נבחר",               # W — the tick the sync reads
+    "range":    RANGE_HEADER,          # V — the owner's price range (price_ranges)
+    "discount": "מבעצעים (אחוזים)",    # W
+    "chosen":   "נבחר",               # X — the tick the sync reads
 }
 COLUMN_KEYS = {**HEADER_KEYS, **EXTRA_HEADERS}
 
 REQUIRED = ("code", "gb", "source", "validity", "price", "changed", "profit", "stock",
             "my_price", "fee", "final", "discount", "chosen")
 
-# The four customer-side cells a switch carries over, in the order they are
+# The customer-side cells a switch carries over, in the order they are
 # written. U leads because U is the one that decides whether any of it moves.
-CARRY = ("final", "my_price", "fee", "discount")
+# The range rides along too: it belongs to the package, not the supplier.
+# ("range" is optional in the header — a sheet without the column carries
+# and mirrors nothing for it, and never reprices.)
+CARRY = ("final", "my_price", "fee", "discount", "range")
 
 
 # ── the sheet, as values ────────────────────────────────────────────────────
@@ -249,7 +266,8 @@ class Row:
     my_price: object = ""          # S
     fee: object = ""               # T
     final: object = ""             # U
-    discount: object = ""          # V
+    range: object = ""             # V — '5.99 - 7.99', or blank = hands off
+    discount: object = ""          # W
     profit: object = ""            # P
 
     def get(self, key: str):
@@ -378,7 +396,8 @@ def eligible(r: Row) -> bool:
             and days_of(r.validity) is not None)
 
 
-def profit_mark(sku: str, r: Row, my_price: Optional[float]) -> str:
+def profit_mark(sku: str, r: Row, my_price: Optional[float],
+                rng: Optional[tuple] = None) -> str:
     """What Q should say about this row's margin: a PROFIT_MARKS word, or ''.
 
     The scraper's two rules in the scraper's order (esim_price_scraper.py
@@ -388,16 +407,26 @@ def profit_mark(sku: str, r: Row, my_price: Optional[float]) -> str:
     needs the SKU's מחיר שלי. With no cost nothing is judged; with a cost but
     no sell price only the ceiling is. Unjudged is '' — not called
     unprofitable, the same as is_profitable() says.
+
+    With a price RANGE on the SKU (`rng`, from price_ranges) the floor is the
+    range's: the row is for sale if some price inside the range pays the
+    owner's 30% (1GB: loses at most 10c) at THIS row's cost, and
+    'לא רווחי — מעל טווח' if none does. The sell price itself is not judged
+    then — the bot moves it to where it pays, or there is nowhere to move it.
     """
     cost, gb = usd(r.price), gb_of(r.gb)
     if over_ceiling(cost, gb, sku):
         return OVER_CEILING_LABEL
+    ok = price_ranges.feasible(gb, cost, rng)
+    if ok is not None:
+        return "" if ok else OVER_RANGE_LABEL
     if my_price and cost and not is_profitable(my_price, cost, gb):
         return UNPROFITABLE_LABEL
     return ""
 
 
-def judge_stock(sku: str, r: Row, my_price: Optional[float]) -> Optional[tuple]:
+def judge_stock(sku: str, r: Row, my_price: Optional[float],
+                rng: Optional[tuple] = None) -> Optional[tuple]:
     """The write that brings Q's margin word up to date, or None for no write.
 
     Only an empty cell or one of PROFIT_MARKS is ever written: a supplier's
@@ -407,8 +436,50 @@ def judge_stock(sku: str, r: Row, my_price: Optional[float]) -> Optional[tuple]:
     now = stock_word(r)
     if now and now not in PROFIT_MARKS:
         return None
-    want = profit_mark(sku, r, my_price)
+    want = profit_mark(sku, r, my_price, rng)
     return None if want == now else (r.row, "stock", want)
+
+
+def sku_range(group: list[Row], chosen: Row, carried: dict) -> Optional[tuple]:
+    """The SKU's price range as (lo, hi), or None when there is none to obey.
+
+    It is read off the chosen row — or, when that cell is blank, off any other
+    row of the SKU (the owner typed it on the twin): then it is put into
+    `carried` so the chosen row gets it and the mirror spreads it, instead
+    of the mirror wiping the twin's copy with the chosen row's blank.
+    """
+    cell = carried["range"] if "range" in carried else chosen.get("range")
+    if _blank(cell):
+        for r in group:
+            if r is not chosen and not _blank(r.range):
+                cell = carried["range"] = r.get("range")
+                break
+    return price_ranges.parse_range(text(cell))
+
+
+def reprice_sku(chosen: Row, carried: dict, rng: Optional[tuple]) -> tuple[list, Optional[tuple]]:
+    """The U/S/T writes that move the chosen row's price by the range rule —
+    and None, or (old, new), to say so. `carried` is updated in place so a
+    switch's carry and the mirror hand the NEW price on, not the old one.
+
+    Nothing is written when the range is absent or unreadable, the row has
+    no cost, the rule says stay, or no price in the range pays (that last is
+    Q's verdict — profit_mark — not a price move: the owner sees the package
+    go off sale at the price it had, not at the top of the range).
+    """
+    if rng is None:
+        return [], None
+    cost = usd(chosen.price)
+    if cost is None:
+        return [], None
+    cur = final_usd(carried["final"] if "final" in carried else chosen.final)
+    new = price_ranges.reprice(gb_of(chosen.gb), cost, cur, *rng)
+    if new is None or (cur is not None and abs(new - cur) < 0.005):
+        return [], None
+    vals = {"final": new, "my_price": price_ranges.net_of(new),
+            "fee": price_ranges.table_fee(new)}
+    carried.update(vals)
+    return [(chosen.row, key, value) for key, value in vals.items()], (cur, new)
 
 
 def profit_text(my_price: float, cost: float) -> str:
@@ -540,6 +611,7 @@ class Decision:
                                     # reason is a rule and not just "already
                                     # matches" — the owner has to be told
     judged: int = 0                 # Q margin words written or cleared this run
+    price_move: Optional[tuple] = None   # (old U, new U) when the range rule moved it
     group: list = field(default_factory=list, repr=False)   # the rows, as read — so a
                                     # deferred switch can still refresh its P
 
@@ -591,17 +663,26 @@ def decide(rows: list[Row]) -> list[Decision]:
             # Mexico sold at a loss for days after Stellar repriced it. Now a
             # live row gets the same ceiling-then-floor verdict as a twin row;
             # an unticked row is off the site already and is left alone.
-            writes = profit_writes(group, [])
+            writes: list = []
             judged = 0
+            move = None
             r = group[0]
             if text(r.chosen).strip():
-                w = judge_stock(sku, r, price_num(r.my_price))
+                carried: dict = {}
+                rng = sku_range(group, r, carried)
+                writes, move = reprice_sku(r, carried, rng)
+                mine = (price_num(carried["my_price"]) if "my_price" in carried
+                        else price_num(r.my_price))
+                writes = writes + profit_writes(group, writes)
+                w = judge_stock(sku, r, mine, rng)
                 if w:
                     writes.append(w)
                     judged = 1
+            else:
+                writes = profit_writes(group, [])
             if writes:
                 out.append(Decision(sku=sku, action="solo", writes=writes,
-                                    judged=judged, group=group))
+                                    judged=judged, group=group, price_move=move))
             continue
         inc, why = _incumbent(group)
         if inc is None:
@@ -668,11 +749,33 @@ def decide(rows: list[Row]) -> list[Decision]:
             # no tick means the site was not selling that row's price anyway.
             if final_usd(inc.final) is not None:
                 carried = {key: inc.get(key) for key in CARRY}
+
+        # The range rule, against the WINNER's cost — the money the SKU is
+        # about to be bought for — from the price the SKU holds (the carry's,
+        # on a switch). It updates `carried`, so the carry below and the
+        # mirror after it hand on the moved price, never the stale one.
+        rng = sku_range(group, winner, carried)
+        price_writes, d.price_move = reprice_sku(winner, carried, rng)
+        if d.action == "switch":
+            if "final" in carried:
                 for key in CARRY:
+                    # A blank range carried over a blank range is no write:
+                    # most SKUs had no range before 2026-10-07, and clearing
+                    # an empty cell is a wasted request.
+                    if key == "range" and _blank(carried[key]) and _blank(winner.range):
+                        continue
                     d.writes.append((winner.row, key, carried[key]))
+            else:
+                d.writes.extend(price_writes)
             d.writes.append((winner.row, "changed", switch_note(inc, winner)))
             d.colours.append((winner.row, WINNER_BG))
             d.colours.extend((r.row, LOSER_BG) for r in group if r is not winner)
+        else:
+            d.writes.extend(price_writes)
+            if "range" in carried:          # typed on the twin: the ✓ row gets it
+                d.writes.append((winner.row, "range", carried["range"]))
+        if "my_price" in carried:
+            mine = price_num(carried["my_price"])
 
         # The mirror, on every run: every row of the SKU quotes the SKU's own
         # customer price, not just the row the tick happens to sit on today.
@@ -702,7 +805,7 @@ def decide(rows: list[Row]) -> list[Decision]:
         # the other row's is what the next switch will inherit. Both stay
         # fresh here because nothing else refreshes a Stellar row's.
         for r in group:
-            w = judge_stock(sku, r, mine)
+            w = judge_stock(sku, r, mine, rng)
             if w:
                 d.writes.append(w)
                 d.judged += 1
@@ -735,6 +838,7 @@ def cap_switches(decisions: list[Decision], limit: int) -> int:
         d.mirrored = 0           # and its mirror: the row it would copy FROM is
         d.mirror_note = ""       # the one this run is no longer going to choose
         d.judged = 0
+        d.price_move = None
         left += 1
     return left
 
@@ -756,7 +860,9 @@ def sheets_service(cred_path: str):
 
 
 def read_sheet(svc) -> list[list]:
-    """A1:X and not one column further — the reference blocks live past it.
+    """A1:Z and not one column further — the reference blocks live past it
+    (Y 'Stellar plan_id' and Z are read and ignored; AA.. holds the fee
+    ladder and the SKU key, which must never be inside a row).
 
     UNFORMATTED_VALUE, so a cell arrives as what it IS: 16.99 for a number,
     '$16.99' for text. The default (FORMATTED_VALUE) renders every cell through
@@ -766,13 +872,13 @@ def read_sheet(svc) -> list[list]:
     carry possible: the write can only preserve a type the read kept.
     """
     return svc.spreadsheets().values().get(
-        spreadsheetId=SHEET_ID, range="A1:X",
+        spreadsheetId=SHEET_ID, range="A1:Z",
         valueRenderOption="UNFORMATTED_VALUE",
     ).execute().get("values", [])
 
 
 def sheet_id(svc) -> int:
-    """The first tab — the one a bare A1:X hits."""
+    """The first tab — the one a bare A1:Z hits."""
     return svc.spreadsheets().get(
         spreadsheetId=SHEET_ID, fields="sheets(properties(sheetId))",
     ).execute()["sheets"][0]["properties"]["sheetId"]
@@ -805,6 +911,7 @@ def read_rows(values: list[list]) -> tuple[list[Row], dict[str, int]]:
                         fee=cells[col["fee"]],
                         final=cells[col["final"]],
                         discount=cells[col["discount"]],
+                        range=cells[col["range"]] if "range" in col else "",
                         profit=cells[col["profit"]]))
     return rows, col
 
@@ -890,8 +997,10 @@ def _describe(d: Decision) -> str:
     p_tail = f"   [+{profits} P]" if profits else ""
     if d.action == "skip":
         return f"  {d.sku:<10} \u23ed  SKIPPED \u2014 {d.reason}{p_tail}"
+    move = (f"   [\U0001f4b2 {money(d.price_move[0])} \u2192 {money(d.price_move[1])}]"
+            if d.price_move else "")
     if d.action == "solo":
-        line = f"  {d.sku:<10} \u00b7  one supplier{p_tail}"
+        line = f"  {d.sku:<10} \u00b7  one supplier{p_tail}{move}"
         if d.judged:
             words = ", ".join(f"{row}:{value or 'cleared'}"
                               for row, key, value in d.writes if key == "stock")
@@ -903,7 +1012,7 @@ def _describe(d: Decision) -> str:
     tail = f"   {d.reason}" if d.reason else ""
     if d.action == "deferred":
         tail += "   [held by --max-switches]"
-    tail += p_tail
+    tail += p_tail + move
     if d.mirrored:
         tail += f"   [⇉{d.mirrored} mirrored]"
     if d.mirror_note:
@@ -950,9 +1059,23 @@ def live_q_changes(decisions: list[Decision], rows: list[Row]) -> list[tuple]:
     return out
 
 
-def mail_live_q_changes(changes: list[tuple]) -> bool:
-    """Mail the owner, in Hebrew, which live packages went off sale (or back on)."""
-    if not changes:
+def price_moves(decisions: list[Decision]) -> list[tuple]:
+    """Every U the range rule moved this run: (sku, row, old, new, cost, range)."""
+    out = []
+    for d in decisions:
+        if not d.price_move:
+            continue
+        r = d.winner if d.winner is not None else d.group[0]
+        out.append((d.sku, r.row, d.price_move[0], d.price_move[1], usd(r.price),
+                    text(r.range).strip()))
+    return out
+
+
+def mail_live_q_changes(changes: list[tuple], moves: list[tuple] = ()) -> bool:
+    """Mail the owner, in Hebrew, which live packages went off sale (or back
+    on) and which prices the range rule moved — one mail per run, only when
+    something did."""
+    if not changes and not moves:
         return False
     off = [c for c in changes if c[6]]
     back = [c for c in changes if not c[6]]
@@ -964,26 +1087,41 @@ def mail_live_q_changes(changes: list[tuple]) -> bool:
                 f"  →  {new or 'חזר למכירה'}"
                 + (f"  (היה: {old})" if old else ""))
 
+    def move_line(m):
+        sku, row, old, new, cost, rng = m
+        arrow = "▲" if (old is None or new > old) else "▼"
+        return (f"{sku}  (שורה {row})  {money(old)} → {money(new)} {arrow}"
+                f"  קנייה {money(cost)}  רווח {price_ranges.margin_pct(new, cost):.0f}%"
+                f"  טווח {rng}")
+
     parts = []
+    if moves:
+        up = sum(1 for m in moves if m[2] is None or m[3] > m[2])
+        parts.append(f"{len(moves)} מחירים זזו ({up} עלו, {len(moves) - up} ירדו)")
     if off:
         parts.append(f"{len(off)} חבילות ירדו מהמכירה")
     if back:
         parts.append(f"{len(back)} חזרו למכירה")
-    subject = " / ".join(parts) + " (רווחיות)"
-    body = ("הבוט שבוחר ספק שינה את "
-            "מילת הרווחיות (Q) על שורות "
-            "שמסומנות ב-וי ולכן מוצגות באתר. "
+    subject = " / ".join(parts)
+    body = ("הבוט שבוחר ספק (כל 4 שעות) הזיז מחירים לפי "
+            "עמודת 'טווח מחירים' ו/או שינה את מילת הרווחיות (Q) "
+            "על שורות שמסומנות ב-וי ולכן מוצגות באתר. "
             "הסנכרון השעתי מעביר את זה לאתר "
             "(מילה ב-Q = אזל מהמלאי).\n\n")
+    if moves:
+        body += "מחירים שזזו:\n" + "\n".join(move_line(m) for m in moves) + "\n\n"
     if off:
         body += "ירדו מהמכירה:\n" + "\n".join(line(c) for c in off) + "\n\n"
     if back:
         body += "חזרו למכירה:\n" + "\n".join(line(c) for c in back) + "\n\n"
-    body += ("כללים: רצפת רווח 20% ממחיר הקנייה "
-             "(1GB: מותר הפסד עד 20%), תקרת קנייה "
-             "30GB $10 / 40GB $14 / 50GB $18. כדי להחזיר חבילה "
-             "למכירה: להעלות את מחיר שלי (S) "
-             "מעל הרצפה — המילה תימחק בריצה הבאה.\n")
+    body += ("כללי הטווח: המחיר עולה (בקפיצות של 50 סנט, תמיד x.49/x.99) "
+             "כשהרווח יורד מתחת ל-30% ממחיר הקנייה, ויורד מדרגה אחת בריצה "
+             "כשהרווח מעל 200% והמחיר מעל המינימום. אין מדרגה בטווח שמרוויחה "
+             "30% → 'לא רווחי — מעל טווח'. 1GB: תמיד 0.99–1.49 בקפיצות של 10 סנט, "
+             "המדרגה הנמוכה ביותר שמפסידה עד 10 סנט כולל סליקה. "
+             "תא טווח ריק = הבוט לא נוגע במחיר. "
+             "בלי טווח: רצפת רווח 20% (1GB: הפסד עד 20%). "
+             "תקרת קנייה: 30GB $10 / 40GB $14 / 50GB $18.\n")
     print(f"\u2709  {subject}")
     pw = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "")
     if not pw:
@@ -1054,6 +1192,11 @@ def main(argv=None) -> int:
     print(f"\n\U0001f4ca switched {len(switched)} / kept {len(kept)} / skipped {len(skipped)}"
           f" | {cells} cells ({profits} of them \u05e8\u05d5\u05d5\u05d7, {judged} of them "
           f"Q) | {sum(len(d.colours) for d in decisions)} rows recoloured")
+    moved = price_moves(decisions)
+    if moved:
+        up = sum(1 for m in moved if m[2] is None or m[3] > m[2])
+        print(f"\U0001f4b2 range rule moved {len(moved)} price{'' if len(moved) == 1 else 's'} "
+              f"({up} up, {len(moved) - up} down)")
     if solo:
         solo_q = sum(d.judged for d in solo)
         print(f"\U0001f4b2 {len(solo)} one-supplier SKU{'' if len(solo) == 1 else 's'} "
@@ -1079,7 +1222,7 @@ def main(argv=None) -> int:
         return 0
     n = apply(svc, decisions, col)
     print(f"\n\u2705 wrote {n} requests")
-    mail_live_q_changes(live_q_changes(decisions, rows))
+    mail_live_q_changes(live_q_changes(decisions, rows), price_moves(decisions))
     return 0
 
 

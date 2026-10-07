@@ -40,7 +40,7 @@ import sys
 
 import day_policy
 from choose_supplier import (
-    CARRY, LAST_COL, LOSER_BG, OVER_CEILING_LABEL, PROFIT_MARKS, TICK,
+    CARRY, LAST_COL, LOSER_BG, OVER_CEILING_LABEL, OVER_RANGE_LABEL, PROFIT_MARKS, TICK,
     UNPROFITABLE_LABEL, WINNER_BG, Row, _entered_value, availability_word,
     cap_switches, decide, eligible, final_usd, gb_of, judge_stock, mirror_of,
     live_q_changes, money, price_num, profit_mark, profit_text, profit_writes,
@@ -554,8 +554,8 @@ check("...and reports the one-supplier SKUs on their own line",
       "one-supplier SKU touched (2 cells: P refreshed, 1 Q word)" in _o, True)
 
 print("\n-- Q's margin word, re-judged on every row of a SKU every run --")
-check("the two words are the scraper's own", PROFIT_MARKS,
-      frozenset({"לא רווחי", "לא רווחי — מעל תקרה"}))
+check("the three margin words: the scraper's two and the range rule's",
+      PROFIT_MARKS, frozenset({UNPROFITABLE_LABEL, OVER_CEILING_LABEL, OVER_RANGE_LABEL}))
 check("gb: a number", gb_of(10), 10.0)
 check("gb: text with a unit", gb_of("10gb"), 10.0)
 check("gb: a fraction", gb_of("0.5GB"), 0.5)
@@ -723,8 +723,8 @@ check("...and that is what the switch actually writes",
       writes_of(d, "changed"),
       [(3, "\u2194 \u05e1\u05e4\u05e7: esim.dog \u2192 Stellar (\u2014 \u2192 $99.00)")])
 
-print("\n-- the stripe is A..W, the width enforceChoice_ paints --")
-check("23 columns, so \u05e0\u05d1\u05d7\u05e8 is the last one painted", LAST_COL, 23)
+print("\n-- the stripe is A..X, the width enforceChoice_ paints --")
+check("24 columns, so \u05e0\u05d1\u05d7\u05e8 is the last one painted (V = range since 10-07)", LAST_COL, 24)
 
 print("\n-- --max-switches: a phased first run --")
 def three_switches():
