@@ -451,6 +451,48 @@ check("after a switch only the newly ticked row counts as live",
       [c[1] for c in live_q_changes([fake], [dog(2, "x.1.10", "$10.00", chosen=TICK),
                                               stellar(3, "x.1.10", "$9.00")])], [3])
 check("no changes, no mail", live_q_changes([], [mx]), [])
+
+print("\n-- the run goes to the daily summary, not to a mail (owner, 2026-10-12) --")
+import json as _json, os as _os, urllib.request as _ur
+import choose_supplier as _cs
+ev = _cs.run_events(decide([mx]), [mx])
+check("Mexico is one 'off' event with its cost, price and word",
+      [(e["t"], e["sku"], e["supplier"], e["cost"], e["price"], e["word"]) for e in ev],
+      [("off", "3.52.5", "Stellar", 4.64, 3.48, UNPROFITABLE_LABEL)])
+_posted, _mailed = [], []
+_real_open, _real_mail = _ur.urlopen, _cs.mail_live_q_changes
+
+
+class _Resp:
+    def __init__(self, status): self.status = status
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+_cs.mail_live_q_changes = lambda *a, **k: _mailed.append(k.get("fallback")) or False
+try:
+    _ur.urlopen = lambda req, timeout=0: (_posted.append(req), _Resp(200))[1]
+    _os.environ["ORDERS_TOKEN"] = "t0k"
+    check("a run the site takes is not mailed", (_cs.report_run(decide([mx]), [mx]), _mailed), (True, []))
+    req = _posted[-1]
+    check("posted to fn=price_log with the bot's bearer", (req.full_url.endswith("/api/admin?fn=price_log"),
+          req.get_header("Authorization")), (True, "Bearer t0k"))
+    check("...carrying the events", [e["sku"] for e in _json.loads(req.data)["events"]], ["3.52.5"])
+    check("an empty run is posted too (a silent bot shows in the summary)",
+          (_cs.report_run([], [mx]), len(_posted), _mailed), (True, 2, []))
+
+    def _refuse(req, timeout=0):
+        raise _ur.HTTPError(req.full_url, 502, "bad gateway", {}, None)
+    _ur.urlopen = _refuse
+    check("the site refused: the old mail is the fallback, and says why",
+          (_cs.report_run(decide([mx]), [mx]), _mailed), (False, ["HTTP 502"]))
+    _mailed.clear()
+    check("...but an empty run that failed mails nothing", (_cs.report_run([], [mx]), _mailed), (False, []))
+    del _os.environ["ORDERS_TOKEN"]
+    check("no token: fallback mail", (_cs.report_run(decide([mx]), [mx]), _mailed), (False, ["no ORDERS_TOKEN"]))
+finally:
+    _ur.urlopen, _cs.mail_live_q_changes = _real_open, _real_mail
+    _os.environ.pop("ORDERS_TOKEN", None)
 gone = stellar(401, "3.52.10", "—", chosen=TICK, my_price=6.36, final=6.99,
                profit=profit_text(6.36, 3.86))
 check("a cost that is no longer there clears P rather than keep a stale profit",

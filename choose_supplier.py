@@ -1071,10 +1071,74 @@ def price_moves(decisions: list[Decision]) -> list[tuple]:
     return out
 
 
-def mail_live_q_changes(changes: list[tuple], moves: list[tuple] = ()) -> bool:
+# ── the daily-summary log ────────────────────────────────────────────────────
+# 2026-10-12, the owner: "stop mailing me every time a price changes, write it
+# in the daily summary instead". So every --apply run POSTs what it did to the
+# site (api/_admin-ops.js, fn=price_log, Bearer ORDERS_TOKEN — the secret this
+# repo already holds for the buyer) and the morning digest prints it. An empty
+# run posts too: a day with no run at all then shows in the summary as an
+# issue. The mail below is now only the fallback for a run the site refused.
+SITE_BASE = os.getenv("SITE_BASE", "https://www.waverole.com").rstrip("/")
+
+
+def run_events(decisions: list[Decision], rows: list[Row]) -> list[dict]:
+    """The run as the site's price log takes it: moves, then off/back sale."""
+    by_row = {r.row: r for r in rows}
+    out = []
+    for sku, row, old, new, cost, rng in price_moves(decisions):
+        r = by_row.get(row)
+        out.append({"t": "move", "sku": sku, "row": row,
+                    "supplier": source_of(r) if r is not None else "",
+                    "old": old, "new": new, "cost": cost, "range": rng,
+                    "margin": (round(price_ranges.margin_pct(new, cost), 1)
+                               if new is not None and cost else None)})
+    for sku, row, src, cost, mine, old, new in live_q_changes(decisions, rows):
+        out.append({"t": "off" if new else "back", "sku": sku, "row": row,
+                    "supplier": src, "cost": cost, "price": mine,
+                    "word": new or "", "was": old or ""})
+    return out
+
+
+def report_run(decisions: list[Decision], rows: list[Row]) -> bool:
+    """Send the run to the daily summary; mail the owner only if that failed
+    and there was something to tell. True = the site took it."""
+    events = run_events(decisions, rows)
+    token = os.getenv("ORDERS_TOKEN", "").strip()
+    why = "no ORDERS_TOKEN"
+    if token:
+        run_url = ""
+        if os.getenv("GITHUB_RUN_ID"):
+            run_url = (f"{os.getenv('GITHUB_SERVER_URL', 'https://github.com')}/"
+                       f"{os.getenv('GITHUB_REPOSITORY', '')}/actions/runs/{os.getenv('GITHUB_RUN_ID')}")
+        body = json.dumps({"source": os.getenv("GITHUB_WORKFLOW", "local"),
+                           "run_url": run_url, "events": events}).encode("utf-8")
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                SITE_BASE + "/api/admin?fn=price_log", data=body, method="POST",
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + token,
+                         "User-Agent": "waverole-chooser"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                if 200 <= resp.status < 300:
+                    print(f"\U0001f4dd daily-summary log: {len(events)} event"
+                          f"{'' if len(events) == 1 else 's'} sent (no mail)")
+                    return True
+                why = f"HTTP {resp.status}"
+        except Exception as exc:          # noqa: BLE001
+            why = getattr(exc, "code", None) and f"HTTP {exc.code}" or type(exc).__name__
+    print(f"   (daily-summary log not sent: {why})")
+    if events:
+        mail_live_q_changes(live_q_changes(decisions, rows), price_moves(decisions),
+                            fallback=why)
+    return False
+
+
+def mail_live_q_changes(changes: list[tuple], moves: list[tuple] = (),
+                        fallback: str = "") -> bool:
     """Mail the owner, in Hebrew, which live packages went off sale (or back
     on) and which prices the range rule moved — one mail per run, only when
-    something did."""
+    something did. Since 2026-10-12 only report_run's fallback calls it."""
     if not changes and not moves:
         return False
     off = [c for c in changes if c[6]]
@@ -1103,6 +1167,8 @@ def mail_live_q_changes(changes: list[tuple], moves: list[tuple] = ()) -> bool:
     if back:
         parts.append(f"{len(back)} חזרו למכירה")
     subject = " / ".join(parts)
+    if fallback:
+        subject += " (לא נכנס לסיכום היומי)"
     body = ("הבוט שבוחר ספק (כל 4 שעות) הזיז מחירים לפי "
             "עמודת 'טווח מחירים' ו/או שינה את מילת הרווחיות (Q) "
             "על שורות שמסומנות ב-וי ולכן מוצגות באתר. "
@@ -1122,6 +1188,9 @@ def mail_live_q_changes(changes: list[tuple], moves: list[tuple] = ()) -> bool:
              "תא טווח ריק = הבוט לא נוגע במחיר. "
              "בלי טווח: רצפת רווח 20% (1GB: הפסד עד 20%). "
              "תקרת קנייה: 30GB $10 / 40GB $14 / 50GB $18.\n")
+    if fallback:
+        body += ("\nהמייל הזה נשלח רק כי האתר לא קיבל את הדיווח לסיכום היומי "
+                 f"({fallback}). בדרך כלל השינויים מופיעים רק בסיכום היומי.\n")
     print(f"\u2709  {subject}")
     pw = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "")
     if not pw:
@@ -1222,7 +1291,7 @@ def main(argv=None) -> int:
         return 0
     n = apply(svc, decisions, col)
     print(f"\n\u2705 wrote {n} requests")
-    mail_live_q_changes(live_q_changes(decisions, rows), price_moves(decisions))
+    report_run(decisions, rows)
     return 0
 
 
