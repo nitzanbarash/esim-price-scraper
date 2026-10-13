@@ -1,6 +1,6 @@
 """Tests for the money logic.
 
-The fixtures are real: STRIPE_BODY is a verbatim supplier receipt pulled from
+The fixtures are real (only the receipt link is a fake): STRIPE_BODY is a verbatim supplier receipt pulled from
 waverolesupply@gmail.com, and the reconciliation cases reproduce the 9 August
 burst where eight identical $4.17 charges landed within twenty minutes.
 """
@@ -42,7 +42,7 @@ eSIM Cyprus - 10GB (30 days validity)
 
 If you have any questions, contact us at hello@esim.dog (hello@esim.dog).
 
-Something wrong with the email? View in browser: (https://dashboard.stripe.com/receipts/payment/CAcQARoXChVhY2N0XzFSbDE3WVAzcnN2RmNrenAooLPr0wYyBjBqHSoihzovFuBN420oDsF5SLdXTHQKxfqnmf7rBRO_okaBXN5Nkv5wpbVhb_sFDu007VJ_UG0)
+Something wrong with the email? View in browser: (https://dashboard.stripe.com/receipts/payment/FAKE-RECEIPT-TOKEN-FOR-TESTS-0000000000000000000000000000000000000000000000000000000000000000)
 """
 
 STRIPE_SENDER = "receipts+acct_1Rl17YP3rsvFckzp@stripe.com"
