@@ -152,8 +152,9 @@ a dearer or equal rival never does, which is the whole point.
 
 The sell price itself (2026-10-07, price_ranges.py). A SKU with a range in
 'טווח מחירים' (V) has its U moved by the cost of the row the tick sits on —
-up to the first 50-cent step that pays 30% of cost, down one step a run while
-it pays over 200%; 1GB to the lowest 10-cent step inside 0.99–1.49 that loses
+up to the first 50-cent step that pays 30% of cost and, from 20GB, the
+size's dollar floor (price_ranges.DOLLAR_FLOOR; short of it, the high end —
+never off sale for it), down one step a run while it pays over 200%; 1GB to the lowest 10-cent step inside 0.99–1.49 that loses
 at most 10c — with S and T rewritten the way applyFee_ would. A range on a
 SKU also replaces the 20% floor in the verdict above: 'לא רווחי — מעל טווח'
 when no price in the range pays at a row's cost (the ceiling is still judged
@@ -1091,6 +1092,8 @@ def run_events(decisions: list[Decision], rows: list[Row]) -> list[dict]:
                     "supplier": source_of(r) if r is not None else "",
                     "old": old, "new": new, "cost": cost, "range": rng,
                     "margin": (round(price_ranges.margin_pct(new, cost), 1)
+                               if new is not None and cost else None),
+                    "profit": (round(price_ranges.net_of(new) - cost, 2)
                                if new is not None and cost else None)})
     for sku, row, src, cost, mine, old, new in live_q_changes(decisions, rows):
         out.append({"t": "off" if new else "back", "sku": sku, "row": row,
@@ -1155,8 +1158,8 @@ def mail_live_q_changes(changes: list[tuple], moves: list[tuple] = (),
         sku, row, old, new, cost, rng = m
         arrow = "▲" if (old is None or new > old) else "▼"
         return (f"{sku}  (שורה {row})  {money(old)} → {money(new)} {arrow}"
-                f"  קנייה {money(cost)}  רווח {price_ranges.margin_pct(new, cost):.0f}%"
-                f"  טווח {rng}")
+                f"  קנייה {money(cost)}  רווח {money(price_ranges.net_of(new) - cost)}"
+                f" ({price_ranges.margin_pct(new, cost):.0f}%)  טווח {rng}")
 
     parts = []
     if moves:

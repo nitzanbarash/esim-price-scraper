@@ -25,6 +25,15 @@ copies to the same answers:
     shows as sold out. It goes DOWN one step a run, and only while the margin
     is above 200% (LOWER_ABOVE_PCT) and the price is above the low end. Easy
     up, hard down — the owner's words.
+  * from 20GB up the 30% has a DOLLAR floor beside it (DOLLAR_FLOOR, the
+    owner's numbers of 2026-10-13: 20GB $4.25, 30GB $4.75, 40GB $5.00,
+    50GB and up $5.50, profit after the real fee). A percentage alone left
+    Hungary 20GB at 9.99 making $3.51 and Japan 50GB at 21.99 making $4.79 —
+    61% and 30% on paper, too few dollars for the size. The price goes up
+    to the first step that makes both; when no step in the range does, it
+    stops at the high end, still on sale — the dollar floor never takes a
+    package off the site, only the 30% does. A step down is taken only when
+    the lower step still makes the dollars.
   * 1GB: a fixed 0.99–1.49 range on a 10-cent grid ending in 9. These are
     the loss leaders: the bot always takes the LOWEST step whose loss, after
     the processor's real fee, is at most 10 cents (LOSS_1GB). Past 1.49 the
@@ -74,6 +83,10 @@ STEP_1GB = 0.10            # the 1GB grid (…9)
 LOSS_1GB = 0.10            # 1GB may lose up to this, fee included
 RANGE_1GB = (0.99, 1.49)   # 1GB's range, the same for every country
 
+# The least a sale may earn in dollars, net of the real fee, by size: (size
+# from, and up, dollars). Below 20GB there is none — the 30% is enough there.
+DOLLAR_FLOOR = ((20, 4.25), (30, 4.75), (40, 5.00), (50, 5.50))
+
 # How wide a seeded range is, by size: (size up to and including, width).
 # The owner's own examples were 10GB 5.99–7.99 and 20GB 9.99–12.99, "a bit
 # wider as the size goes up"; the rest is interpolated and his to retune.
@@ -118,6 +131,21 @@ def pays(final: float, cost: float, gb: Optional[float]) -> bool:
     if is_1gb(gb):
         return net_of(final) - cost >= -LOSS_1GB - _EPS
     return margin_pct(final, cost) >= RAISE_BELOW_PCT - _EPS
+
+
+def dollar_floor(gb: Optional[float]) -> float:
+    """The least a sale of this size must earn in dollars; 0 = no floor."""
+    out = 0.0
+    for size, dollars in DOLLAR_FLOOR:
+        if gb is not None and gb >= size - _EPS:
+            out = dollars
+    return out
+
+
+def earns(final: float, cost: float, gb: Optional[float]) -> bool:
+    """Does a sale at `final` make the size's dollar floor? (True without one.)"""
+    floor = dollar_floor(gb)
+    return floor <= 0 or net_of(final) - cost >= floor - _EPS
 
 
 # ── the grid ─────────────────────────────────────────────────────────────
@@ -193,9 +221,11 @@ def reprice(gb: Optional[float], cost: float, current: Optional[float],
     """The price U should hold now, or None when nothing in the range pays.
 
     `current` is what U holds today (None when unknown or off the sheet): the
-    non-1GB rule moves FROM it — up as far as it takes to pay, down one step
-    when the margin is over 200% — so the answer depends on where the price
-    is. 1GB ignores it: the lowest paying step, every time.
+    non-1GB rule moves FROM it — up as far as it takes to pay, and on to the
+    size's dollar floor (or the high end, short of it); down one step when
+    the margin is over 200% and the step below still makes the floor — so
+    the answer depends on where the price is. 1GB ignores it: the lowest
+    paying step, every time.
     """
     grid = steps(lo, hi, gb)
     if not grid or cost is None or cost <= 0:
@@ -209,10 +239,18 @@ def reprice(gb: Optional[float], cost: float, current: Optional[float],
         cur = grid[-1]
     else:
         cur = min(grid_up(current, gb), grid[-1])
+    def lift(p: float) -> float:          # p pays: on to the dollar floor
+        return next((s for s in grid if s >= p and earns(s, cost, gb)), grid[-1])
+
     if not pays(cur, cost, gb):
-        return next((s for s in grid if s > cur and pays(s, cost, gb)), None)
+        up = next((s for s in grid if s > cur and pays(s, cost, gb)), None)
+        return None if up is None else lift(up)
+    if not earns(cur, cost, gb):
+        return lift(cur)
     if margin_pct(cur, cost) > LOWER_ABOVE_PCT + _EPS and cur > grid[0]:
-        return grid[grid.index(cur) - 1]        # cur is on the grid by now
+        down = grid[grid.index(cur) - 1]        # cur is on the grid by now
+        if earns(down, cost, gb):
+            return down
     return cur
 
 

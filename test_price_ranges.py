@@ -8,6 +8,10 @@ The owner's rules, 2026-10-07, each pinned below:
       it takes when the margin is under 30%; DOWN one step a run when it is
       over 200% and the price is above the low end; no step pays → the SKU
       is 'לא רווחי — מעל טווח' in Q,
+    * from 20GB up a DOLLAR floor beside the 30% (2026-10-13: 20GB $4.25,
+      30GB $4.75, 40GB $5, 50GB+ $5.50): up to the first step that makes
+      both; short of it, the high end, still on sale; a step down only when
+      the lower step still makes it,
     * 1GB: 0.99–1.49 on a 10-cent grid, the LOWEST step that loses at most
       10 cents after the processor's real fee,
     * a blank range cell = hands off (the old 20% floor still judges),
@@ -109,7 +113,8 @@ check("a regional 1GB with its own range uses the 1GB grid (2.89 nets 2.42, lose
 print("\n-- the others: easy up, hard down --")
 check("under 30% → up as far as it takes (Canada 5GB, cost 4.25)",
       pr.reprice(5, 4.25, 4.99, 4.99, 6.49), 6.49)
-check("Greece 50GB cost 15.91 at 20.99 (24%) → 21.99", pr.reprice(50, 15.91, 20.99, 16.99, 22.99), 21.99)
+check("Greece 50GB cost 15.91 at 20.99 (24%): 21.99 pays 30% but earns $4.85 → 22.99 ($5.81)",
+      pr.reprice(50, 15.91, 20.99, 16.99, 22.99), 22.99)
 check("30% exactly stays", pr.reprice(10, 4.00, 5.99, 5.99, 7.99), 5.99 if pr.margin_pct(5.99, 4.0) >= 30 else 6.49)
 check("inside the band: stays", pr.reprice(10, 3.0, 6.49, 5.99, 7.99), 6.49)
 check("over 200% → ONE step down", pr.reprice(10, 2.0, 6.99, 5.99, 7.99), 6.49)
@@ -123,6 +128,29 @@ check("…and if even that does not pay, None", pr.reprice(10, 7.0, 9.99, 5.99, 
 check("current below the low end is lifted to it", pr.reprice(10, 3.0, 4.99, 5.99, 7.99), 5.99)
 check("no current price: from the low end", pr.reprice(10, 4.5, None, 5.99, 7.99), 6.49)
 check("no cost: None", pr.reprice(10, None, 6.49, 5.99, 7.99), None)
+
+print("\n-- from 20GB up: the dollar floor beside the 30% (owner, 2026-10-13) --")
+check("the floor by size", [pr.dollar_floor(g) for g in (1, 5, 10, 15, 20, 30, 40, 50, 75, 100)],
+      [0, 0, 0, 0, 4.25, 4.75, 5.0, 5.5, 5.5, 5.5])
+check("Hungary 20GB cost 5.72 at 9.99: 61% but $3.52 → 10.99 ($4.48)",
+      pr.reprice(20, 5.72, 9.99, 9.99, 12.99), 10.99)
+check("Japan 50GB cost 15.96 at 21.99: 30% but $4.80 → 22.99 ($5.76)",
+      pr.reprice(50, 15.96, 21.99, 16.99, 22.99), 22.99)
+check("already past the floor: stays (11.49 on 5.72 earns $4.96)",
+      pr.reprice(20, 5.72, 11.49, 9.99, 12.99), 11.49)
+check("10GB has no floor: 5.99 on $4.00 earns $1.40 and stays",
+      pr.reprice(10, 4.00, 5.99, 5.99, 7.99), 5.99)
+check("short of the floor inside the range: the high end, still on sale (30GB on 11.89: 17.49 earns $4.55)",
+      pr.reprice(30, 11.89, 13.99, 13.49, 17.49), 17.49)
+check("…and feasible says so", pr.feasible(30, 11.89, (13.49, 17.49)), True)
+check("only the 30% takes a package off: 30GB on $14, 17.49 nets 17% → None",
+      pr.reprice(30, 14.0, 13.99, 13.49, 17.49), None)
+check("over 200%, the step down still makes the floor: down (20GB on 1.50, 7.49 → 6.99 earns $4.86)",
+      pr.reprice(20, 1.50, 7.49, 5.99, 8.99), 6.99)
+check("over 200%, the step down would miss the floor: stays (6.49 earns $4.38, 5.99 would earn $3.90)",
+      pr.reprice(20, 1.50, 6.49, 5.99, 8.99), 6.49)
+check("no current price: from the low end, on to the floor (20GB on 5.72)",
+      pr.reprice(20, 5.72, None, 9.99, 12.99), 10.99)
 check("an empty grid: None", pr.reprice(10, 3.0, 6.49, 6.00, 6.40), None)
 check("feasible: some step pays", pr.feasible(10, 5.0, (5.99, 7.99)), True)
 check("feasible: none does", pr.feasible(10, 7.0, (5.99, 7.99)), False)
@@ -178,7 +206,8 @@ check("cost falls: the word is cleared", writes(d[0], "stock"), [(2, "")])
 check("…and the price stays: 14.49 already pays 50% on $9", writes(d[0], "final"), [])
 r.price = "$11.00"
 d = decide([r])
-check("cost 11: 14.49 nets 13.56 (23%); 14.99 nets 14.04 (28%); 15.49 nets 14.52 (32%)", writes(d[0], "final"), [(2, 15.49)])
+check("cost 11: 15.49 is the first to pay 30% ($3.52); 16.49 the first to earn $4.25 ($4.48)",
+      writes(d[0], "final"), [(2, 16.49)])
 
 r = row(2, "1.66.10", 7.0, final=6.49, rng="")
 d = decide([r])
@@ -199,7 +228,8 @@ check("1GB that cannot pay inside 0.99–1.49: the range word", writes(d[0], "st
 r = row(2, "2.48.30", 11.89, gb="30gb", final=13.99, rng="13.49 - 17.49", stock=OVER_CEILING_LABEL)
 d = decide([r])
 check("the buy ceiling is still judged first (30GB over $10)", writes(d[0], "stock"), [])
-check("…though the price is moved to where it would pay", writes(d[0], "final"), [(2, 16.49)])
+check("…though the price is moved: 16.49 pays 30% ($3.59), nothing earns $4.75, so the high end",
+      writes(d[0], "final"), [(2, 17.49)])
 
 r = row(2, "1.66.10", 2.0, final=6.99)
 d = decide([r])

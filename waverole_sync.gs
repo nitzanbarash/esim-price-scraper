@@ -248,6 +248,10 @@ function profitText_(net, buy) {
 //   * every size but 1GB: a 50-cent grid ending in .49/.99. Margin under 30%
 //     of cost -> UP as many steps as it takes; over 200% and above the low
 //     end -> DOWN one step. Easy up, hard down.
+//   * from 20GB up a DOLLAR floor beside the 30% (DOLLAR_FLOOR, the owner's
+//     numbers of 2026-10-13): up to the first step that makes both; short
+//     of it, the high end, still on sale; down only while the lower step
+//     still makes it. Only the 30% ever takes a package off sale.
 //   * 1GB: 0.99-1.49 on a 10-cent grid ending in 9 - the LOWEST step that
 //     loses at most 10 cents after the processor's real fee.
 //   * no step pays -> the price stays and Q says OVER_RANGE (site: sold out).
@@ -261,6 +265,10 @@ const RANGE_LOWER_ABOVE_PCT = 200;   // margin over this -> one step down
 const RANGE_STEP_CENTS      = 50;    // .49 / .99
 const RANGE_STEP_CENTS_1GB  = 10;    // .x9
 const RANGE_LOSS_1GB        = 0.10;  // 1GB may lose this much, fee included
+// The least a sale may earn in dollars, net of the real fee, by size
+// ([size from, dollars] - price_ranges.DOLLAR_FLOOR). A percentage alone
+// left 20GB earning $3.52 and 50GB $4.80; below 20GB there is no floor.
+const DOLLAR_FLOOR          = [[20, 4.25], [30, 4.75], [40, 5.00], [50, 5.50]];
 const RANGE_EPS             = 1e-6;
 const OVER_RANGE   = '\u05dc\u05d0 \u05e8\u05d5\u05d5\u05d7\u05d9 \u2014 \u05de\u05e2\u05dc \u05d8\u05d5\u05d5\u05d7';
 // The scraper's proportion rule (2026-09-17): from 30GB up, a package bought
@@ -286,6 +294,20 @@ function marginPct_(price, cost) { return (netOf_(price) - cost) / cost * 100; }
 function pays_(price, cost, gb) {
   if (isOneGb_(gb)) return netOf_(price) - cost >= -RANGE_LOSS_1GB - RANGE_EPS;
   return marginPct_(price, cost) >= RANGE_RAISE_BELOW_PCT - RANGE_EPS;
+}
+
+// The least a sale of this size must earn in dollars; 0 = no floor.
+function dollarFloor_(gb) {
+  let out = 0;
+  if (gb === null || gb === undefined) return out;
+  for (let k = 0; k < DOLLAR_FLOOR.length; k++) if (gb >= DOLLAR_FLOOR[k][0] - RANGE_EPS) out = DOLLAR_FLOOR[k][1];
+  return out;
+}
+
+// Does a sale at `price` make the size's dollar floor? (true without one)
+function earns_(price, cost, gb) {
+  const floor = dollarFloor_(gb);
+  return floor <= 0 || netOf_(price) - cost >= floor - RANGE_EPS;
 }
 
 // The grid is worked in whole cents: 0.1 + 0.2 is not 0.3 in floating point.
@@ -315,8 +337,10 @@ function parseRange_(cell) {
 }
 
 // The price U should hold now, or null when nothing in the range pays.
-// Moves FROM `current` (null = unknown): up as far as it takes to pay, down
-// one step over 200%. 1GB ignores it - the lowest paying step, every time.
+// Moves FROM `current` (null = unknown): up as far as it takes to pay and
+// on to the size's dollar floor (or the high end, short of it), down one
+// step over 200% while the step below still makes the floor. 1GB ignores
+// it - the lowest paying step, every time.
 function reprice_(gb, cost, current, lo, hi) {
   const grid = rangeSteps_(lo, hi, gb);
   if (!grid.length || !(cost > 0)) return null;
@@ -329,12 +353,18 @@ function reprice_(gb, cost, current, lo, hi) {
   if (current === null || current === undefined || current < grid[0]) cur = grid[0];
   else if (current > top) cur = top;
   else cur = Math.min(gridUp_(current, gb), top);
+  const lift = function (p) {                  // p pays: on to the dollar floor
+    for (let k = 0; k < grid.length; k++) if (grid[k] >= p && earns_(grid[k], cost, gb)) return grid[k];
+    return top;
+  };
   if (!pays_(cur, cost, gb)) {
-    for (let k = 0; k < grid.length; k++) if (grid[k] > cur && pays_(grid[k], cost, gb)) return grid[k];
+    for (let k = 0; k < grid.length; k++) if (grid[k] > cur && pays_(grid[k], cost, gb)) return lift(grid[k]);
     return null;
   }
+  if (!earns_(cur, cost, gb)) return lift(cur);
   if (marginPct_(cur, cost) > RANGE_LOWER_ABOVE_PCT + RANGE_EPS && cur > grid[0]) {
-    return grid[grid.indexOf(cur) - 1];        // cur is on the grid by now
+    const down = grid[grid.indexOf(cur) - 1];  // cur is on the grid by now
+    if (earns_(down, cost, gb)) return down;
   }
   return cur;
 }
@@ -373,7 +403,13 @@ function checkPriceRanges() {
     [10, 1.50, 6.99, 5.99, 7.99, 6.49],         // > 200%: one step down
     [10, 1.50, 5.99, 5.99, 7.99, 5.99],         // ... never below the low end
     [10, 4.30, 6.75, 5.99, 7.99, 6.99],         // off the grid -> snapped up
-    [10, 4.30, 9.99, 5.99, 7.99, 7.99]          // over the top -> clamped
+    [10, 4.30, 9.99, 5.99, 7.99, 7.99],         // over the top -> clamped
+    [20, 5.72, 9.99, 9.99, 12.99, 10.99],       // 61% but $3.52: on to the $4.25 floor
+    [50, 15.96, 21.99, 16.99, 22.99, 22.99],    // 30% but $4.80: on to the $5.50 floor
+    [30, 11.89, 13.99, 13.49, 17.49, 17.49],    // nothing earns $4.75: the high end, on sale
+    [30, 14.00, 13.99, 13.49, 17.49, null],     // nothing pays 30%: off sale
+    [20, 1.50, 7.49, 5.99, 8.99, 6.99],         // > 200%, 6.99 still earns $4.86: down
+    [20, 1.50, 6.49, 5.99, 8.99, 6.49]          // > 200%, 5.99 would earn $3.90: stays
   ];
   const bad = cases.filter(function (c) { return reprice_(c[0], c[1], c[2], c[3], c[4]) !== c[5]; });
   const ranges = [['5.99 - 7.99', [5.99, 7.99]], ['\u200f5.99\u2013$7.99', [5.99, 7.99]],
