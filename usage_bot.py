@@ -107,6 +107,7 @@ COL_ACTIVATED = "הופעל - Activated"
 COL_SALE = "הנחה - Sale"
 COL_SOURCE = "מקור - source"
 COL_SELL = "מכירה - Sell"
+COL_BUY = "קנייה - Buy"
 COL_SKU = 'מק"ט - SUK'
 COL_ROUTE = "Route"
 
@@ -453,6 +454,55 @@ def activation_text(usage: dict | None, current: str,
     return ACTIVATED_NO
 
 
+def fetch_refunds() -> list[dict]:
+    """Orders the site knows were refunded (PayPal webhook, or typed on the
+    dashboard), either to the customer or by the supplier. [] on any failure:
+    the marks are only a mirror of the books, and the next run tries again."""
+    try:
+        r = requests.get(ORDERS_URL, params={"refunds": "1", "days": "120"}, timeout=20,
+                         headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+        r.raise_for_status()
+        return r.json().get("refunds", [])
+    except Exception as e:
+        log.warning(f"could not read refunds from the site: {_redact(str(e))}")
+        return []
+
+
+def _refund_text(refund: float, whole) -> str:
+    """'refund' for all of it; 'refund 3.00$' for part — both stay red in the sheet."""
+    if whole is not None and refund >= float(whole) - 0.01:
+        return "refund"
+    return f"refund {refund:.2f}$"
+
+
+def refund_marks(rows: list[list[str]], idx: dict, refunds: list[dict]) -> list[tuple[int, int, str]]:
+    """(row, col, text) for every refund the sheet does not show yet: Sell for
+    money back to the customer, Buy for money back from the supplier. A cell
+    that already says 'refund' — by hand or by an earlier run — is left alone."""
+    if COL_ORDER not in idx:
+        return []
+    by_order = {}
+    for n, r in enumerate(rows[1:], start=2):
+        oid = r[idx[COL_ORDER]].strip().upper() if len(r) > idx[COL_ORDER] else ""
+        if oid:
+            by_order.setdefault(oid, n)        # the first row of an order is its sale
+    out = []
+    for f in refunds:
+        n = by_order.get(str(f.get("order_id") or "").strip().upper())
+        if not n:
+            continue
+        row = rows[n - 1]
+        for col, amount, whole in ((COL_SELL, f.get("refund_usd"), f.get("paid_usd")),
+                                   (COL_BUY, f.get("supplier_refund_usd"), f.get("cost_usd"))):
+            if col not in idx or not amount or float(amount) <= 0:
+                continue
+            have = row[idx[col]] if len(row) > idx[col] else ""
+            if "refund" in have.lower():
+                continue
+            out.append((n, idx[col] + 1, _refund_text(float(amount), whole)))
+    return out
+
+
 def _a1_col(idx0: int) -> str:
     """0-based column index -> 'A', 'Z', 'AA'. The owner keeps adding columns,
     and a formula built with chr(65+i) turns to punctuation past column Z."""
@@ -608,6 +658,10 @@ def main() -> int:
                 "that as 'finished'. Fix whichever column is wrong and they "
                 "rejoin the sweep on the next run (every 4 hours).")
     if not todo:
+        marks = refund_marks(rows, idx, fetch_refunds())
+        if marks:
+            ws.update_cells([gspread.Cell(n, c, t) for n, c, t in marks], value_input_option="USER_ENTERED")
+            log.info(f"refunds: {len(marks)} cell(s) marked from the site's books")
         return 0
 
     # ── rows missing the facts this sweep runs on: recover them ──
@@ -804,6 +858,13 @@ def main() -> int:
               + "\n\nThe reason per row is in the GitHub Actions log (usage "
                 "workflow). Rows are left exactly as they were, nothing is "
                 "retired. If this repeats tomorrow, the fault is not a blip.")
+    # ── refunds the site recorded (PayPal webhook / dashboard) → the sheet ──
+    marks = refund_marks(rows, idx, fetch_refunds())
+    for n, c, text in marks:
+        cells.append(gspread.Cell(n, c, text))
+    if marks:
+        log.info(f"refunds: {len(marks)} cell(s) marked from the site's books")
+
     if cells:
         ws.update_cells(cells, value_input_option="USER_ENTERED")
     log.info(f"sheet: {len(cells)} cell(s) updated · still active {counts[ACTIVE]} · "

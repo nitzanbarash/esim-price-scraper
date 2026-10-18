@@ -32,6 +32,10 @@ jobs:
       - name: Usage bot
         run: python test_usage_bot.py
 
+      # Which receipts-sheet cells a refund recorded at the site marks red.
+      - name: Refund marks
+        run: python test_refund_marks.py
+
       # Which route goes in the sheet is which route the purchase bot buys, so
       # a regression here is sold to a customer before anyone sees it.
       - name: Route policy
