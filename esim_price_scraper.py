@@ -206,25 +206,26 @@ BROWSER_SLOTS = int(os.environ.get('BROWSER_SLOTS', 6))
 SCRAPE_ONLY_SKUS = [c.strip() for c in
                     os.environ.get('SCRAPE_ONLY_SKUS', '').split(',') if c.strip()]
 
-# The update network (several computers) splits the sheet into N pieces and
-# runs one piece per process: "k/N" keeps only the rows whose package code
-# hashes to k. Unlike SCRAPE_ONLY_SKUS this is the NORMAL run on fewer rows -
-# the day-scan rotation and every other rule stay exactly as they are.
-def _parse_shard(v: str) -> Optional[Tuple[int, int]]:
-    m = re.fullmatch(r'\s*(\d+)\s*/\s*(\d+)\s*', v or '')
-    if not m or int(m.group(2)) < 1 or int(m.group(1)) >= int(m.group(2)):
-        return None
-    return int(m.group(1)), int(m.group(2))
+# The update network (several computers) works ONE COUNTRY AT A TIME: a
+# group is the country of the row's link ("jp"), or "region-<name>" for a
+# regional plan. Read off the link, so a row added today is in its country's
+# group before it even has a package code, and a new country is a new group.
+# SCRAPE_GROUPS="jp,th" keeps only those groups - the NORMAL run on fewer rows,
+# every rule unchanged (unlike SCRAPE_ONLY_SKUS, which is a hand check).
+# SCRAPE_LIST_GROUPS=1 prints {group: rows} as JSON and stops (no browser).
+def group_of(it: Dict) -> str:
+    u = parse_url((it.get('link') or '').strip())
+    if u['type'] == 'country':
+        return u['slug'].lower()
+    if u['type'] == 'region' and u.get('region'):
+        return 'region-' + u['region'].lower()
+    path = urlparse((it.get('link') or '').strip()).path.strip('/').split('/')[0]
+    return 'link-' + (path or 'none').lower()
 
 
-SCRAPE_SHARD = _parse_shard(os.environ.get('SCRAPE_SHARD', ''))
-
-
-def in_shard(it: Dict, shard: Optional[Tuple[int, int]]) -> bool:
-    if not shard:
-        return True
-    key = ((it.get('old_code') or '').strip() or (it.get('link') or '').strip())
-    return zlib.crc32(key.encode('utf-8')) % shard[1] == shard[0]
+SCRAPE_GROUPS = {g.strip().lower() for g in
+                 os.environ.get('SCRAPE_GROUPS', '').split(',') if g.strip()}
+SCRAPE_LIST_GROUPS = os.environ.get('SCRAPE_LIST_GROUPS', '') == '1'
 
 
 # Shadow mode for the network's first days: read and price everything, write
@@ -1516,9 +1517,9 @@ class ESIMScraper:
             if missing:
                 print(f"   ⚠️  not found in the sheet: {', '.join(sorted(missing))}")
             items = kept
-        if SCRAPE_SHARD:
-            kept = [it for it in items if in_shard(it, SCRAPE_SHARD)]
-            print(f"🧩 SCRAPE_SHARD {SCRAPE_SHARD[0]}/{SCRAPE_SHARD[1]}: "
+        if SCRAPE_GROUPS:
+            kept = [it for it in items if group_of(it) in SCRAPE_GROUPS]
+            print(f"🧩 SCRAPE_GROUPS {','.join(sorted(SCRAPE_GROUPS))}: "
                   f"{len(kept)} of {len(items)} rows")
             items = kept
         return items, col_index
@@ -1528,6 +1529,10 @@ class ESIMScraper:
             print("⚠️  Google Sheets not configured. Cannot run.")
             return -1
         items, col = self.read_rows()
+        if SCRAPE_LIST_GROUPS:
+            print(json.dumps(dict(collections.Counter(group_of(it) for it in items)),
+                             sort_keys=True))
+            return 0
         if not items:
             print("ℹ️  No links found in column E.")
             return -1
