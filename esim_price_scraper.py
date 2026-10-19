@@ -206,6 +206,31 @@ BROWSER_SLOTS = int(os.environ.get('BROWSER_SLOTS', 6))
 SCRAPE_ONLY_SKUS = [c.strip() for c in
                     os.environ.get('SCRAPE_ONLY_SKUS', '').split(',') if c.strip()]
 
+# The update network (several computers) splits the sheet into N pieces and
+# runs one piece per process: "k/N" keeps only the rows whose package code
+# hashes to k. Unlike SCRAPE_ONLY_SKUS this is the NORMAL run on fewer rows -
+# the day-scan rotation and every other rule stay exactly as they are.
+def _parse_shard(v: str) -> Optional[Tuple[int, int]]:
+    m = re.fullmatch(r'\s*(\d+)\s*/\s*(\d+)\s*', v or '')
+    if not m or int(m.group(2)) < 1 or int(m.group(1)) >= int(m.group(2)):
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+SCRAPE_SHARD = _parse_shard(os.environ.get('SCRAPE_SHARD', ''))
+
+
+def in_shard(it: Dict, shard: Optional[Tuple[int, int]]) -> bool:
+    if not shard:
+        return True
+    key = ((it.get('old_code') or '').strip() or (it.get('link') or '').strip())
+    return zlib.crc32(key.encode('utf-8')) % shard[1] == shard[0]
+
+
+# Shadow mode for the network's first days: read and price everything, write
+# nothing. The would-be writes are counted and dropped.
+SCRAPE_DRY_RUN = os.environ.get('SCRAPE_DRY_RUN', '') == '1'
+
 # Built on first use, never at import. An asyncio.Semaphore belongs to the loop
 # that first awaits it, and awaiting it from a second loop raises "bound to a
 # different event loop" — so the loop it was built for is remembered and a new
@@ -1491,6 +1516,11 @@ class ESIMScraper:
             if missing:
                 print(f"   ⚠️  not found in the sheet: {', '.join(sorted(missing))}")
             items = kept
+        if SCRAPE_SHARD:
+            kept = [it for it in items if in_shard(it, SCRAPE_SHARD)]
+            print(f"🧩 SCRAPE_SHARD {SCRAPE_SHARD[0]}/{SCRAPE_SHARD[1]}: "
+                  f"{len(kept)} of {len(items)} rows")
+            items = kept
         return items, col_index
 
     async def run(self):
@@ -1530,6 +1560,11 @@ class ESIMScraper:
 
         def flush(done_count):
             if not updates:
+                return
+            if SCRAPE_DRY_RUN:
+                print(f"  🧪 dry run: {len(updates)} cell writes dropped "
+                      f"(through package {done_count}/{len(items)})")
+                updates.clear()
                 return
             self.setup_google_sheets()
             CHUNK = 50
