@@ -1,0 +1,66 @@
+name: loadtest
+
+# One-off load test of the shop from several addresses at once (owner's OK,
+# 2026-10-19). Plain requests only: no page script runs, so the dashboard's
+# visit counts never see it; the order probe asks for an order that does not
+# exist (one store read, no write). Removed again after the run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_at:
+        description: "Unix time all runners start together"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2, 3, 4, 5, 6]
+    steps:
+      - name: Run
+        env:
+          START_AT: ${{ inputs.start_at }}
+        run: |
+          HOME_URL="https://www.waverole.com/"
+          TOK=$(printf '{"id":"LT-LOADTEST-0"}' | base64 | tr '+/' '-_' | tr -d '=')
+          FN_URL="https://www.waverole.com/api/order-status?order=$TOK"
+          W='%{http_code} %{time_total} m=%header{x-vercel-mitigated} c=%header{x-vercel-cache}\n'
+
+          fire() {  # url rate secs tag
+            local url=$1 r=$2 secs=$3 out=res_$4.txt; : > "$out"
+            local t0; t0=$(date +%s.%N)
+            for ((s=0; s<secs; s++)); do
+              for ((i=0; i<r; i++)); do
+                curl -s -o /dev/null --compressed -m 20 -w "$W" "$url" >> "$out" &
+              done
+              sleep "$(python3 -c "import time;print(max(0,$t0+$s+1-time.time()))")"
+            done
+            wait
+          }
+
+          now=$(date +%s); echo "runner ${{ matrix.runner }} ready at $now, start_at $START_AT"
+          [ "$START_AT" -gt "$now" ] && sleep $((START_AT - now))
+          echo "started $(date +%s)"
+
+          for r in 5 10 20; do fire "$HOME_URL" $r 10 home_$r; sleep 5; done
+          for r in 5 10 20 40; do fire "$FN_URL" $r 10 fn_$r; sleep 5; done
+
+          python3 - <<'EOF'
+          import glob
+          def pct(a, p): return a[min(len(a) - 1, int(len(a) * p))] if a else 0
+          for f in sorted(glob.glob('res_*.txt'), key=lambda x: (x.split('_')[1], int(x.split('_')[2][:-4]))):
+              rows = [l.split() for l in open(f) if l.strip()]
+              t = sorted(float(r[1]) for r in rows)
+              codes = {}
+              for r in rows: codes[r[0]] = codes.get(r[0], 0) + 1
+              mit = sum(1 for r in rows if r[2] != 'm=')
+              hit = sum(1 for r in rows if r[3] == 'c=HIT')
+              print(f"RESULT {f[4:-4]} n={len(rows)} codes={codes} p50={pct(t,.5):.3f} p95={pct(t,.95):.3f} max={t[-1] if t else 0:.3f} mitigated={mit} cdn_hit={hit}")
+          EOF
