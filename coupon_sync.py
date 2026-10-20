@@ -624,4 +624,20 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
+    # The update network (waverole-net) runs this script inside a fence: a
+    # deadline on referee time that it moves forward while this computer is
+    # entitled to the task. net_fence.install() checks that fence before
+    # EVERY HTTP request this process makes (Sheets, the site, anything on
+    # requests / httplib2 / urllib) and exits 124 before a write that would
+    # come too late - or right after the computer slept without its
+    # monotonic clock counting it. WHY in the script and not only in runjob:
+    # runjob looks once a second; a job that wakes from a sleep can send a
+    # write in that second, after another computer already took the task
+    # over. net_fence.py is copied next to the scripts by the installer only;
+    # under GitHub Actions or by hand it is absent and nothing changes.
+    try:
+        import net_fence
+        net_fence.install()
+    except ImportError:
+        pass
     sys.exit(main())
