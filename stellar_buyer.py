@@ -199,8 +199,8 @@ SUPPLIER_NAME = "Stellar"
 # there by hand. 'manual' and 'bot - manually' are NOT here on purpose: they
 # are the rows whose money still has to be chased, and green is what says a
 # row needs no chasing.
-PAID_RAILS = {"paypal", "payme"}
-PAID_BG = {"red": 217 / 255, "green": 234 / 255, "blue": 211 / 255}   # #d9ead3
+PAID_RAILS = fb.PAID_RAILS          # one spelling for both cloud writers
+PAID_BG = fb.PAID_BG                # #d9ead3
 
 TERMINAL_BAD = {"failed", "refunded"}
 NON_TERMINAL = {"processing", "vpn_processing"}
@@ -1197,6 +1197,50 @@ class Run:
         # convenience and nobody waits for it.
         self.mail(o, payload)
         paint_paid(self.ws, n, self.rail(o), self.hdr())
+        self.retire_placeholders(o, n)
+
+    def retire_placeholders(self, o: dict, n: int):
+        """This row now carries the order's money; any eSIM-less esim.dog row
+        of the same number stops reading as the sale.
+
+        The case is an esim.dog checkout that ended uncertain, then handed to
+        Stellar under the SAME number (rebuy_order.py 's', forced by BUY AGAIN
+        or by a proven-unpaid verdict). Its placeholder row kept Sell = the
+        payment and its green rail, this row has both too, and the books
+        counted one $6.99 as $13.98 of revenue (review 2026-10-20 - the 10-11
+        double count again, by a new road). The placeholder is marked the way
+        the PC bot marks one (fb.supersede_row): 'replaced - check the charge',
+        Sell 0, its session defused, Mail white. Its Buy stays: only the owner
+        can say the esim.dog attempt was never charged.
+
+        Done here, after delivery, and not at the purchase: a Stellar order
+        that ends failed bought nothing, and the esim.dog row must then keep
+        the sale. Best effort - the customer already has the eSIM; a failure
+        is told, never raised."""
+        oid = str(o.get("order_id") or "")
+        try:
+            changes = fb.supersede_placeholders(self.ws, oid, keep={n}, skip_route_prefix=ROUTE_PREFIX)
+        except Exception as ex:                              # noqa: BLE001
+            log.warning(f"{oid}: could not retire the esim.dog placeholder rows ({type(ex).__name__})")
+            alert_now(f"{oid}: check the esim.dog row of this order",
+                      f"{oid} was delivered from Stellar (receipts row {n}), and an eSIM-less "
+                      f"esim.dog row of the same number may still read as a sale. It could not be "
+                      f"checked ({type(ex).__name__}). If such a row exists: Sell 0, Status "
+                      f"'{fb.REPLACED_CHECK_STATUS}', Mail white - and zero its Buy only once the "
+                      f"esim.dog charge is known not to exist.")
+            return
+        if not changes:
+            return
+        rows = sorted({c[0] for c in changes})
+        log.info(f"{oid}: esim.dog placeholder row(s) {rows} marked replaced (Stellar row {n} is the sale)")
+        alert_now(f"{oid}: esim.dog row(s) {rows} marked replaced",
+                  f"{oid} was delivered from Stellar (receipts row {n}), which now carries the "
+                  f"customer's payment. The eSIM-less esim.dog row(s) of the same order were "
+                  f"marked so the payment is not counted twice:\n" +
+                  "\n".join(f"  row {r}: {h}: '{b}' -> '{a}'" for r, h, b, a in changes) +
+                  "\n\nTheir Buy is kept: check whether the esim.dog attempt was charged, and "
+                  "zero it if it was not. A late esim.dog delivery for it is checked against "
+                  "the site and never reaches the customer.")
 
     def mail(self, o: dict, payload: dict):
         """The buyer's 'your eSIM is ready' email, sent from THIS step.

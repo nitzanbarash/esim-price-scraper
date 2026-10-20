@@ -627,6 +627,18 @@ SUPERSEDED_RE = re.compile(re.escape(SUPERSEDED_SESSION) + r"([A-Za-z0-9_\-]+)")
 FREE_RAIL = "free"
 H_STATUS, H_BUY, H_SELL, H_SALE = ("\u05e1\u05d8\u05d8\u05d5\u05e1 - Status", "\u05e7\u05e0\u05d9\u05d9\u05d4 - Buy",
                                    "\u05de\u05db\u05d9\u05e8\u05d4 - Sell", "\u05d4\u05e0\u05d7\u05d4 - Sale")
+H_PURCHASE, H_MAIL = "\u05e8\u05db\u05d9\u05e9\u05d4 - Purchase", "\u05de\u05d9\u05d9\u05dc - Mail"
+H_ORDER, H_ROUTE = "\u05de\u05e1\u05f3 \u05d4\u05d6\u05de\u05e0\u05d4", "Route"
+H_ACT, H_ICCID = "Activation Code", "\u05de\u05e1 \u05e1\u05d9\u05d3\u05d5\u05e8\u05d9 -ICCID"
+H_LINK_SUP, H_QR = "Link - esim.dog", "QR"
+# The Mail cell's colour is the owner's "money banked" mark (memory:
+# receipts-sheet): green on the ONE row that carries a payment on a rail we can
+# see, white everywhere else. One spelling for both cloud writers —
+# stellar_buyer reads these from here — and the same values as the PC bot's
+# bot/sheets.py, so a row painted by any of the three looks the same.
+PAID_RAILS = {"paypal", "payme"}
+PAID_BG = {"red": 217 / 255, "green": 234 / 255, "blue": 211 / 255}   # #d9ead3
+WHITE_BG = {"red": 1.0, "green": 1.0, "blue": 1.0}
 
 
 def is_replaced_status(status) -> bool:
@@ -642,6 +654,33 @@ def _is_zero_money(text) -> bool:
         return bool(digits) and float(digits) == 0.0
     except ValueError:
         return False
+
+
+def neutralised_link(link: str) -> str:
+    """`link` with its session id no longer readable as one (SUPERSEDED_SESSION)
+    — the PC bot's bot/sheets.neutralised_link, spelled the same so either
+    side's marking is read by the other. A link without a session is returned
+    as it is."""
+    s = str(link or "").strip()
+    if not s or SUPERSEDED_SESSION in s:
+        return s
+    m = SESSION_ID_RE.search(s)
+    return f"{SUPERSEDED_SESSION}{m.group(1)}" if m else s
+
+
+def _dead_row(status, link, qr, buy, sell) -> bool:
+    """A receipts row no delivery may ever be written onto: one the PC bot (or
+    the owner) marked as superseded, or a placeholder zeroed on both sides.
+    Without this, the receipts row an abandoned checkout left behind — order
+    number, no eSIM, so 'pending' to the matcher — took the next delivery of
+    the same size within twelve hours, and the customer's eSIM was written
+    onto the dead order instead of the one that replaced it (WR-4YWATY /
+    WR-T3QD3Q, receipts rows 188-189, 2026-10-11)."""
+    if is_replaced_status(status):
+        return True
+    if SUPERSEDED_SESSION in str(link or "") or SUPERSEDED_SESSION in str(qr or ""):
+        return True
+    return _is_zero_money(buy) and _is_zero_money(sell)
 
 
 def _session_ids(text) -> set[str]:
@@ -752,18 +791,7 @@ def find_pending_row(ws, delivery: dict) -> dict | None:
     window = timedelta(hours=MATCH_WINDOW_HOURS)
 
     def dead(get) -> bool:
-        """A row no delivery may ever be written onto: one the PC bot (or the
-        owner) marked as superseded, or a placeholder zeroed on both sides.
-        Without this, the receipts row an abandoned checkout left behind —
-        order number, no eSIM, so 'pending' to the test below — took the next
-        delivery of the same size within twelve hours, and the customer's eSIM
-        was written onto the dead order instead of the one that replaced it
-        (WR-4YWATY / WR-T3QD3Q, receipts rows 188-189, 2026-10-11)."""
-        if is_replaced_status(get(i_status)):
-            return True
-        if SUPERSEDED_SESSION in get(i_link) or SUPERSEDED_SESSION in get(i_qr):
-            return True
-        return _is_zero_money(get(i_buy)) and _is_zero_money(get(i_sell))
+        return _dead_row(get(i_status), get(i_link), get(i_qr), get(i_buy), get(i_sell))
 
     # ── the certain answer first: the same purchase session ──
     # The purchase bot writes the order's supplier page into the row, and the
@@ -864,13 +892,16 @@ def find_replaced_row(ws, delivery: dict) -> dict | None:
 
     A delivery for a row marked replaced is a purchase that went through after
     the order had already been bought again or replaced — the checkout closed
-    mid-payment, a 3DS approval that landed late. That package is real and
-    paid for, and it belongs to nobody: the customer already has the eSIM of
-    the purchase that replaced it, and mailing them a second working one is
-    the 2026-09-08 mistake. find_pending_row never offers this row; this is
-    how the mail is recognised instead of waiting two hours to be called an
-    orphan. The row's session survives as `superseded-session:<id>` (or
-    intact, when the owner marked the Status by hand)."""
+    mid-payment, a 3DS approval that landed late. find_pending_row never
+    offers this row; this is how the mail is recognised instead of waiting two
+    hours to be called an orphan. The row's session survives as
+    `superseded-session:<id>` (or intact, when the owner marked the Status by
+    hand).
+
+    It does NOT say whose package it is — handle_replaced_delivery asks the
+    site that. `live_rows` are the other rows of the same order number that
+    still read as the sale (a same-number re-buy): when the site turns out to
+    hold THIS package, one of them is the spare instead."""
     wanted = set()
     for u in (delivery.get("success_urls") or [delivery.get("success_url", "")]):
         wanted |= _session_ids(u)
@@ -879,8 +910,9 @@ def find_replaced_row(ws, delivery: dict) -> dict | None:
     rows = ws.get_all_values()
     hdr = [h.strip() for h in rows[0]]
     idx = lambda name: hdr.index(name) if name in hdr else None
-    i_order, i_status = idx("\u05de\u05e1\u05f3 \u05d4\u05d6\u05de\u05e0\u05d4"), idx(H_STATUS)
-    cols = [i for i in (idx("Link - esim.dog"), idx("QR")) if i is not None]
+    i_order, i_status = idx(H_ORDER), idx(H_STATUS)
+    i_link, i_qr, i_buy, i_sell = idx(H_LINK_SUP), idx(H_QR), idx(H_BUY), idx(H_SELL)
+    cols = [i for i in (i_link, i_qr) if i is not None]
     for n, r in enumerate(rows[1:], start=2):
         get = lambda i: r[i].strip() if i is not None and len(r) > i else ""
         replaced = is_replaced_status(get(i_status))
@@ -892,36 +924,129 @@ def find_replaced_row(ws, delivery: dict) -> dict | None:
             ids |= {m.group(1) for m in SUPERSEDED_RE.finditer(c)}
             if replaced:
                 ids |= _session_ids(c)
-        if ids & wanted:
-            return {"row": n, "order_id": get(i_order), "status": get(i_status)}
+        if not ids & wanted:
+            continue
+        oid = get(i_order)
+        live = []
+        for m, r2 in enumerate(rows[1:], start=2):
+            g2 = lambda i: r2[i].strip() if i is not None and len(r2) > i else ""
+            if m == n or not oid or g2(i_order).upper() != oid.upper():
+                continue
+            if not _dead_row(g2(i_status), g2(i_link), g2(i_qr), g2(i_buy), g2(i_sell)):
+                live.append(m)
+        return {"row": n, "order_id": oid, "status": get(i_status), "live_rows": live}
     return None
 
 
-def mark_row_superseded(ws, row_number: int) -> list[tuple[str, str, str]]:
-    """Mark a row the cloud bot just completed as NOT a sale, because the site
-    said its order had already been replaced (or already holds another eSIM):
-    Status REPLACED_CHECK_STATUS ('replaced - check the charge'), Sell 0, no
-    discount — the PC bot's own marking (bot/sheets._supersede_row with
-    zero_buy=False). Buy is KEPT: the package was delivered, so the charge is
-    real. Without this the row read as a second sale of an order the customer
-    paid for once.
+def _a1(ws_hdr: list, row_number: int, name: str) -> str | None:
+    if name not in ws_hdr:
+        return None
+    return gspread.utils.rowcol_to_a1(row_number, ws_hdr.index(name) + 1)
+
+
+def _paint(ws, hdr: list, row_number: int, colour: dict) -> bool:
+    """The Mail cell's fill, by header name. Best effort: the colour is the
+    owner's convenience, never a reason to fail the write it follows."""
+    cell = _a1(hdr, row_number, H_MAIL)
+    if not cell:
+        return False
+    try:
+        ws.format(cell, {"backgroundColor": colour})
+        return True
+    except Exception as e:
+        log.warning(f"row {row_number}: could not set the Mail colour: {_redact(str(e))}")
+        return False
+
+
+def supersede_row(ws, row_number: int, hdr: list | None = None, before: list | None = None,
+                  neutralise: bool = True) -> list[tuple[str, str, str]]:
+    """Mark one receipts row as NOT a sale, in place — the PC bot's
+    bot/sheets._supersede_row with zero_buy=False, in one shared spelling for
+    both cloud writers: Status REPLACED_CHECK_STATUS ('replaced - check the
+    charge'), Sell 0, no discount, the Mail cell WHITE, and (neutralise) the
+    session in its supplier link defused so no reader takes it for a pending
+    purchase again.
+
+    Buy is KEPT: nobody here can prove the charge was never made, and a cost
+    the owner zeroes after checking is safer than one that vanished. The fill
+    matters as much as the Sell: green Mail is the owner's "money banked"
+    mark, and a superseded row left green shows one payment as two when he
+    reconciles PayPal's deposits by hand (review 2026-10-20).
 
     Returns [(header, before, after)] for the owner's alert, so every change
-    can be undone by hand. Best effort per the caller."""
-    hdr = [h.strip() for h in ws.row_values(1)]
-    before = ws.row_values(row_number)
+    can be undone by hand."""
+    hdr = hdr if hdr is not None else [h.strip() for h in ws.row_values(1)]
+    before = before if before is not None else ws.row_values(row_number)
+
+    def was(name):
+        i = hdr.index(name) if name in hdr else -1
+        return before[i] if 0 <= i < len(before) else ""
     target = {H_STATUS: REPLACED_CHECK_STATUS, H_SELL: "0.00$", H_SALE: ""}
+    if neutralise:
+        for name in (H_LINK_SUP, H_QR):
+            old = str(was(name)).strip()
+            if old and neutralised_link(old) != old:
+                target[name] = neutralised_link(old)
     cells, changes = [], []
     for name, val in target.items():
         if name not in hdr:
             continue
-        i = hdr.index(name)
-        was = before[i] if i < len(before) else ""
-        cells.append(gspread.Cell(row_number, i + 1, val))
-        changes.append((name, was, val))
+        cells.append(gspread.Cell(row_number, hdr.index(name) + 1, val))
+        changes.append((name, was(name), val))
     if cells:
         ws.update_cells(cells, value_input_option="USER_ENTERED")
+    if _paint(ws, hdr, row_number, WHITE_BG):
+        changes.append((H_MAIL + " (fill)", "?", "white"))
     return changes
+
+
+def mark_row_superseded(ws, row_number: int) -> list[tuple[str, str, str]]:
+    """Mark a row the cloud bot just completed as NOT a sale, because the site
+    said its order had already been replaced (or already holds another eSIM).
+    supersede_row without touching the link: the row holds the package now,
+    and its supplier page is what the owner opens to shelve or refund it.
+    Without this the row read as a second sale of an order the customer paid
+    for once. Best effort per the caller."""
+    return supersede_row(ws, row_number, neutralise=False)
+
+
+def supersede_placeholders(ws, order_id: str, keep=(), skip_route_prefix: str = "") -> list:
+    """Every eSIM-less row of `order_id` (no activation code, no ICCID) that
+    still reads as the sale, other than `keep`, marked with supersede_row.
+    Returns [(row, header, before, after)].
+
+    For a purchase that carries the order's money on a NEW row of the same
+    number — the Stellar buyer taking over an esim.dog order whose checkout
+    ended uncertain (rebuy_order.py, 's'). Left alone, the old placeholder
+    kept its Sell and its green rail beside the new row's, and the books
+    counted the customer's one payment twice (the 10-11 double count, review
+    2026-10-20). `skip_route_prefix` keeps the caller's own supplier's rows
+    out of it: they are its attempts, and it settles them itself."""
+    oid = str(order_id or "").strip().upper()
+    if not oid:
+        return []
+    rows = ws.get_all_values()
+    if not rows:
+        return []
+    hdr = [h.strip() for h in rows[0]]
+    idx = lambda name: hdr.index(name) if name in hdr else None
+    i_order, i_act, i_iccid, i_route = idx(H_ORDER), idx(H_ACT), idx(H_ICCID), idx(H_ROUTE)
+    i_status, i_link, i_qr, i_buy, i_sell = (idx(H_STATUS), idx(H_LINK_SUP), idx(H_QR),
+                                             idx(H_BUY), idx(H_SELL))
+    if i_order is None:
+        return []
+    out = []
+    for n, r in enumerate(rows[1:], start=2):
+        get = lambda i: r[i].strip() if i is not None and len(r) > i else ""
+        if n in keep or get(i_order).upper() != oid or get(i_act) or get(i_iccid):
+            continue
+        if skip_route_prefix and get(i_route).startswith(skip_route_prefix):
+            continue
+        if _dead_row(get(i_status), get(i_link), get(i_qr), get(i_buy), get(i_sell)):
+            continue
+        for h, b, a in supersede_row(ws, n, hdr, list(r), neutralise=True):
+            out.append((n, h, b, a))
+    return out
 
 
 def complete_row(ws, row_number: int, delivery: dict, details: dict):
@@ -1465,28 +1590,16 @@ def process(inbox: Inbox, ws, d: dict):
     log.info(f"email uid={uid}: {d['gb']}GB/{d['days']}d {d['location']}")
 
     # An identity before any guess: a delivery whose session belongs to a row
-    # marked REPLACED is a package nobody is waiting for (find_replaced_row).
-    # It is told to the owner at once and never written anywhere a customer
-    # could be served from — not onto the dead row, not onto a look-alike
-    # pending row by the size-and-time fallback below, and not to the site,
-    # which would mail it if the order had not been linked there as well.
+    # marked REPLACED is never written onto a look-alike pending row by the
+    # size-and-time fallback below. Whose package it is, the site decides
+    # (handle_replaced_delivery) — the mark alone is not proof.
     try:
         late = find_replaced_row(ws, d)
     except Exception as e:                       # the guess below still runs
         log.warning(f"email uid={uid}: replaced-row check failed: {_redact(str(e))}")
         late = None
     if late:
-        alert(f"Order {late['order_id'] or '?'}: a package arrived for a REPLACED order",
-              f"Receipts row {late['row']} ({late['order_id'] or 'no order number'}) is marked "
-              f"'{late['status'] or 'superseded'}', and this delivery belongs to its purchase:\n"
-              f"{d['gb']}GB / {d['days']}d / {d['location']}\n{d['success_url']}\n\n"
-              "The payment went through after all. The customer already has the eSIM of "
-              "the order that replaced it, so NOTHING was sent to them and nothing was "
-              "written to the sheet or the site.\n\n"
-              "The package is real and paid for: put it on the spare-stock shelf, or ask "
-              f"the supplier for a refund. If row {late['row']} says Buy 0, the charge was "
-              "booked as not made - put the cost back.")
-        inbox.flag(uid)
+        handle_replaced_delivery(inbox, ws, d, late)
         return
 
     try:
@@ -1596,6 +1709,166 @@ def process(inbox: Inbox, ws, d: dict):
                     f"for retry: {_redact(str(e))}")
     inbox.flag(uid)
     log.info(f"order {order_id} COMPLETED (row {match['row']})")
+
+
+def _late_alert_body(late: dict, d: dict) -> str:
+    return (f"Receipts row {late['row']} ({late['order_id'] or 'no order number'}) is marked "
+            f"'{late['status'] or 'superseded'}', and this delivery belongs to its purchase:\n"
+            f"{d['gb']}GB / {d['days']}d / {d['location']}\n{d['success_url']}\n\n")
+
+
+def handle_replaced_delivery(inbox, ws, d: dict, late: dict):
+    """A delivery mail for a receipts row marked replaced: whose package is it?
+
+    The PC bot's mark says the row was superseded; it does not say which
+    purchase reached the customer, and on a same-number re-buy that is not the
+    question it looks like (review 2026-10-20). The first, uncertain checkout
+    S1 is handed to the site; the PC buys S2; S1's bank approval lands and the
+    site's sweep completes the order with ITS eSIM and mails the customer; S2
+    is then reported on the session path, which answers "fulfilled" for an
+    order that already is. The PC writes S2 as the live row and S1's as
+    replaced — the opposite of what the customer installed. Calling S1's
+    package a spare then shelves an eSIM somebody is using, and the next
+    customer served from stock shares it.
+
+    So the site is asked, and only the site's own record decides:
+      * the order was replaced by ANOTHER order (replaced_by), or holds no
+        eSIM and is no longer waiting for one -> nobody's page shows this
+        package: a spare. Told to the owner; nothing written, nothing posted.
+      * the order is fulfilled -> this package is reported to it. A site that
+        holds a DIFFERENT eSIM parks this one (late_esim, customer_mail:false)
+        and it is a spare, as above. A plain answer means the site already
+        holds THIS one: it is the customer's eSIM, so its row becomes the sale
+        and the live row of the same number becomes the spare.
+      * the order is still pending -> its own session may yet complete it
+        with this package; asked again next run, for UNMATCHED_GRACE_HOURS.
+      * the site cannot be read, or cannot be trusted with the comparison (a
+        site from before 2026-10-20 swaps the eSIM on the customer's page when
+        a different one is reported; the `has_session` key in its lookup is
+        how the new one is recognised), or holds an eSIM on a record that is
+        not 'fulfilled' -> nobody decides blind: retried, then handed to the
+        owner.
+    The customer is never mailed from here: when this package is theirs, they
+    have had it since the site completed the order, and the delivery ledger
+    owns that mail."""
+    uid, oid = d["uid"], str(late.get("order_id") or "").strip()
+    age = datetime.now(timezone.utc) - d["received_at"]
+    head = _late_alert_body(late, d)
+
+    def spare(why: str):
+        alert(f"Order {oid or '?'}: a package arrived for a REPLACED order",
+              head + why + "\n\nNOTHING was sent to the customer and nothing was written "
+              "to the sheet or the site.\n\nThe package is real and paid for: put it on the "
+              f"spare-stock shelf, or ask the supplier for a refund. If row {late['row']} says "
+              "Buy 0, the charge was booked as not made - put the cost back.")
+        inbox.flag(uid)
+
+    def undecided(why: str):
+        if age < timedelta(hours=UNMATCHED_GRACE_HOURS):
+            log.info(f"email uid={uid}: late package for {oid or '?'} not decided yet ({why}) - will retry")
+            return                                   # NOT flagged -> asked again next run
+        alert(f"Order {oid or '?'}: a package for a REPLACED order - decide by hand",
+              head + f"It could not be settled by itself: {why}.\n\nOpen the order's page and "
+              f"compare its ICCID with this package's. If they are the SAME, the customer has "
+              f"this package: fill row {late['row']} with it and make it the sale, and mark the "
+              f"other row of {oid or 'the order'} as the spare. If they differ, this one is a "
+              "spare: shelf or supplier refund. Nothing was sent, written or posted.")
+        inbox.flag(uid)
+
+    if not oid:
+        spare("The row carries no order number, so no customer page can hold it.")
+        return
+    facts = order_facts(oid)
+    if not facts:
+        undecided("the site's record of the order could not be read")
+        return
+    if facts.get("replaced_by"):
+        spare(f"The site says {oid} was replaced by {facts['replaced_by']}, which carries the "
+              f"customer's eSIM.")
+        return
+    status = str(facts.get("status") or "").strip().lower()
+    if status == "pending" and not facts.get("esim_ready"):
+        undecided("the order has no eSIM on the site yet, and this purchase may still be the "
+                  "one that completes it")
+        return
+    if facts.get("esim_ready") and status != "fulfilled":
+        # An eSIM on a record that is not 'fulfilled' (settled after delivery,
+        # say): the page may show it, and the site's status path would write
+        # a report over it rather than compare. Not a call to make blind.
+        undecided(f"the site holds an eSIM for {oid} but the order is '{status or '?'}', "
+                  f"so the two cannot be compared safely")
+        return
+    if not facts.get("esim_ready"):
+        spare(f"The site holds no eSIM for {oid} (status '{status or '?'}'), so no customer page "
+              f"shows this package. If {oid} is still owed an eSIM, this package could be given "
+              f"to it by hand instead of buying another.")
+        return
+    if "has_session" not in facts:
+        undecided("the site predates the 2026-10-20 second-package guard, and reporting a "
+                  "different eSIM to it would replace the one on the customer's page")
+        return
+    details = fetch_esim_details(d.get("success_urls") or [d["success_url"]])
+    if details.get("used_url"):
+        d["success_url"] = details["used_url"]
+    if not details.get("activation_code"):
+        # The site compares by activation code (it always holds one when
+        # esim_ready); without ours the comparison would prove nothing, and
+        # an undecided report is written onto the customer's page.
+        undecided("the supplier's page did not give this package's activation code")
+        return
+    try:
+        answer = report_fulfilled(oid, d, details)
+    except Exception as e:
+        undecided(f"the site report failed ({_redact(str(e))})")
+        return
+    if site_withholds_mail(answer):
+        spare(f"The site holds a DIFFERENT eSIM for {oid} - the one the customer has - and "
+              f"kept this one aside as a spare (late_esim).")
+        return
+
+    # The site already held THIS package: it is the customer's eSIM. Row
+    # late['row'] becomes the sale; the live row(s) of the same number hold a
+    # package nobody shows, or nothing at all.
+    n = late["row"]
+    hdr = [h.strip() for h in ws.row_values(1)]
+    notes = []
+    complete_row(ws, n, d, details)
+    sale = {}
+    live = list(late.get("live_rows") or [])
+    if live:
+        src = ws.row_values(live[0])
+        for name in (H_SELL, H_SALE, H_PURCHASE):
+            if name in hdr and hdr.index(name) < len(src) and src[hdr.index(name)].strip():
+                sale[name] = src[hdr.index(name)].strip()
+    if sale:
+        ws.update_cells([gspread.Cell(n, hdr.index(k) + 1, v) for k, v in sale.items()],
+                        value_input_option="USER_ENTERED")
+        notes.append(f"row {n}: eSIM filled in, Status active, "
+                     + ", ".join(f"{k} '{v}'" for k, v in sale.items()) + f" (from row {live[0]})")
+    else:
+        notes.append(f"row {n}: eSIM filled in, Status active - its Sell is NOT restored "
+                     f"(no live row to take it from): type what the customer paid")
+    if str(sale.get(H_PURCHASE, "")).strip().lower() in PAID_RAILS and _paint(ws, hdr, n, PAID_BG):
+        notes.append(f"row {n}: Mail green")
+    before = ws.row_values(n)
+    if H_BUY in hdr and _is_zero_money(before[hdr.index(H_BUY)] if hdr.index(H_BUY) < len(before) else ""):
+        notes.append(f"row {n}: Buy says 0, but this package WAS charged - put its cost back")
+    for m in live:
+        try:
+            ch = supersede_row(ws, m, hdr)
+            notes.append(f"row {m} is now the spare: " +
+                         ("; ".join(f"{h}: '{b}' -> '{a}'" for h, b, a in ch) or "nothing changed"))
+        except Exception as e:
+            notes.append(f"row {m} NOT marked ({_redact(str(e))}) - mark it as the spare by hand")
+    alert(f"Order {oid}: the 'replaced' purchase IS the customer's eSIM - rows swapped",
+          head + f"The site already shows THIS package on {oid}'s page (same activation code), "
+          "so it is the eSIM the customer has, and the other purchase of the same number is "
+          "the one nobody is using.\n\nChanged:\n  * " + "\n  * ".join(notes) +
+          "\n\nThe customer was not mailed again (they have had this eSIM since the site "
+          "completed the order). The spare row's package: shelf, or a supplier refund.")
+    inbox.flag(uid)
+    log.info(f"order {oid}: late package is the customer's - row {n} is the sale, "
+             f"row(s) {live or '-'} the spare")
 
 
 def _open_inbox(attempts: int = 3):

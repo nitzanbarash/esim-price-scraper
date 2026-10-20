@@ -203,6 +203,7 @@ class Sheet:
     def __init__(self, rows):
         self.rows = [list(HDR)] + [list(r) for r in rows]
         self.cells = []
+        self.formats = []
 
     def get_all_values(self):
         return [list(r) for r in self.rows]
@@ -214,6 +215,9 @@ class Sheet:
         for c in cells:
             self.cells.append((c.row, HDR[c.col - 1], c.value))
             self.rows[c.row - 1][c.col - 1] = c.value
+
+    def format(self, a1, fmt):
+        self.formats.append((a1, fmt))
 
 
 def delivery(sid=SID_B, gb=10.0, when=WHEN):
@@ -291,19 +295,164 @@ class TestALatePackageForAReplacedOrder(unittest.TestCase):
         ws = Sheet([rrow("WR-4YWATY", link=URL + SID_A, status=REPLACED)])
         self.assertEqual(fb.find_replaced_row(ws, delivery(SID_A))["row"], 2)
 
-    def test_process_tells_the_owner_and_touches_nothing(self):
+    def test_the_live_row_of_the_same_number_is_named(self):
         ws = Sheet([rrow("WR-4YWATY", link=fb.SUPERSEDED_SESSION + SID_A, status=REPLACED_CHECK,
-                         sell="0.00$")])
-        inbox, alerts, flagged = mock.Mock(), [], []
+                         sell="0.00$"),
+                    rrow("WR-4YWATY", link=URL + SID_B, act="LPA:1$x$B", iccid="'8900B"),
+                    rrow("WR-OTHER1", link=URL + SID_B)])
+        self.assertEqual(fb.find_replaced_row(ws, delivery(SID_A))["live_rows"], [3])
+
+
+# The same-number re-buy of the review (2026-10-20): row 2 is the first,
+# uncertain checkout (session A), marked replaced by the PC; row 3 is the
+# re-buy (session B), filled in and live. A's delivery mail arrives. Whose
+# eSIM is it? Only the site's record can say.
+GOT_A = {"activation_code": "LPA:1$smdp$CODEA", "iccid": "8972000000000000AAA", "used_url": URL + SID_A}
+
+
+class TestWhoseLatePackageIsIt(unittest.TestCase):
+    def _sheet(self):
+        r1 = rrow("WR-4YWATY", link=fb.SUPERSEDED_SESSION + SID_A, status=REPLACED_CHECK, sell="0.00$")
+        r1[H["\u05d4\u05e0\u05d7\u05d4 - Sale"]] = ""
+        r2 = rrow("WR-4YWATY", link=URL + SID_B, act="LPA:1$smdp$CODEB", iccid="'8972000000000000BBB",
+                  date="11/10/2026 20:00:49")
+        return Sheet([r1, r2])
+
+    def _run(self, facts, answer=None, details=GOT_A, when=WHEN, ws=None):
+        ws = ws or self._sheet()
+        inbox, alerts, flagged, posts = mock.Mock(), [], [], []
         inbox.flag = flagged.append
+
+        def report(oid, d, det):
+            posts.append((oid, det.get("activation_code")))
+            if isinstance(answer, Exception):
+                raise answer
+            return answer if answer is not None else {"ok": True, "order_id": oid, "status": "fulfilled"}
         with mock.patch.object(fb, "alert", lambda s, b: alerts.append((s, b))), \
-             mock.patch.object(fb, "fetch_esim_details", side_effect=AssertionError("no lookup")), \
-             mock.patch.object(fb, "report_fulfilled", side_effect=AssertionError("no site")), \
-             mock.patch.object(fb, "send_customer_email", side_effect=AssertionError("no mail")):
-            fb.process(inbox, ws, delivery(SID_A))
+             mock.patch.object(fb, "order_facts", lambda oid: dict(facts)), \
+             mock.patch.object(fb, "fetch_esim_details", lambda urls: dict(details)), \
+             mock.patch.object(fb, "report_fulfilled", report), \
+             mock.patch.object(fb, "send_customer_email", side_effect=AssertionError("no mail")), \
+             mock.patch.object(fb, "report_email_sent", side_effect=AssertionError("no ledger")):
+            fb.process(inbox, ws, delivery(SID_A, when=when))
+        return ws, alerts, flagged, posts
+
+    FULFILLED = {"order_id": "WR-4YWATY", "status": "fulfilled", "esim_ready": True, "has_session": True}
+
+    def col(self, ws, n, h):
+        return ws.rows[n - 1][H[h]]
+
+    def test_the_site_shows_THIS_package_so_the_rows_swap(self):
+        ws, alerts, flagged, posts = self._run(self.FULFILLED)
+        self.assertEqual(posts, [("WR-4YWATY", GOT_A["activation_code"])])
+        # Row 2 is the sale now: the eSIM, active, the money and the rail of row 3.
+        self.assertEqual(self.col(ws, 2, "Activation Code"), GOT_A["activation_code"])
+        self.assertEqual(self.col(ws, 2, "\u05e1\u05d8\u05d8\u05d5\u05e1 - Status"), "\u05e4\u05e2\u05d9\u05dc")
+        self.assertEqual(self.col(ws, 2, "\u05de\u05db\u05d9\u05e8\u05d4 - Sell"), "6.99$")
+        self.assertEqual(self.col(ws, 2, "\u05e8\u05db\u05d9\u05e9\u05d4 - Purchase"), "paypal")
+        self.assertEqual(self.col(ws, 2, "Link - esim.dog"), URL + SID_A, "the clean link replaces the defused one")
+        self.assertIn(("A2", {"backgroundColor": fb.PAID_BG}), ws.formats)
+        # Row 3 is the spare: not a sale, white, its cost kept.
+        self.assertEqual(self.col(ws, 3, "\u05e1\u05d8\u05d8\u05d5\u05e1 - Status"), REPLACED_CHECK)
+        self.assertEqual(self.col(ws, 3, "\u05de\u05db\u05d9\u05e8\u05d4 - Sell"), "0.00$")
+        self.assertEqual(self.col(ws, 3, "\u05e7\u05e0\u05d9\u05d9\u05d4 - Buy"), "3.86$")
+        self.assertEqual(self.col(ws, 3, "Link - esim.dog"), fb.SUPERSEDED_SESSION + SID_B)
+        self.assertIn(("A3", {"backgroundColor": fb.WHITE_BG}), ws.formats)
         self.assertEqual(flagged, ["7"])
         self.assertEqual(len(alerts), 1)
-        self.assertIn("WR-4YWATY", alerts[0][0])
+        self.assertIn("rows swapped", alerts[0][0])
+        self.assertIn("row 3", alerts[0][1])
+
+    def test_a_zeroed_buy_is_called_out_when_the_package_turns_out_charged(self):
+        ws = self._sheet()
+        ws.rows[1][H["\u05e7\u05e0\u05d9\u05d9\u05d4 - Buy"]] = "0.00$"
+        ws.rows[1][H["\u05e1\u05d8\u05d8\u05d5\u05e1 - Status"]] = REPLACED
+        _, alerts, _, _ = self._run(self.FULFILLED, ws=ws)
+        self.assertIn("Buy says 0", alerts[0][1])
+
+    def test_the_site_holds_ANOTHER_esim_so_this_one_is_the_spare(self):
+        ws, alerts, flagged, posts = self._run(
+            self.FULFILLED, answer={"ok": True, "status": "fulfilled", "late_delivery": True,
+                                    "customer_mail": False})
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(ws.cells, [], "the sheet is left as the PC wrote it")
+        self.assertEqual(ws.formats, [])
+        self.assertEqual(flagged, ["7"])
+        self.assertIn("DIFFERENT eSIM", alerts[0][1])
+
+    def test_replaced_by_another_order_is_a_spare_without_asking_again(self):
+        ws, alerts, flagged, posts = self._run({"status": "settled", "replaced_by": "WR-T3QD3Q",
+                                                "has_session": False})
+        self.assertEqual((posts, ws.cells, flagged), ([], [], ["7"]))
+        self.assertIn("WR-T3QD3Q", alerts[0][1])
+
+    def test_no_esim_and_not_waiting_is_a_spare(self):
+        ws, alerts, flagged, posts = self._run({"status": "failed", "esim_ready": False, "has_session": True})
+        self.assertEqual((posts, ws.cells, flagged), ([], [], ["7"]))
+        self.assertIn("could be given", alerts[0][1])
+
+    def test_an_esim_on_a_record_that_is_not_fulfilled_is_not_posted_to(self):
+        ws, alerts, flagged, posts = self._run({"status": "settled", "esim_ready": True, "has_session": True})
+        self.assertEqual((posts, ws.cells, flagged), ([], [], ["7"]))
+        self.assertIn("decide by hand", alerts[0][0])
+
+    def test_a_pending_order_is_asked_again_while_the_mail_is_fresh(self):
+        fresh = datetime.now(timezone.utc) - timedelta(minutes=10)
+        ws, alerts, flagged, posts = self._run({"status": "pending", "esim_ready": False,
+                                                "has_session": True}, when=fresh)
+        self.assertEqual((posts, ws.cells, flagged, alerts), ([], [], [], []))
+
+    def test_then_handed_to_the_owner_once_the_grace_is_over(self):
+        ws, alerts, flagged, posts = self._run({"status": "pending", "esim_ready": False, "has_session": True})
+        self.assertEqual((posts, ws.cells, flagged), ([], [], ["7"]))
+        self.assertIn("decide by hand", alerts[0][0])
+
+    def test_an_unreadable_site_never_decides_blind(self):
+        fresh = datetime.now(timezone.utc) - timedelta(minutes=10)
+        ws, alerts, flagged, posts = self._run({}, when=fresh)
+        self.assertEqual((posts, ws.cells, flagged, alerts), ([], [], [], []))
+
+    def test_a_site_without_the_second_package_guard_is_never_posted_to(self):
+        # Before f10f1d4 a different eSIM reported to a fulfilled order
+        # REPLACED the one on the customer's page.
+        facts = {k: v for k, v in self.FULFILLED.items() if k != "has_session"}
+        ws, alerts, flagged, posts = self._run(facts)
+        self.assertEqual((posts, ws.cells, flagged), ([], [], ["7"]))
+        self.assertIn("decide by hand", alerts[0][0])
+
+    def test_no_activation_code_means_no_comparison(self):
+        ws, alerts, flagged, posts = self._run(self.FULFILLED, details={"iccid": "8972000000000000AAA"})
+        self.assertEqual((posts, ws.cells, flagged), ([], [], ["7"]))
+
+    def test_a_failed_report_is_retried_not_guessed(self):
+        fresh = datetime.now(timezone.utc) - timedelta(minutes=10)
+        ws, alerts, flagged, posts = self._run(self.FULFILLED, answer=OSError("502"), when=fresh)
+        self.assertEqual((len(posts), ws.cells, flagged, alerts), (1, [], [], []))
+
+
+class TestSupersedeHelpers(unittest.TestCase):
+    def test_a_parked_spare_row_is_no_longer_green(self):
+        ws = Sheet([rrow("WR-OLDONE", link=URL + SID_B, act="LPA:1$a$b")])
+        ch = fb.mark_row_superseded(ws, 2)
+        self.assertEqual(ws.formats, [("A2", {"backgroundColor": fb.WHITE_BG})])
+        self.assertIn((fb.H_MAIL + " (fill)", "?", "white"), ch)
+        self.assertEqual(ws.rows[1][H["Link - esim.dog"]], URL + SID_B, "a spare keeps its package page")
+
+    def test_placeholders_of_the_order_only(self):
+        ws = Sheet([rrow("WR-X00001", link=URL + SID_A + "#payment-uncertain"),     # placeholder -> marked
+                    rrow("WR-X00001", link=URL + SID_B, act="LPA:1$a$b"),           # has an eSIM -> kept
+                    rrow("WR-X00001", status=REPLACED, buy="0.00$", sell="0.00$"),  # already dead -> kept
+                    rrow("WR-Y00002")])                                            # other order -> kept
+        before = [list(r) for r in ws.rows]
+        out = fb.supersede_placeholders(ws, "wr-x00001", keep={99})
+        self.assertEqual(sorted({r for r, *_ in out}), [2])
+        self.assertEqual(ws.rows[1][H["Link - esim.dog"]], fb.SUPERSEDED_SESSION + SID_A)
+        self.assertEqual(ws.rows[1][H["\u05de\u05db\u05d9\u05e8\u05d4 - Sell"]], "0.00$")
+        self.assertEqual(ws.rows[2:], before[2:])
+
+    def test_a_row_the_caller_keeps_is_never_touched(self):
+        ws = Sheet([rrow("WR-X00001")])
+        self.assertEqual(fb.supersede_placeholders(ws, "WR-X00001", keep={2}), [])
         self.assertEqual(ws.cells, [])
 
 

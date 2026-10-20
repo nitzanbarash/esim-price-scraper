@@ -1202,8 +1202,50 @@ check("the row keeps the credentials and the cost",
 check("...but is no longer a sale",
       ws36.col(2, sb.H_STATUS) == fb.REPLACED_CHECK_STATUS and ws36.col(2, sb.H_SELL) == "0.00$"
       and ws36.col(2, sb.H_SALE) == "", f"{ws36.col(2, sb.H_STATUS)} {ws36.col(2, sb.H_SELL)}")
-check("no green paint", ws36.formats == [], str(ws36.formats))
+check("no green paint - the Mail cell is set WHITE (a spare banked no money)",
+      ws36.formats == [("A2", {"backgroundColor": fb.WHITE_BG})], str(ws36.formats))
 check("the owner is told once", len(alerts) == 1 and "spare" in alerts[0][0], str(alerts))
+
+print("\n37. an esim.dog placeholder re-bought on Stellar is not counted twice (review 2026-10-20)")
+# rebuy_order.py 's': the esim.dog checkout of WR-TEST01 ended uncertain (a
+# placeholder row: Sell 6.99, paypal, green, no eSIM), the order was handed to
+# Stellar under the SAME number. Both rows used to stay revenue.
+SIDX = "cs_live_" + "Q" * 40
+dog_row = [""] * len(HDR)
+for h, v in (("\u05de\u05e1\u05f3 \u05d4\u05d6\u05de\u05e0\u05d4", "WR-TEST01"),
+             ("Link - esim.dog", "https://esim.dog/success?session_id=" + SIDX + "#payment-uncertain"),
+             ("\u05e1\u05d8\u05d8\u05d5\u05e1 - Status", "\u05e4\u05e2\u05d9\u05dc"),
+             ("\u05e8\u05db\u05d9\u05e9\u05d4 - Purchase", "paypal"), ("\u05de\u05e7\u05d5\u05e8 - source", "esim.dog"),
+             ("\u05e7\u05e0\u05d9\u05d9\u05d4 - Buy", "3.86$"), ("\u05de\u05db\u05d9\u05e8\u05d4 - Sell", "6.99$"),
+             ("\u05d4\u05e0\u05d7\u05d4 - Sale", "-")):
+    dog_row[HDR.index(h)] = v
+other_dog = list(dog_row)
+other_dog[HDR.index("\u05de\u05e1\u05f3 \u05d4\u05d6\u05de\u05e0\u05d4")] = "WR-OTHER9"
+_, ws37, _, _ = scenario([order()], StellarFake(), ws=Ws([dog_row, other_dog]))
+check("the Stellar row is the sale (delivered, Sell 6.99, green)",
+      ws37.col(4, sb.H_ACT) == LPA and ws37.col(4, sb.H_SELL) == "6.99$"
+      and ("A4", {"backgroundColor": sb.PAID_BG}) in ws37.formats, f"{ws37.rows[3]} {ws37.formats}")
+check("the esim.dog placeholder: 'replaced - check the charge', Sell 0, no discount",
+      (ws37.col(2, sb.H_STATUS), ws37.col(2, sb.H_SELL), ws37.col(2, sb.H_SALE))
+      == (fb.REPLACED_CHECK_STATUS, "0.00$", ""), str(ws37.rows[1]))
+check("...its Buy is kept (only the owner can rule the charge out)", ws37.col(2, sb.H_BUY) == "3.86$")
+check("...its session is defused, so a late delivery is never matched as pending",
+      ws37.col(2, sb.H_LINK_SUP) == fb.SUPERSEDED_SESSION + SIDX, ws37.col(2, sb.H_LINK_SUP))
+check("...and its Mail cell is white", ("A2", {"backgroundColor": fb.WHITE_BG}) in ws37.formats, str(ws37.formats))
+check("another order's row is untouched", ws37.rows[2] == other_dog)
+check("the owner is told which row changed", any("marked replaced" in a[0] for a in alerts), str(alerts))
+check("a late esim.dog delivery for it is now recognised as the replaced row",
+      (fb.find_replaced_row(ws37, {"success_urls": ["https://esim.dog/success?session_id=" + SIDX]}) or {})
+      .get("row") == 2)
+
+_w37 = Ws([receipt_row("WR-TEST01", sb.ST_PROCESSING), dog_row])
+check("the buyer's own Stellar attempts are never retired (they settle themselves)",
+      sorted({c[0] for c in fb.supersede_placeholders(_w37, "WR-TEST01", skip_route_prefix=sb.ROUTE_PREFIX)})
+      == [3] and _w37.col(2, sb.H_STATUS) == sb.ST_PROCESSING, str(_w37.rows[1]))
+
+print("   ...a Stellar order that FAILS leaves the esim.dog row the sale")
+_, ws37b, _, _ = scenario([order()], StellarFake(statuses=("failed",)), ws=Ws([dog_row]))
+check("nothing delivered, the placeholder untouched", ws37b.rows[1] == dog_row, str(ws37b.rows[1]))
 
 
 # ── summary (last, so it gates the exit code) ────────────────────────────────
