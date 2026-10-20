@@ -529,5 +529,157 @@ class TestSummary(unittest.TestCase):
         self.assertAlmostEqual(s["modelled_fees"], s["fees"], places=2)
 
 
+# ── 2026-10-20: gifts, superseded rows, shekel charges ──────────────────────
+# The receipts rows below are written exactly as the PC bot writes them
+# (bot/sheets.py): a gift's Purchase cell says 'free' and its Sell is 0.00$;
+# a superseded placeholder says 'replaced' (Buy zeroed, proven unpaid) or
+# 'replaced - check the charge' (Buy kept, may have been charged). WR-4YWATY /
+# WR-T3QD3Q (receipts rows 188-189, 2026-10-11) is the case that started it:
+# one customer, one payment, two rows that both read as a $6.99 sale.
+
+REPLACED_CHECK = fc.REPLACED_STATUS + " - \u05dc\u05d1\u05d3\u05d5\u05e7 \u05d7\u05d9\u05d5\u05d1"
+
+
+def row(sell, buy, status="\u05e4\u05e2\u05d9\u05dc", provider="paypal", order_id="WR-T3QD3Q",
+        date="11/10/2026 20:00:49", discount="-"):
+    return {"date": date, "sku": "2.0.10", "sell": sell, "buy": buy, "region": "Europe",
+            "order_id": order_id, "status": status, "provider": provider,
+            "discount": discount, "customer": "c@x.com", "gb": "10GB"}
+
+
+def sale(r, model=None):
+    return fc.build_sale(r, {"fee": "", "list": "6.99"}, model or fc.FeeModel())
+
+
+class TestGiftsAndReplacedRows(unittest.TestCase):
+    def _real(self):
+        return sale(row("6.99$", "3.67$"))
+
+    def test_a_gift_is_an_internal_cost_named_a_gift(self):
+        g = sale(row("0.00$", "3.86$", provider=fc.FREE_RAIL, order_id="WR-GIFT01",
+                     discount="100% ($6.99 \u05d4\u05e0\u05d7\u05d4)"))
+        self.assertTrue(g.internal)
+        self.assertTrue(g.gift)
+        self.assertEqual(g.fee, 0.0)              # nothing was processed
+        self.assertEqual(g.provider, fc.GIFT)     # not "Bit"
+        base = fc.summarise([self._real()], [], lambda d: 3.0)
+        s = fc.summarise([self._real(), g], [], lambda d: 3.0)
+        # Zero revenue, the real cost, no extra order: exactly an internal one.
+        self.assertEqual(s["orders"], base["orders"])
+        self.assertEqual(s["revenue"], base["revenue"])
+        self.assertAlmostEqual(s["internal_cost"], 3.86, places=2)
+        self.assertEqual(s["gift_orders"], 1)
+        self.assertAlmostEqual(s["gift_cost"], 3.86, places=2)
+        self.assertAlmostEqual(s["net_profit"], base["net_profit"] - 3.86, places=2)
+
+    def test_a_free_word_next_to_a_price_is_a_sale(self):
+        s = sale(row("5.00$", "3.86$", provider=fc.FREE_RAIL))
+        self.assertFalse(s.internal)
+        self.assertFalse(s.gift)
+        self.assertNotEqual(s.provider, fc.GIFT)
+
+    def test_a_test_order_is_internal_but_not_a_gift(self):
+        t = sale(row("0$", "0.68$", provider="bot - manually"))
+        self.assertTrue(t.internal)
+        self.assertFalse(t.gift)
+
+    def test_a_proven_unpaid_placeholder_leaves_the_books(self):
+        dead = sale(row("0.00$", "0.00$", status=fc.REPLACED_STATUS, order_id="WR-4YWATY",
+                        date="11/10/2026 19:55:43", discount=""))
+        self.assertTrue(dead.replaced)
+        base = fc.summarise([self._real()], [], lambda d: 3.0)
+        s = fc.summarise([self._real(), dead], [], lambda d: 3.0)
+        self.assertEqual(s, base)
+        self.assertEqual(fc.reconcile([], [dead]), [])   # no charge is expected
+
+    def test_a_replaced_row_is_never_revenue_even_with_its_price_left_in(self):
+        # Marked by hand: the Status typed, the $6.99 left in Sell. Counted,
+        # the customer's one payment would be revenue twice.
+        hand = sale(row("6.99$", "3.86$", status=REPLACED_CHECK, order_id="WR-4YWATY",
+                        date="11/10/2026 19:55:43"))
+        self.assertEqual(hand.sell, 0.0)
+        self.assertTrue(hand.internal and hand.replaced and not hand.gift)
+        s = fc.summarise([self._real(), hand], [], lambda d: 3.0)
+        self.assertEqual(s["orders"], 1)
+        self.assertAlmostEqual(s["revenue"], 6.99, places=2)
+        # The charge may have happened, so its cost stays in the internal line.
+        self.assertAlmostEqual(s["replaced_cost"], 3.86, places=2)
+        self.assertEqual(s["replaced_orders"], 1)
+
+    def test_reconcile_says_whether_the_replaced_attempt_was_charged(self):
+        placeholder = sale(row("0.00$", "3.86$", status=REPLACED_CHECK, order_id="WR-4YWATY",
+                               date="11/10/2026 19:56:00"))
+        live = sale(row("6.99$", "3.86$", date="11/10/2026 20:01:00"))
+        # One charge, CLOSER in time to the dead attempt than to the live one.
+        # The live row still takes it: a superseded row is only ever matched
+        # when nothing live fits.
+        charge = fc.Expense(key="k1", when=il(2026, 10, 11, 19, 58), vendor="ESIM.DOG",
+                            description="", category=fc.COGS, amount=3.86,
+                            currency="USD", source="\u05de\u05d9\u05d9\u05dc")
+        ms = {m.order_id: m for m in fc.reconcile([charge], [placeholder, live])}
+        self.assertEqual(ms["WR-T3QD3Q"].verdict, fc.MATCHED)
+        self.assertEqual(ms["WR-4YWATY"].verdict, fc.SALE_NO_CHARGE)
+        self.assertEqual(ms["WR-4YWATY"].note, fc.REPLACED_NO_CHARGE)
+        # A second charge for the same price: now the dead attempt WAS paid.
+        charge2 = fc.Expense(key="k2", when=il(2026, 10, 11, 19, 56, 30), vendor="ESIM.DOG",
+                             description="", category=fc.COGS, amount=3.86,
+                             currency="USD", source="\u05de\u05d9\u05d9\u05dc")
+        ms = {m.order_id: m for m in fc.reconcile([charge, charge2], [placeholder, live])}
+        self.assertEqual(ms["WR-4YWATY"].verdict, fc.MATCHED)
+        self.assertIn(fc.REPLACED_CHARGED, ms["WR-4YWATY"].note)
+
+
+class TestShekelCharges(unittest.TestCase):
+    """esim.dog's Stripe page opens in ₪ for an Israeli buyer; a switch to $
+    that did not take left a few purchases charged in shekels. Compared raw,
+    ₪11.96 never equalled a $3.86 Buy, and each one showed up twice."""
+
+    def _charge(self, amount, currency="ILS", when=None):
+        return fc.Expense(key=f"k{amount}", when=when or il(2026, 8, 30, 0, 52),
+                          vendor="ESIM.DOG", description="", category=fc.COGS,
+                          amount=amount, currency=currency, source="\u05de\u05d9\u05d9\u05dc")
+
+    def _sale(self, buy=3.86):
+        return fc.Sale(when=il(2026, 8, 30, 0, 52, 30), order_id="WR-ILS001",
+                       sku="2.0.10", region="Europe", gb="10GB", customer="",
+                       status="", sell=6.99, buy=buy, fee=0.0, fee_source="",
+                       list_price=6.99)
+
+    def test_the_stripe_receipt_says_shekels(self):
+        body = STRIPE_BODY.replace("$4.17", "₪11.96")
+        e = fc.parse_stripe_receipt(STRIPE_SENDER, "Your receipt from ESIM.DOG", body,
+                                    utc(2026, 8, 30, 0, 52))
+        self.assertEqual((e.amount, e.currency), (11.96, "ILS"))
+
+    def test_a_shekel_charge_pairs_with_its_dollar_buy(self):
+        # ₪11.96 at Stripe's 3.0986 is the $3.86 list price; at a market 3.0
+        # it is $3.99 — Stripe's conversion fee, inside the 4% slack.
+        [m] = fc.reconcile([self._charge(11.96)], [self._sale()], rate_for=lambda d: 3.0)
+        self.assertEqual(m.verdict, fc.MATCHED)
+        self.assertEqual(m.order_id, "WR-ILS001")
+        self.assertAlmostEqual(m.amount, 3.99, places=2)        # shown in dollars
+        self.assertIn(fc.ILS_CHARGE, m.note)
+
+    def test_without_a_rate_it_is_not_guessed(self):
+        ms = fc.reconcile([self._charge(11.96)], [self._sale()])
+        self.assertEqual(sorted(m.verdict for m in ms),
+                         sorted([fc.CHARGE_NO_SALE, fc.SALE_NO_CHARGE]))
+        self.assertIn(fc.NO_RATE, next(m.note for m in ms if m.verdict == fc.CHARGE_NO_SALE))
+
+    def test_a_shekel_charge_for_a_different_price_does_not_pair(self):
+        ms = fc.reconcile([self._charge(15.00)], [self._sale()], rate_for=lambda d: 3.0)
+        self.assertNotIn(fc.MATCHED, [m.verdict for m in ms])
+
+    def test_dollar_charges_keep_their_two_cent_rule(self):
+        # The shekel slack is for a conversion fee; a dollar receipt has none.
+        ms = fc.reconcile([self._charge(3.96, currency="USD")], [self._sale()],
+                          rate_for=lambda d: 3.0)
+        self.assertNotIn(fc.MATCHED, [m.verdict for m in ms])
+        [m] = fc.reconcile([self._charge(3.87, currency="USD")], [self._sale()],
+                           rate_for=lambda d: 3.0)
+        self.assertEqual((m.verdict, m.amount, m.note.startswith("\u05e4\u05e2\u05e8")),
+                         (fc.MATCHED, 3.87, True))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

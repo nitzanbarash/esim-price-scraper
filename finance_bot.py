@@ -724,7 +724,9 @@ def publish(sh, data: dict, rates: Rates) -> dict:
 
     summary = summarise(sales, merged, rates.for_date)
     cogs_expenses = [e for e in merged if e.category == COGS]
-    matches = reconcile(cogs_expenses, sales)
+    # rate_for: a supplier charge billed in shekels is compared in dollars
+    # (finance_core.ILS_TOLERANCE) - raw, it never matched its sale.
+    matches = reconcile(cogs_expenses, sales, rate_for=rates.for_date)
 
     log("writing tabs")
     write_tab(sh, T_EXPENSES, EXPENSE_HEADER, expense_rows)
@@ -739,7 +741,10 @@ def publish(sh, data: dict, rates: Rates) -> dict:
             fmt(s.profit), fmt(s.margin_pct, 1),
             fmt(s.list_price), fmt(s.discount_pct, 1),
             "כן" if s.discounted else "",
-            "כן" if s.internal else "",
+            # Any text marks the row internal (finance_ui reads the cell as
+            # truthy); a gift and a superseded attempt say which they are.
+            (fc.GIFT if s.gift else fc.REPLACED_STATUS if s.replaced else "כן")
+            if s.internal else "",
         ])
     write_tab(sh, T_SALES,
               ["תאריך", "מס׳ הזמנה", 'מק"ט', "אזור", "GB", "לקוח", "סטטוס",
@@ -804,7 +809,11 @@ def write_summary(sh, s: dict, matches, data: dict, rates: Rates) -> None:
         ["רווח גולמי", s["gross_profit"], ""],
         ["הוצאות אחרות", -s["overhead"], ""],
         ["הזמנות פנימיות / בדיקה", -s["internal_cost"],
-         f'{s["internal_orders"]} הזמנות שנקנו ולא נמכרו'
+         (f'{s["internal_orders"]} הזמנות שנקנו ולא נמכרו'
+          + "".join(f" \u00b7 {label}: {n} (${cost:.2f})" for label, n, cost in (
+              ("\u05de\u05ea\u05e0\u05d5\u05ea", s.get("gift_orders", 0), s.get("gift_cost", 0.0)),
+              (fc.REPLACED_STATUS, s.get("replaced_orders", 0), s.get("replaced_cost", 0.0)))
+              if n))
          if s["internal_orders"] else ""],
         ["רווח נקי", s["net_profit"], f'≈ {round(s["net_profit"] * rate)} ש"ח'],
         ["שולי רווח %", s["margin"], ""],

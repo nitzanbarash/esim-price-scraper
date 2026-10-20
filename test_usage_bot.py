@@ -967,6 +967,35 @@ check("and says how many it did not name", "and 13 more" in body, True)
 check("nothing was written to any of them", ws2.written, [])
 
 
+print("\n-- the discount sweep: a gift says 100%, a superseded row says nothing --")
+# 2026-10-20. Both rows read Sell 0.00$ with a blank discount cell. The gift
+# (Purchase 'free') IS 100% off; the superseded placeholder of an abandoned
+# checkout is not a sale at all — the PC bot emptied its cell on purpose, and
+# stamping it "100%" would make a dead row read as a package given away.
+gift = u_row("WR-GIFT1", date=OLD_DATE, status=usage_bot.EXPIRED)
+gift[UC["\u05de\u05db\u05d9\u05e8\u05d4 - Sell"]], gift[UC["\u05d4\u05e0\u05d7\u05d4 - Sale"]] = "0.00$", ""
+dead = u_row("WR-DEAD1", date=OLD_DATE,
+             status="\u05d4\u05d5\u05d7\u05dc\u05e4\u05d4 - \u05dc\u05d1\u05d3\u05d5\u05e7 \u05d7\u05d9\u05d5\u05d1")
+dead[UC["\u05de\u05db\u05d9\u05e8\u05d4 - Sell"]], dead[UC["\u05d4\u05e0\u05d7\u05d4 - Sale"]] = "0.00$", ""
+# One live package, because the discount pass runs inside a sweep that has
+# something to check (an empty sweep returns before it).
+live = u_row("WR-LIVE1", iccid="8972011", link="https://esim.dog/x", route="Cellcom",
+             source="esim.dog")
+ws3 = _WS([U_HEAD, gift, dead, live])
+with mock.patch.object(usage_bot, "sheet_client", lambda: ws3), \
+     mock.patch.object(usage_bot, "ensure_status_colours", lambda *a: None), \
+     mock.patch.object(usage_bot, "list_prices", lambda: {"2.49.10": 6.99}), \
+     mock.patch.object(usage_bot, "push_to_site", lambda items: 0), \
+     mock.patch.object(usage_bot, "alert", lambda su, bo: None), \
+     mock.patch.object(usage_bot, "fetch_usage", lambda ic: {}), \
+     mock.patch.object(usage_bot.stellar_usage, "fetch_usage", lambda urls: {}):
+    check("the run finished", usage_bot.main(), 0)
+w3 = {(c.row, c.col): c.value for c in ws3.written}
+check("the gift's discount is filled in", w3.get((2, UC["\u05d4\u05e0\u05d7\u05d4 - Sale"] + 1)),
+      "100% ($6.99 \u05d4\u05e0\u05d7\u05d4)")
+check("the superseded row is not given one", (3, UC["\u05d4\u05e0\u05d7\u05d4 - Sale"] + 1) in w3, False)
+
+
 # ── unmetered Stellar mail: once a day, never without a key ──
 _due, _TZ = usage_bot.unmetered_mail_due, usage_bot.TZ
 check("unmetered: 09:00 run mails", _due(3, True, datetime(2026, 9, 30, 9, 5, tzinfo=_TZ)), True)

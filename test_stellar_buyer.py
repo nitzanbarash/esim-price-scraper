@@ -246,11 +246,13 @@ sleeps: list[float] = []        # every gap this run waited, in order
 downloads: list[str] = []       # every FULL catalogue download (~35 calls each)
 
 
-def fake_send(to, order_id, order_url, delivery, esim=None, lang="", total=None):
+def fake_send(to, order_id, order_url, delivery, esim=None, lang="", total=None,
+              free=None, replaces=""):
     if mail_raises:
         raise mail_raises[0]
     mails.append({"to": to, "order_id": order_id, "order_url": order_url,
-                  "delivery": delivery, "esim": esim, "lang": lang, "total": total})
+                  "delivery": delivery, "esim": esim, "lang": lang, "total": total,
+                  "free": free, "replaces": replaces})
 
 
 NOW_TOP = datetime(2026, 9, 10, 4, 1, tzinfo=fb.TZ)     # alerts pass
@@ -1109,6 +1111,99 @@ check("the model is in its column", ws33.col(2, sb.H_DEVICE) == "iPhone 15 Pro",
 check("...and the row is still a delivered one", ws33.col(2, sb.H_STATUS) == sb.ST_ACTIVE)
 _, ws33b, _, _ = scenario([order()], StellarFake())
 check("an order that names no phone leaves the cell blank", ws33b.col(2, sb.H_DEVICE) == "")
+
+
+print("\n34. a GIFT is bought like any order and booked as a gift")
+# 2026-10-20: the owner can give a package away (new_order.py, price 0). The
+# site stores paid_usd 0 + free:true on an order whose source is 'manual'.
+# Zero revenue, the real cost, the word 'free' -- never 'manual', which reads
+# as money still to chase -- and never green, because nothing was banked.
+gift = dict(order(paid=0, source="manual"), free=True)
+site, ws34, bought, _ = scenario([gift], (f34 := StellarFake()))
+check("the gift is bought (no loss rule stands in the way)", bought == 1 and len(f34.creates) == 1)
+check("Purchase says 'free'", ws34.col(2, sb.H_PURCHASE) == fb.FREE_RAIL, ws34.col(2, sb.H_PURCHASE))
+check("Sell is 0.00$, the cost is the real one",
+      ws34.col(2, sb.H_SELL) == "0.00$" and ws34.col(2, sb.H_BUY) == "2.48$",
+      f"{ws34.col(2, sb.H_SELL)} / {ws34.col(2, sb.H_BUY)}")
+check("Sale says 100% off the list price", ws34.col(2, sb.H_SALE).startswith("100% ($6.99"),
+      ws34.col(2, sb.H_SALE))
+check("no green paint on a gift", ws34.formats == [], str(ws34.formats))
+check("the customer's mail is told it is a gift",
+      len(mails) == 1 and mails[0]["free"] is True and mails[0]["total"] == 0, str(mails))
+
+print("\n   a forged or half-made gift is an ordinary order")
+_, ws34b, _, _ = scenario([dict(order(paid=5, source="manual"), free=True)], StellarFake())
+check("free:true with a price -> the price, rail 'manual'",
+      ws34b.col(2, sb.H_SELL) == "5.00$" and ws34b.col(2, sb.H_PURCHASE) == "manual"
+      and mails[0]["free"] is False, f"{ws34b.col(2, sb.H_PURCHASE)} {mails}")
+_, ws34c, _, _ = scenario([order(paid=0, source="manual")], StellarFake())
+check("paid 0 without the marker is not called a gift",
+      ws34c.col(2, sb.H_PURCHASE) == "manual" and mails[0]["free"] is False)
+
+print("\n35. a REPLACEMENT carries the rail of the order it replaces")
+# new_order.py --replaces WR-OLD: the new order is 'manual' at the site, but
+# its customer paid once, with PayPal, for the old one. The row that holds the
+# eSIM is the row the owner reconciles PayPal against.
+old_row = receipt_row("WR-OLD001", fb.REPLACED_STATUS, stellar_id="", route="")
+old_row[HDR.index("\u05e8\u05db\u05d9\u05e9\u05d4 - Purchase")] = "paypal"
+rep = dict(order(oid="WR-NEW001", paid=6.99, source="manual"), replaces="WR-OLD001")
+_, ws35, _, _ = scenario([rep], StellarFake(), ws=Ws([old_row]))
+check("the new row says paypal", ws35.col(3, sb.H_PURCHASE) == "paypal", ws35.col(3, sb.H_PURCHASE))
+check("...and is green", ws35.formats == [("A3", {"backgroundColor": sb.PAID_BG})], str(ws35.formats))
+check("the mail says what it replaces", mails and mails[0]["replaces"] == "WR-OLD001", str(mails))
+check("the old row is left exactly as it was", ws35.rows[1] == old_row)
+
+print("\n   no old row: the site's record of the old order names the rail")
+
+
+class FactsSite(Site):
+    def get(self, url, params=None, headers=None, timeout=None):
+        if (params or {}).get("order_id") == "WR-OLD002":
+            self.gets.append(dict(params))
+            return Resp(200, {"order_id": "WR-OLD002", "source": "paypal", "has_session": False})
+        return super().get(url, params=params, headers=headers, timeout=timeout)
+
+
+rep2 = dict(order(oid="WR-NEW002", paid=6.99, source="manual"), replaces="WR-OLD002")
+fs = FactsSite([rep2])
+site, ws35b, _, _ = scenario([rep2], StellarFake(), site=fs)
+check("asked once, read-only, with probe=1",
+      [g for g in site.gets if g.get("order_id")] == [{"order_id": "WR-OLD002", "probe": "1"}],
+      str(site.gets))
+check("the new row says paypal", ws35b.col(2, sb.H_PURCHASE) == "paypal", ws35b.col(2, sb.H_PURCHASE))
+check("a replacement whose old order says nothing stays 'manual'",
+      sb.rail_for(dict(rep, replaces="WR-NONE01"), [HDR], HDR, site_source=lambda o: "") == "manual")
+check("an own real rail is never overwritten",
+      sb.rail_for(dict(rep, source="payme"), [HDR, old_row], HDR) == "payme")
+
+print("\n36. the site says the order was replaced meanwhile -> no customer mail")
+# A settle from HQ or the Orders screen does not wait for a claim, so an order
+# can be replaced while Stellar provisions it. The site parks the package as a
+# spare and answers late_delivery / customer_mail:false.
+
+
+class LateSite(Site):
+    def post(self, url, json=None, headers=None, timeout=None):
+        if json and json.get("status") == "fulfilled":
+            self.posts.append(dict(json))
+            return Resp(200, {"ok": True, "order_id": json["order_id"], "status": "settled",
+                              "late_delivery": True, "customer_mail": False})
+        return super().post(url, json=json, headers=headers, timeout=timeout)
+
+
+ls = LateSite([order()])
+site, ws36, _, _ = scenario([order()], StellarFake(), site=ls)
+check("the site was told (it keeps the package on the record)", len(site.reports("fulfilled")) == 1)
+check("NO customer mail", mails == [], str(mails))
+check("the ledger is not closed for it", not [p for p in site.posts if "email_sent" in p],
+      str(site.posts))
+check("the row keeps the credentials and the cost",
+      ws36.col(2, sb.H_ACT) == LPA and ws36.col(2, sb.H_BUY) == "2.48$")
+check("...but is no longer a sale",
+      ws36.col(2, sb.H_STATUS) == fb.REPLACED_CHECK_STATUS and ws36.col(2, sb.H_SELL) == "0.00$"
+      and ws36.col(2, sb.H_SALE) == "", f"{ws36.col(2, sb.H_STATUS)} {ws36.col(2, sb.H_SELL)}")
+check("no green paint", ws36.formats == [], str(ws36.formats))
+check("the owner is told once", len(alerts) == 1 and "spare" in alerts[0][0], str(alerts))
 
 
 # ── summary (last, so it gates the exit code) ────────────────────────────────

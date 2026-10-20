@@ -74,6 +74,22 @@ VENDOR_RULES: list[tuple[str, str, str]] = [
 NEEDS_REVIEW = "לבדיקה"
 CONFIRMED = "מאושר"
 
+# ------------------------------------------------- the receipts sheet's words
+# (2026-10-20.) New Hebrew is spelled in \u escapes: a paste once broke on
+# mojibake. These are the PC bot's own spellings (bot/sheets.py) — the books
+# read the cells that bot writes, so the words must be the same words.
+
+# The Status of a receipts row another purchase SUPERSEDED: the placeholder an
+# abandoned or uncertain checkout left behind, once its order was bought again
+# or replaced by a new one. The word alone ('replaced') means the old attempt
+# is proven unpaid (Buy 0 as well); with ' - check the charge' after it, it
+# may have been charged and its Buy stays. Read by prefix, so both — and a
+# note added by hand — count.
+REPLACED_STATUS = "\u05d4\u05d5\u05d7\u05dc\u05e4\u05d4"
+# The Purchase-column word for a package the owner gave away (decision D3).
+FREE_RAIL = "free"
+GIFT = "\u05de\u05ea\u05e0\u05d4"                     # "gift" — the books' label for it
+
 # ------------------------------------------------------------------- parsing
 
 _NUM = r"\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?"
@@ -291,6 +307,7 @@ class Sale:
     list_price: float | None
     provider: str = ""
     discount_note: str = ""      # the receipts sheet's own 'הנחה - Sale' cell
+    rail: str = ""               # the receipts Purchase cell as written ('paypal', 'free'...)
 
     @property
     def internal(self) -> bool:
@@ -302,6 +319,22 @@ class Sale:
         on a customer. They are reported as their own cost line instead.
         """
         return self.sell <= 0 and self.buy > 0
+
+    @property
+    def replaced(self) -> bool:
+        """A row another purchase superseded (REPLACED_STATUS). Never revenue:
+        the customer paid once, and the row that holds their eSIM — the
+        replacement — carries that money. Its Buy is a cost only while the
+        old attempt may have been charged."""
+        return self.status.startswith(REPLACED_STATUS)
+
+    @property
+    def gift(self) -> bool:
+        """A package the owner gave away: Purchase 'free' and nothing sold.
+        Still an internal cost — this only names it, so the books can say how
+        much of that line was gifts rather than tests. A 'free' row that
+        carries a price is a sale: a price typed later wins over the word."""
+        return self.rail.strip().lower() == FREE_RAIL and self.sell <= 0
 
     @property
     def profit(self) -> float:
@@ -353,6 +386,13 @@ def build_sale(row: dict, price_row: dict | None, model: FeeModel) -> Sale:
     buy, _ = parse_money(row.get("buy"))
     sell = sell or 0.0
     buy = buy or 0.0
+    status = (row.get("status") or "").strip()
+    if status.startswith(REPLACED_STATUS):
+        # A superseded row is never a sale, whatever its Sell cell still says.
+        # The PC bot zeroes it when it marks the row, but a row the owner marks
+        # by hand — the Status word typed, the price left — would otherwise
+        # count the customer's one payment twice: here and on the replacement.
+        sell = 0.0
 
     provider = (row.get("provider") or "").strip()
     fee, fee_source = processing_fee(
@@ -364,6 +404,12 @@ def build_sale(row: dict, price_row: dict | None, model: FeeModel) -> Sale:
 
     list_price, _ = parse_money((price_row or {}).get("list"))
 
+    # 'free' is no payment provider: FeeModel answers for it with the account
+    # default ("Bit"), which is the right FEE (nothing was processed) and the
+    # wrong NAME — the books' payment column would say a gift came in by Bit.
+    pay_name = (GIFT if provider.lower() == FREE_RAIL and sell <= 0
+                else model.provider(provider).name)
+
     return Sale(
         when=parse_sheet_datetime(row.get("date", "")),
         order_id=(row.get("order_id") or "").strip(),
@@ -371,14 +417,15 @@ def build_sale(row: dict, price_row: dict | None, model: FeeModel) -> Sale:
         region=(row.get("region") or "").strip(),
         gb=(row.get("gb") or "").strip(),
         customer=(row.get("customer") or "").strip(),
-        status=(row.get("status") or "").strip(),
+        status=status,
         sell=round(sell, 4),
         buy=round(buy, 4),
         fee=fee,
         fee_source=fee_source,
         list_price=list_price,
-        provider=model.provider(provider).name,
+        provider=pay_name,
         discount_note=(row.get("discount") or "").strip(),
+        rail=provider,
     )
 
 
@@ -570,10 +617,45 @@ MATCHED = "התאמה"
 CHARGE_NO_SALE = "חיוב ללא מכירה"
 SALE_NO_CHARGE = "מכירה ללא חיוב"
 
+# A supplier charge billed in SHEKELS (2026-10: esim.dog's Stripe checkout
+# opens in ₪ for a buyer in Israel, and a switch to $ that did not take left a
+# few purchases charged in ILS). The sheet's Buy is in dollars, so the charge
+# is brought to dollars at the day's rate first. Stripe's own rate carries its
+# conversion fee — measured on the payment page at 3.10-3.12 ₪/$, against a
+# market rate a few percent under — so the two are compared with this slack
+# instead of the two cents a dollar receipt gets.
+ILS_TOLERANCE = 0.04
+ILS_CHARGE = "\u05d7\u05d9\u05d5\u05d1 \u05d1\u05e9\u05e7\u05dc\u05d9\u05dd"     # "charged in shekels"
+NO_RATE = "\u05d0\u05d9\u05df \u05e9\u05e2\u05e8"                                  # "no rate"
+# What a superseded row's reconciliation means to the owner deciding about it.
+REPLACED_NO_CHARGE = ("\u05e9\u05d5\u05e8\u05d4 \u05e9\u05d4\u05d5\u05d7\u05dc\u05e4\u05d4: "
+                      "\u05dc\u05d0 \u05e0\u05de\u05e6\u05d0 \u05d7\u05d9\u05d5\u05d1 — "
+                      "\u05d0\u05e4\u05e9\u05e8 \u05dc\u05d0\u05e4\u05e1 \u05d0\u05ea "
+                      "\u05d4\u05e7\u05e0\u05d9\u05d9\u05d4")
+REPLACED_CHARGED = ("\u05e9\u05d5\u05e8\u05d4 \u05e9\u05d4\u05d5\u05d7\u05dc\u05e4\u05d4: "
+                    "\u05e0\u05de\u05e6\u05d0 \u05d7\u05d9\u05d5\u05d1 — "
+                    "\u05d7\u05d1\u05d9\u05dc\u05d4 \u05e8\u05d6\u05e8\u05d1\u05d9\u05ea "
+                    "\u05d0\u05d5 \u05d4\u05d7\u05d6\u05e8 \u05de\u05d4\u05e1\u05e4\u05e7")
+
+
+def _charge_usd(e: Expense, rate_for) -> tuple[float | None, float, str]:
+    """(dollars, slack, note) for one supplier charge. None dollars = cannot
+    be compared with a dollar Buy at all (a shekel charge and no rate)."""
+    if e.currency == "ILS":
+        rate = (rate_for(e.when) if rate_for else 0.0) or 0.0
+        if not rate:
+            return None, 0.0, f"{ILS_CHARGE} ₪{e.amount:.2f} · {NO_RATE}"
+        amount = round(e.amount / rate, 4)
+        return amount, amount * ILS_TOLERANCE, (
+            f"{ILS_CHARGE} ₪{e.amount:.2f} ≈ ${amount:.2f} "
+            f"(\u05e9\u05e2\u05e8 {rate:.4f})")
+    return e.amount, 0.0, ""
+
 
 def reconcile(cogs: list[Expense], sales: list[Sale],
               window_minutes: int = 25,
-              cents: float = 0.02) -> list[Match]:
+              cents: float = 0.02,
+              rate_for=None) -> list[Match]:
     """Pair every supplier charge with the sale it paid for.
 
     The card is the ground truth: each Stripe receipt is money that really
@@ -584,35 +666,58 @@ def reconcile(cogs: list[Expense], sales: list[Sale],
     Greedy nearest-in-time matching on equal amounts. Purchases run seconds
     apart in bursts and repeat the same price, so amount alone cannot pair
     them — the timestamp breaks the tie.
+
+    A shekel charge is brought to dollars first (`rate_for(date)`, the same
+    callable summarise takes; see ILS_TOLERANCE). Compared raw, ₪11.96 never
+    equalled a $3.86 Buy, and every such purchase showed up twice — once as a
+    charge with no sale and once as a sale with no charge.
+
+    A SUPERSEDED row (Sale.replaced) still has a Buy while its old attempt may
+    have been charged, and this is where that question is answered: it is
+    matched only when no live row fits the charge (the replacement usually
+    costs the same, minutes later), and its verdict says what to do — zero the
+    Buy when no charge exists, or treat the package as spare stock when one
+    does.
     """
     unclaimed = [s for s in sales if s.buy > 0]
     used: set[int] = set()
     out: list[Match] = []
 
     for e in sorted(cogs, key=lambda x: x.when or datetime.min.replace(tzinfo=IL)):
-        best_i, best_gap = None, None
+        amount, slack, note = _charge_usd(e, rate_for)
+        best_i, best_key = None, None
         for i, s in enumerate(unclaimed):
-            if i in used or not s.when or not e.when:
+            if amount is None or i in used or not s.when or not e.when:
                 continue
-            if abs(s.buy - e.amount) > cents:
+            if abs(s.buy - amount) > max(cents, slack):
                 continue
             gap = abs((s.when - e.when).total_seconds())
             if gap > window_minutes * 60:
                 continue
-            if best_gap is None or gap < best_gap:
-                best_i, best_gap = i, gap
+            key = (s.replaced, gap)
+            if best_key is None or key < best_key:
+                best_i, best_key = i, key
+        # The recon tab's column is dollars: a shekel charge is shown converted.
+        shown = round(amount, 2) if (note and amount is not None) else e.amount
         if best_i is None:
-            out.append(Match(e.key, "", CHARGE_NO_SALE, e.amount, e.when,
-                             "חיוב מהספק שאין מולו שורת מכירה"))
+            out.append(Match(e.key, "", CHARGE_NO_SALE, shown, e.when,
+                             "חיוב מהספק שאין מולו שורת מכירה"
+                             + (f" · {note}" if note else "")))
         else:
             used.add(best_i)
             s = unclaimed[best_i]
-            out.append(Match(e.key, s.order_id, MATCHED, e.amount, e.when,
-                             f"פער {int(best_gap)} שניות"))
+            parts = [f"פער {int(best_key[1])} שניות"]
+            if note:
+                parts.append(note)
+            if s.replaced:
+                parts.append(REPLACED_CHARGED)
+            out.append(Match(e.key, s.order_id, MATCHED, shown, e.when,
+                             " · ".join(parts)))
 
     for i, s in enumerate(unclaimed):
         if i not in used:
             out.append(Match("", s.order_id, SALE_NO_CHARGE, s.buy, s.when,
+                             REPLACED_NO_CHARGE if s.replaced else
                              "שורת מכירה עם מחיר קנייה שלא נמצא לו חיוב"))
     return out
 
@@ -642,6 +747,11 @@ def summarise(all_sales: list[Sale], expenses: list[Expense],
     sales = [s for s in priced if not s.internal]
     internal = [s for s in priced if s.internal]
     internal_cost = round(sum(s.buy + s.fee for s in internal), 2)
+    # Two named parts of that one cost line (owner decision D4: inside it,
+    # not beside it). Gifts the owner chose to give; superseded attempts that
+    # may have been charged — reconcile says, per row, whether they were.
+    gifts = [s for s in internal if s.gift]
+    replaced = [s for s in internal if s.replaced]
 
     revenue = round(sum(s.sell for s in sales), 2)
     cogs = round(sum(s.buy for s in sales), 2)
@@ -716,6 +826,10 @@ def summarise(all_sales: list[Sale], expenses: list[Expense],
         unreviewed=unreviewed,
         internal_orders=len(internal),
         internal_cost=internal_cost,
+        gift_orders=len(gifts),
+        gift_cost=round(sum(s.buy + s.fee for s in gifts), 2),
+        replaced_orders=len(replaced),
+        replaced_cost=round(sum(s.buy + s.fee for s in replaced), 2),
         discounted_orders=len(discounted),
         discounted_pct=round(len(discounted) / len(sales) * 100, 1) if sales else 0.0,
         discount_given=round(sum(s.discount_usd for s in discounted), 2),

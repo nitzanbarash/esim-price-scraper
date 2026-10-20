@@ -123,13 +123,39 @@ def _redact(s: str) -> str:
 
 def order_payload(order_url: str) -> dict:
     """Decode the ?order= base64 JSON of a waverole.com order link
-    ({id, sku, ts, t}) — `t` is the total the customer actually paid."""
+    ({id, sku, ts, t}) — `t` is the total the customer actually paid, and
+    `fr: 1` (from 2026-10-20) marks a package the owner gave away."""
     try:
         b64 = order_url.split("order=", 1)[1].split("&", 1)[0]
         b64 += "=" * (-len(b64) % 4)
         return json.loads(base64.urlsafe_b64decode(b64))
     except Exception:
         return {}
+
+
+def is_free(order: dict) -> bool:
+    """A package the OWNER gave away (2026-10-20) — the same three facts the
+    PC bot demands (bot/fallback.is_free), so the two machines can never
+    disagree about whether an order was a gift:
+
+      * the site stored `free: true` — only its bearer-authenticated create
+        action can write it, never a till, so no buyer can mint one;
+      * paid_usd is exactly zero — `free` arriving WITH a price is a
+        contradiction about money, and that is read as the paid order;
+      * the order is the owner's own ('manual', or no source at all — the
+        awaiting_email rows do not carry one).
+
+    A paid_usd of 0 WITHOUT the marker keeps meaning what it always meant:
+    nothing was recorded. It is not a gift and is never shown as "Free"."""
+    if order.get("free") is not True:
+        return False
+    try:
+        paid = float(order.get("paid_usd"))
+    except (TypeError, ValueError):
+        return False
+    if abs(paid) > 1e-9:
+        return False
+    return str(order.get("source") or "").strip().lower() in ("manual", "")
 
 
 # ── alerts ───────────────────────────────────────────────────────────────────
@@ -577,6 +603,84 @@ def _fetch_one_esim(success_url: str) -> dict:
 
 # ── receipts sheet ───────────────────────────────────────────────────────────
 
+# What the PC bot (bot/sheets.py, 2026-10-20) writes on a receipts row that
+# another purchase SUPERSEDED: the placeholder an uncertain or abandoned
+# checkout left behind, once the order was bought again (same number) or
+# replaced (a new one). A row is never deleted — it is the audit trail, and
+# the duplicate guard reads the order number off it — so it is marked:
+#   Status REPLACED_STATUS ('replaced')         Buy 0 too: PROVEN unpaid;
+#   Status REPLACED_CHECK_STATUS ('replaced -   Buy kept: nobody can rule
+#          check the charge')                  out the charge.
+# Spelled in \u escapes on purpose (a paste once broke on mojibake), and
+# compared by PREFIX so both spellings — and any note the owner appends by
+# hand — read the same.
+REPLACED_STATUS = "\u05d4\u05d5\u05d7\u05dc\u05e4\u05d4"
+REPLACED_CHECK_STATUS = REPLACED_STATUS + " - \u05dc\u05d1\u05d3\u05d5\u05e7 \u05d7\u05d9\u05d5\u05d1"
+# ...and the same row's supplier link, neutralised: the session id stays
+# readable for the owner checking the charge, but no `session_id=` reader
+# matches it any more, so a late delivery mail cannot be written onto the dead
+# row of an order the customer already has an eSIM for.
+SUPERSEDED_SESSION = "superseded-session:"
+SUPERSEDED_RE = re.compile(re.escape(SUPERSEDED_SESSION) + r"([A-Za-z0-9_\-]+)")
+# The Purchase-column word for a package the owner gave away (owner decision
+# D3). Not a paid rail: green means money banked, and a gift banked nothing.
+FREE_RAIL = "free"
+H_STATUS, H_BUY, H_SELL, H_SALE = ("\u05e1\u05d8\u05d8\u05d5\u05e1 - Status", "\u05e7\u05e0\u05d9\u05d9\u05d4 - Buy",
+                                   "\u05de\u05db\u05d9\u05e8\u05d4 - Sell", "\u05d4\u05e0\u05d7\u05d4 - Sale")
+
+
+def is_replaced_status(status) -> bool:
+    """A receipts Status that says this row was superseded by another one."""
+    return str(status or "").strip().startswith(REPLACED_STATUS)
+
+
+def _is_zero_money(text) -> bool:
+    """'0$' / '0.00$' / '$0' -> True. A BLANK cell is not zero: blank is
+    "nobody wrote a price", which is no reason to call a row dead."""
+    digits = re.sub(r"[^\d.]", "", str(text or ""))
+    try:
+        return bool(digits) and float(digits) == 0.0
+    except ValueError:
+        return False
+
+
+def _session_ids(text) -> set[str]:
+    return {m.group(1) for m in SESSION_ID_RE.finditer(str(text or ""))}
+
+
+def _names_other_session(cells: list[str], wanted: set[str]) -> bool:
+    """True when the row's own supplier link identifies a DIFFERENT purchase
+    from the one this delivery mail is about.
+
+    A row that names its own session is waiting for that session's mail, and
+    the exact pass in find_pending_row already gave it every chance to be
+    this one. Letting the size-and-time guess hand it a different package is
+    how a late delivery of an abandoned checkout lands on the row of the
+    purchase that replaced it (review 2026-10-20: a same-number re-buy, then
+    the first, uncertain payment approved after all).
+
+    Conservative on purpose — only a clear contradiction counts:
+      * no session on the row (older rows hold the plan's shop page) -> no;
+      * one id a prefix of the other (a mail-wrapped, truncated link) -> no;
+      * different id KINDS (cs_… against pi_…, the two formats seen in real
+        mail) -> cannot tell, so no."""
+    if not wanted:
+        return False
+    have = set()
+    for c in cells:
+        have |= _session_ids(c)
+    if not have:
+        return False
+
+    def kind(s):
+        return s.split("_", 1)[0]
+    for r in have:
+        for w in wanted:
+            if kind(r) != kind(w) or r.startswith(w) or w.startswith(r):
+                return False
+    return True
+
+
 class AmbiguousMatch(Exception):
     pass
 
@@ -639,9 +743,27 @@ def find_pending_row(ws, delivery: dict) -> dict | None:
     i_order, i_act = idx("מס׳ הזמנה"), idx("Activation Code")
     i_iccid, i_link = idx("מס סידורי -ICCID"), idx("Link - esim.dog")
     i_mail, i_wave = idx("מייל - Mail"), idx("Link - waverole")
+    i_qr = idx("QR")
+    # Optional: a sheet without them simply cannot mark a row dead, and every
+    # row stays a candidate exactly as before 2026-10-20.
+    i_status, i_buy, i_sell = idx(H_STATUS), idx(H_BUY), idx(H_SELL)
 
     email_time = delivery["received_at"].astimezone(TZ)
     window = timedelta(hours=MATCH_WINDOW_HOURS)
+
+    def dead(get) -> bool:
+        """A row no delivery may ever be written onto: one the PC bot (or the
+        owner) marked as superseded, or a placeholder zeroed on both sides.
+        Without this, the receipts row an abandoned checkout left behind —
+        order number, no eSIM, so 'pending' to the test below — took the next
+        delivery of the same size within twelve hours, and the customer's eSIM
+        was written onto the dead order instead of the one that replaced it
+        (WR-4YWATY / WR-T3QD3Q, receipts rows 188-189, 2026-10-11)."""
+        if is_replaced_status(get(i_status)):
+            return True
+        if SUPERSEDED_SESSION in get(i_link) or SUPERSEDED_SESSION in get(i_qr):
+            return True
+        return _is_zero_money(get(i_buy)) and _is_zero_money(get(i_sell))
 
     # ── the certain answer first: the same purchase session ──
     # The purchase bot writes the order's supplier page into the row, and the
@@ -649,18 +771,22 @@ def find_pending_row(ws, delivery: dict) -> dict | None:
     # is an identity, not a guess. Everything below is the fallback for rows
     # that predate it (matching on size, destination and a time window, which
     # can only ever be circumstantial and needs a human when two orders look
-    # alike).
-    wanted = {m.group(1) for u in (delivery.get("success_urls")
-                                   or [delivery.get("success_url", "")])
-              if (m := SESSION_ID_RE.search(str(u or "")))}
+    # alike). The PC bot's uncertain-payment placeholder carries its session
+    # with a '#payment-uncertain' fragment; the id stops at the '#', so that
+    # row is matched here exactly too, and complete_row rewrites the cell with
+    # the clean link.
+    wanted = set()
+    for u in (delivery.get("success_urls") or [delivery.get("success_url", "")]):
+        wanted |= _session_ids(u)
     if wanted:
         for n, r in enumerate(rows[1:], start=2):
             get = lambda i: r[i].strip() if i is not None and len(r) > i else ""
             if not get(i_order) or get(i_act) or get(i_iccid):
                 continue                                # not pending
-            for col in (i_link, idx("QR")):             # older rows kept it in QR
-                m = SESSION_ID_RE.search(get(col))
-                if m and m.group(1) in wanted:
+            if dead(get):
+                continue
+            for col in (i_link, i_qr):                  # older rows kept it in QR
+                if _session_ids(get(col)) & wanted:
                     log.info(f"row {n} matched by purchase session (exact)")
                     return {"row": n, "time": _row_time(get(i_date)),
                             "order_id": get(i_order), "customer_email": get(i_mail),
@@ -671,6 +797,10 @@ def find_pending_row(ws, delivery: dict) -> dict | None:
         get = lambda i: r[i].strip() if i is not None and len(r) > i else ""
         if not get(i_order) or get(i_act) or get(i_iccid):
             continue                                    # not pending
+        if dead(get):
+            continue
+        if _names_other_session([get(i_link), get(i_qr)], wanted):
+            continue                                    # waiting for its OWN mail
         gb = re.sub(r"[^\d.]", "", get(i_gb))
         if delivery["gb"] is not None and gb and float(gb) != delivery["gb"]:
             continue
@@ -696,11 +826,20 @@ def find_pending_row(ws, delivery: dict) -> dict | None:
 
 def already_completed(ws, success_url) -> bool:
     """True if some row already holds this delivery's supplier page AND its
-    activation code — i.e. the purchase bot finished the order itself."""
+    activation code — i.e. the purchase bot finished the order itself.
+
+    Compared by session id as well as by the whole link: the PC bot's
+    placeholder link carries a '#payment-uncertain' fragment (2026-10-20), and
+    a row it later completed itself with that link still in place would
+    otherwise read as "no row has this delivery" and alert the owner about an
+    order that is fine."""
     wanted = {success_url} if isinstance(success_url, str) else set(success_url or [])
     wanted.discard("")
     if not wanted:
         return False
+    wanted_ids = set()
+    for u in wanted:
+        wanted_ids |= _session_ids(u)
     rows = ws.get_all_values()
     hdr = [h.strip() for h in rows[0]]
     if "Activation Code" not in hdr:
@@ -714,9 +853,75 @@ def already_completed(ws, success_url) -> bool:
         if not act:
             continue
         for i in link_cols:
-            if (r[i].strip() if len(r) > i else "") in wanted:
+            cell = r[i].strip() if len(r) > i else ""
+            if cell in wanted or (wanted_ids and _session_ids(cell) & wanted_ids):
                 return True
     return False
+
+
+def find_replaced_row(ws, delivery: dict) -> dict | None:
+    """The superseded receipts row this delivery belongs to, or None.
+
+    A delivery for a row marked replaced is a purchase that went through after
+    the order had already been bought again or replaced — the checkout closed
+    mid-payment, a 3DS approval that landed late. That package is real and
+    paid for, and it belongs to nobody: the customer already has the eSIM of
+    the purchase that replaced it, and mailing them a second working one is
+    the 2026-09-08 mistake. find_pending_row never offers this row; this is
+    how the mail is recognised instead of waiting two hours to be called an
+    orphan. The row's session survives as `superseded-session:<id>` (or
+    intact, when the owner marked the Status by hand)."""
+    wanted = set()
+    for u in (delivery.get("success_urls") or [delivery.get("success_url", "")]):
+        wanted |= _session_ids(u)
+    if not wanted:
+        return None
+    rows = ws.get_all_values()
+    hdr = [h.strip() for h in rows[0]]
+    idx = lambda name: hdr.index(name) if name in hdr else None
+    i_order, i_status = idx("\u05de\u05e1\u05f3 \u05d4\u05d6\u05de\u05e0\u05d4"), idx(H_STATUS)
+    cols = [i for i in (idx("Link - esim.dog"), idx("QR")) if i is not None]
+    for n, r in enumerate(rows[1:], start=2):
+        get = lambda i: r[i].strip() if i is not None and len(r) > i else ""
+        replaced = is_replaced_status(get(i_status))
+        links = [get(i) for i in cols]
+        if not (replaced or any(SUPERSEDED_SESSION in c for c in links)):
+            continue
+        ids = set()
+        for c in links:
+            ids |= {m.group(1) for m in SUPERSEDED_RE.finditer(c)}
+            if replaced:
+                ids |= _session_ids(c)
+        if ids & wanted:
+            return {"row": n, "order_id": get(i_order), "status": get(i_status)}
+    return None
+
+
+def mark_row_superseded(ws, row_number: int) -> list[tuple[str, str, str]]:
+    """Mark a row the cloud bot just completed as NOT a sale, because the site
+    said its order had already been replaced (or already holds another eSIM):
+    Status REPLACED_CHECK_STATUS ('replaced - check the charge'), Sell 0, no
+    discount — the PC bot's own marking (bot/sheets._supersede_row with
+    zero_buy=False). Buy is KEPT: the package was delivered, so the charge is
+    real. Without this the row read as a second sale of an order the customer
+    paid for once.
+
+    Returns [(header, before, after)] for the owner's alert, so every change
+    can be undone by hand. Best effort per the caller."""
+    hdr = [h.strip() for h in ws.row_values(1)]
+    before = ws.row_values(row_number)
+    target = {H_STATUS: REPLACED_CHECK_STATUS, H_SELL: "0.00$", H_SALE: ""}
+    cells, changes = [], []
+    for name, val in target.items():
+        if name not in hdr:
+            continue
+        i = hdr.index(name)
+        was = before[i] if i < len(before) else ""
+        cells.append(gspread.Cell(row_number, i + 1, val))
+        changes.append((name, was, val))
+    if cells:
+        ws.update_cells(cells, value_input_option="USER_ENTERED")
+    return changes
 
 
 def complete_row(ws, row_number: int, delivery: dict, details: dict):
@@ -875,9 +1080,11 @@ def check_stale_pending():
         suppliers.add(sup)
         age = (f"{age_min:.0f} min" if age_min < 90
                else f"{age_min / 60:.1f} hours")
+        # A gift says so: "$0" here read like an order whose price was lost.
+        paid = "FREE (gift)" if is_free(o) else f"${o.get('paid_usd', '?')}"
         lines.append(
             f"  {o.get('order_id', '?')}  -  {age} ago  -  "
-            f"${o.get('paid_usd', '?')}  -  SKU {o.get('sku', '?')}  -  buys at {sup}"
+            f"{paid}  -  SKU {o.get('sku', '?')}  -  buys at {sup}"
         )
     n = len(due)
     # Each buyer has its own fix. Sending the owner to the PC for a Stellar
@@ -1028,9 +1235,12 @@ def deliver_pending_emails(ws):
                                 f"not close — still not resending")
                 continue
             try:
+                # free / replaces ride on the awaiting row from 2026-10-20;
+                # an older site sends neither and the mail is as before.
                 send_customer_email(to, oid, str(o.get("order_url", "")),
                                     _delivery_from_record(o), esim=o.get("esim") or {},
-                                    lang=str(o.get("lang", "")), total=o.get("paid_usd"))
+                                    lang=str(o.get("lang", "")), total=o.get("paid_usd"),
+                                    free=is_free(o), replaces=str(o.get("replaces") or ""))
                 report_email_sent(oid, True, address=to)
                 log.info(f"order {oid}: eSIM email delivered (ledger closed)")
             except Exception as e:
@@ -1060,7 +1270,54 @@ def report_fulfilled(order_id: str, delivery: dict, details: dict):
     r = requests.post(ORDERS_URL, json=payload, timeout=20,
                       headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
     r.raise_for_status()
-    log.info(f"order {order_id}: site fulfilled")
+    try:
+        answer = r.json()
+    except Exception:
+        answer = {}
+    answer = answer if isinstance(answer, dict) else {}
+    if site_withholds_mail(answer):
+        log.warning(f"order {order_id}: the site kept this package as a spare "
+                    f"(late_delivery) - the customer is NOT to be mailed")
+    else:
+        log.info(f"order {order_id}: site fulfilled")
+    return answer
+
+
+def site_withholds_mail(answer: dict) -> bool:
+    """The site's answer to a 'fulfilled' report says this package must NOT
+    reach the customer (api/orders.js, 2026-10-20):
+
+      * the order was settled and REPLACED by another one, which carries the
+        customer's eSIM — the package is parked on the record as late_esim;
+      * the order already holds a DIFFERENT eSIM, which the customer may have
+        installed — the second package is parked the same way, and the first
+        one's mail stays owed on the delivery ledger.
+
+    Either way the mail must not go, and report_email_sent must not be called:
+    in the second case it would close the ledger entry of the eSIM the
+    customer actually needs. An older site answers neither key, and that
+    reads as "go ahead", exactly as before."""
+    return bool(answer.get("late_delivery")) or answer.get("customer_mail") is False
+
+
+def order_facts(order_id: str) -> dict:
+    """The site's owner-only view of one order ({} when it cannot be read):
+    `free`, `replaces`, `replaced_by` among the rest. probe=1 so the read is
+    never mistaken for a buyer's poll.
+
+    Asked only where the delivery mail would otherwise go out without them —
+    process() completes a row from the supplier's mail, and the receipts row
+    does not say whether its order replaced another. A failed read costs one
+    line of the mail, never the mail."""
+    try:
+        r = requests.get(ORDERS_URL, params={"order_id": order_id, "probe": "1"}, timeout=20,
+                         headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+        r.raise_for_status()
+        out = r.json()
+        return out if isinstance(out, dict) else {}
+    except Exception as e:
+        log.warning(f"order {order_id}: could not read the order's facts: {_redact(str(e))}")
+        return {}
 
 
 # ── customer "ready" email (from waverolesupply@gmail.com) ───────────────────
@@ -1068,8 +1325,12 @@ SUPPORT_EMAIL = "waverolesupport@gmail.com"
 NAVY, BEIGE, BROWN, ACCENT = "#1B365D", "#f7ede2", "#7a5c40", "#C27A4E"
 
 
+REPLACES_ID_RE = re.compile(r"^WR-[A-Z0-9]{4,12}$")
+
+
 def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
-                        esim: dict | None = None, lang: str = "", total=None):
+                        esim: dict | None = None, lang: str = "", total=None,
+                        free=None, replaces: str = ""):
     """The buyer's 'your eSIM is ready' email. Sent from the real Waverole
     Gmail (waverolesupply) — the site's Resend sender (onboarding@resend.dev)
     looked untrustworthy, so this bot owns the customer email now.
@@ -1080,7 +1341,18 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
     eSIM by mistake and nothing could take it back; the order page can be
     blocked in seconds. The customer installs from the order page, where the
     QR is drawn on the device. `esim` is accepted for the callers' sake and
-    not read."""
+    not read.
+
+    free (2026-10-20): a package the owner GAVE away. The 'Total paid' row
+    says "Free" — the same word the order page uses — instead of "$0.00",
+    which reads like a failed charge. None means "not told": the order link's
+    `fr: 1` decides. A free flag next to a real price is a contradiction about
+    money and the price wins (same rule as is_free).
+
+    replaces: the order number this one REPLACES (new_order.py --replaces).
+    The customer's first order page now forwards here, and without a word the
+    mail reads like a second purchase — so one line says it replaces their
+    order and that there is nothing more to pay."""
     if not to:
         raise ValueError("missing customer email address")
     # With nothing but the link in the mail, a mail without the link would say
@@ -1097,6 +1369,15 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
         total = payload.get("t")                 # what the customer actually paid
     heb = (lang or payload.get("l", "")) == "he" # site language at purchase time
     gb, days = delivery.get("gb"), delivery.get("days")
+    if free is None:
+        free = payload.get("fr") == 1
+    try:
+        priced = total is not None and float(total) > 1e-9
+    except (TypeError, ValueError):
+        priced = False
+    gift = free is True and not priced
+    old = str(replaces or "").strip().upper()
+    old = old if REPLACES_ID_RE.match(old) and old != str(order_id).strip().upper() else ""
     L = {
         "subject": (f"ה-eSIM שלך מוכן לשימוש! \N{AIRPLANE} הזמנה {order_id}" if heb
                     else f"Your eSIM is ready to use! \N{AIRPLANE} Order {order_id}"),
@@ -1112,15 +1393,27 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
         "fallback": ("הכפתור לא עובד? העתיקו את הקישור הזה לדפדפן:" if heb
                      else "Button not working? Copy this link into your browser:"),
         "dir": "rtl" if heb else "ltr",
+        # "Free" (Hebrew: chinam) — the order page's own word (index.html dictionary).
+        "free": "\u05d7\u05d9\u05e0\u05dd" if heb else "Free",
+        # "This order replaces your order {old} — nothing more to pay."
+        "replaces": (("\u05d4\u05d4\u05d6\u05de\u05e0\u05d4 \u05d4\u05d6\u05d5 "
+                      "\u05de\u05d7\u05dc\u05d9\u05e4\u05d4 \u05d0\u05ea "
+                      "\u05d4\u05d6\u05de\u05e0\u05d4 {old} \u05e9\u05dc\u05da — "
+                      "\u05d0\u05d9\u05df \u05e6\u05d5\u05e8\u05da \u05dc\u05e9\u05dc\u05dd "
+                      "\u05e9\u05d5\u05d1.") if heb
+                     else "This order replaces your order {old} — nothing more to pay."),
     }
+    if gift:
+        paid_text = L["free"]
+    else:
+        paid_text = f"${total:.2f}" if isinstance(total, (int, float)) else ""
     rows = [("מספר הזמנה" if heb else "Order number", order_id),
             ("יעד" if heb else "Destination", delivery.get("location", "")),
             ("נפח גלישה" if heb else "Data", f"{gb:g} GB" if gb else ""),
             ("תוקף" if heb else "Validity",
              (f"{days} ימים" if heb else f"{days} days") if days else ""),
             ("רשת" if heb else "Network", delivery.get("network", "")),
-            ("סה״כ שולם" if heb else "Total paid",
-             f"${total:.2f}" if isinstance(total, (int, float)) else "")]
+            ("סה״כ שולם" if heb else "Total paid", paid_text)]
     detail_rows = "".join(
         f'<tr><td style="padding:7px 14px;color:{BROWN};font-size:13px">{k}</td>'
         f'<td style="padding:7px 14px;color:{NAVY};font-size:13px;font-weight:700;'
@@ -1134,11 +1427,17 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
     footer = (f"""<hr style="border:none;border-top:1px solid #e5d5c0;margin:0 0 12px">
   <p style="font-size:11px;color:#9a7a60;text-align:center;word-break:break-all;margin:0">{L['fallback']}<br><span dir="ltr">{order_url}</span></p>"""
               if order_url else "")
+    # The old number sits in its own left-to-right span: inside a Hebrew
+    # sentence a bare "WR-ABC123" is reordered by the bidi algorithm.
+    replaces_line = (f"""<p style="text-align:center;color:{NAVY};font-size:13px;margin:0 0 20px">"""
+                     + L["replaces"].format(old=f'<strong dir="ltr">{old}</strong>') + "</p>"
+                     if old else "")
 
     html = f"""<div dir="{L['dir']}" style="font-family:'Nunito',Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px;background:{BEIGE};border-radius:16px">
   <h1 style="font-size:22px;color:{NAVY};text-align:center;margin:0 0 6px">{L['title']}</h1>
   <p style="text-align:center;color:{NAVY};font-size:16px;font-weight:700;margin:0 0 4px">{L['ready']}</p>
   <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 20px">{L['order']} <strong style="color:{NAVY}">{order_id}</strong></p>
+  {replaces_line}
   <table style="width:100%;background:#fff;border-radius:12px;border-collapse:collapse;margin:0 0 20px">{detail_rows}</table>
   {cta}
   <p style="text-align:center;color:{BROWN};font-size:13px;margin:0 0 6px">{L['guide']}</p>
@@ -1164,6 +1463,31 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
 def process(inbox: Inbox, ws, d: dict):
     uid = d["uid"]
     log.info(f"email uid={uid}: {d['gb']}GB/{d['days']}d {d['location']}")
+
+    # An identity before any guess: a delivery whose session belongs to a row
+    # marked REPLACED is a package nobody is waiting for (find_replaced_row).
+    # It is told to the owner at once and never written anywhere a customer
+    # could be served from — not onto the dead row, not onto a look-alike
+    # pending row by the size-and-time fallback below, and not to the site,
+    # which would mail it if the order had not been linked there as well.
+    try:
+        late = find_replaced_row(ws, d)
+    except Exception as e:                       # the guess below still runs
+        log.warning(f"email uid={uid}: replaced-row check failed: {_redact(str(e))}")
+        late = None
+    if late:
+        alert(f"Order {late['order_id'] or '?'}: a package arrived for a REPLACED order",
+              f"Receipts row {late['row']} ({late['order_id'] or 'no order number'}) is marked "
+              f"'{late['status'] or 'superseded'}', and this delivery belongs to its purchase:\n"
+              f"{d['gb']}GB / {d['days']}d / {d['location']}\n{d['success_url']}\n\n"
+              "The payment went through after all. The customer already has the eSIM of "
+              "the order that replaced it, so NOTHING was sent to them and nothing was "
+              "written to the sheet or the site.\n\n"
+              "The package is real and paid for: put it on the spare-stock shelf, or ask "
+              f"the supplier for a refund. If row {late['row']} says Buy 0, the charge was "
+              "booked as not made - put the cost back.")
+        inbox.flag(uid)
+        return
 
     try:
         match = find_pending_row(ws, d)
@@ -1219,7 +1543,7 @@ def process(inbox: Inbox, ws, d: dict):
 
     complete_row(ws, match["row"], d, details)
     try:
-        report_fulfilled(order_id, d, details)
+        answer = report_fulfilled(order_id, d, details)
     except Exception as e:
         # No customer email: it sends the buyer to their order page, which has
         # no eSIM on it until the site accepts this POST. Flagged anyway — the
@@ -1231,14 +1555,40 @@ def process(inbox: Inbox, ws, d: dict):
               f"{match['row']} of the receipts sheet has every detail.")
         inbox.flag(uid)
         return
+    if site_withholds_mail(answer):
+        # The site has already replaced this order (or it holds another eSIM),
+        # so the package just written to row N is a second one for a customer
+        # who paid once. The site parked it as a spare and told the owner; this
+        # side owes two things: no customer mail, and a row that stops reading
+        # as a second sale. The row keeps the eSIM — it is the spare's record.
+        try:
+            changes = mark_row_superseded(ws, match["row"])
+            done = "; ".join(f"{h}: '{b}' -> '{a}'" for h, b, a in changes) or "nothing"
+        except Exception as e:
+            done = f"NOT marked ({_redact(str(e))}) - mark it by hand"
+        alert(f"Order {order_id}: package kept as a spare - customer NOT mailed",
+              f"The site answered that order {order_id} was already replaced, or "
+              f"already holds a different eSIM, so this delivery was not shown or "
+              f"mailed to the customer.\n\nReceipts row {match['row']} holds the "
+              f"package. Changed on that row: {done}.\n\nDecide: spare-stock "
+              f"shelf, or a supplier refund.")
+        inbox.flag(uid)
+        log.info(f"order {order_id}: late package parked (row {match['row']})")
+        return
     # The buyer's email is now tracked in the site's delivery ledger (opened by
     # report_fulfilled above). Send it right away for speed, but a failure here
     # is no longer the end of the road: the entry stays open, deliver_pending_
     # emails retries it every run, and the site escalates on its own. No alert
     # from here — that would fire on every transient SMTP hiccup.
     to = match.get("customer_email", "")
+    # The receipts row cannot say whether this order is a gift or replaces an
+    # earlier one; the site's record can (one read, and only on this path —
+    # the sweep's rows already carry both).
+    facts = order_facts(order_id)
     try:
-        send_customer_email(to, order_id, match.get("order_url", ""), d, esim=details)
+        send_customer_email(to, order_id, match.get("order_url", ""), d, esim=details,
+                            free=is_free(facts) if facts else None,
+                            replaces=str(facts.get("replaces") or ""))
         report_email_sent(order_id, True, address=to)
     except Exception as e:
         report_email_sent(order_id, False, str(e))

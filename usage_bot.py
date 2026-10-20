@@ -60,7 +60,7 @@ import requests
 import stellar_usage
 from fulfillment_bot import (
     ORDERS_URL, RECEIPTS_SHEET_ID, TZ, alert, env, fetch_esim_details,
-    fetch_usage, sheet_client, _redact, _row_time,
+    fetch_usage, is_replaced_status, sheet_client, _redact, _row_time,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -481,14 +481,23 @@ def refund_marks(rows: list[list[str]], idx: dict, refunds: list[dict]) -> list[
     that already says 'refund' — by hand or by an earlier run — is left alone."""
     if COL_ORDER not in idx:
         return []
-    by_order = {}
+    i_st = idx.get(COL_STATUS)
+    by_order = {}                              # order -> (row, superseded?)
     for n, r in enumerate(rows[1:], start=2):
         oid = r[idx[COL_ORDER]].strip().upper() if len(r) > idx[COL_ORDER] else ""
-        if oid:
-            by_order.setdefault(oid, n)        # the first row of an order is its sale
+        if not oid:
+            continue
+        # The first row of an order is its sale -- unless that row was
+        # SUPERSEDED (2026-10-20: an abandoned checkout's placeholder, marked
+        # 'replaced' once the order was bought again under the same number). The
+        # sale is then the later row that holds the eSIM, and a red 'refund'
+        # on the dead row's 0.00$ would leave the real sale reading as kept.
+        dead = i_st is not None and is_replaced_status(r[i_st] if len(r) > i_st else "")
+        if oid not in by_order or (by_order[oid][1] and not dead):
+            by_order[oid] = (n, dead)
     out = []
     for f in refunds:
-        n = by_order.get(str(f.get("order_id") or "").strip().upper())
+        n = by_order.get(str(f.get("order_id") or "").strip().upper(), (0, False))[0]
         if not n:
             continue
         row = rows[n - 1]
@@ -823,6 +832,12 @@ def main() -> int:
         n_sale = 0
         for n, r in enumerate(rows[1:], start=2):
             if not cell(r, COL_ORDER):
+                continue
+            # A SUPERSEDED row (2026-10-20) has Sell 0.00$ and its discount
+            # cell deliberately emptied by the PC bot: it is not a sale, so it
+            # carries no discount. Read as "0 = a giveaway" it would be stamped
+            # "100% off", and a dead placeholder would look like a gift.
+            if is_replaced_status(cell(r, COL_STATUS)):
                 continue
             want = discount_text(cell(r, COL_SKU), cell(r, COL_SELL), prices)
             # BLANK cells only. The owner keeps this column by hand, and the

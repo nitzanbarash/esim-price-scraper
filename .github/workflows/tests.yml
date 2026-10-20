@@ -77,6 +77,11 @@ jobs:
       - name: Delivery dedup
         run: python test_delivery_dedup.py
 
+      # What the customer's eSIM mail says about money: "Free" for a gift,
+      # "replaces your order WR-…" for a replacement, the price otherwise.
+      - name: Customer email
+        run: python test_customer_email.py
+
       # Which VALIDITY each size is sold at. The owner's day rules (2026-09-10)
       # are the difference between 30 days and 25 for a few agorot, and between
       # a Stellar 60-day plan taken for free and one bought by mistake — the

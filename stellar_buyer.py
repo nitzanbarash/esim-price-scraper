@@ -262,7 +262,12 @@ def claim(order_id: str) -> bool:
     return bool(r.json().get("claimed"))
 
 
-def report_fulfilled(order_id: str, esim: dict):
+def report_fulfilled(order_id: str, esim: dict) -> dict:
+    """The site's answer ({} when it is not JSON). It matters since 2026-10-20:
+    an order the owner settled and REPLACED while this purchase was running
+    (or one that already holds another eSIM) answers late_delivery /
+    customer_mail:false -- the package is parked as a spare and the customer
+    must not be mailed (fb.site_withholds_mail)."""
     # days_bought: the validity actually delivered, stated outright so the
     # site can say "upgraded from 7 to 30 days" on the order page when the
     # listing bought ran longer than the one sold (site reads it off the plan
@@ -273,6 +278,11 @@ def report_fulfilled(order_id: str, esim: dict):
         body["days_bought"] = int(m.group(1))
     r = requests.post(fb.ORDERS_URL, json=body, headers=_site_headers(), timeout=20)
     r.raise_for_status()
+    try:
+        answer = r.json()
+    except Exception:                                       # noqa: BLE001
+        answer = {}
+    return answer if isinstance(answer, dict) else {}
 
 
 def report_failed(order_id: str, reason: str):
@@ -544,6 +554,58 @@ def source_text(rail: str) -> str:
     return SOURCE_NAMES.get(key, key) if key else SOURCE_UNKNOWN
 
 
+def _real_rail(rail) -> str:
+    """A rail that says how money came in, or '' -- the two hand rails and a
+    gift say nothing a replacement could inherit."""
+    key = str(rail or "").strip().lower()
+    return key if key and key not in (SOURCE_UNKNOWN, "manual", fb.FREE_RAIL) else ""
+
+
+def rail_in(values: list, hdr: list, order_id: str) -> str:
+    """The Purchase cell of the first receipts row carrying `order_id` -- the
+    PC bot's sheets.rail_in, so both buyers read an old order's rail alike."""
+    if not values or not order_id or H_ORDER not in hdr or H_PURCHASE not in hdr:
+        return ""
+    i_oid, i_p = hdr.index(H_ORDER), hdr.index(H_PURCHASE)
+    want = str(order_id).strip().upper()
+    for r in values[1:]:
+        if i_oid < len(r) and r[i_oid].strip().upper() == want:
+            return r[i_p].strip() if i_p < len(r) else ""
+    return ""
+
+
+def rail_for(o: dict, values: Optional[list], hdr: list, site_source=None) -> str:
+    """What this order's Purchase cell (H_PURCHASE) says. Three cases, the same
+    three the PC bot writes (bot/main._receipt_kwargs, 2026-10-20):
+
+      * a GIFT (fb.is_free: the site stored free:true, paid 0, the owner's own
+        order) -> 'free'. 'manual' would read as money still to chase, which a
+        gift is not, and 'free' is never painted green.
+      * a REPLACEMENT (the order carries `replaces`) whose own rail says
+        nothing -> the rail of the order it replaces. That customer paid once,
+        with PayPal say, for the OLD order; the row that holds the eSIM is the
+        row the owner reconciles PayPal's deposits against, so it must say
+        'paypal' -- and be green -- not 'manual'. Read off the old order's
+        receipts row first; an old order that never got a row (closed before
+        Pay) is asked of the site (`site_source(order_id) -> rail`).
+      * anything else -> the order's own rail, as always.
+    """
+    if fb.is_free(o):
+        return fb.FREE_RAIL
+    own = str(o.get("source") or "").strip().lower()
+    old = str(o.get("replaces") or "").strip().upper()
+    if old and not _real_rail(own):
+        carried = _real_rail(rail_in(values or [], hdr, old))
+        if not carried and site_source is not None:
+            try:
+                carried = _real_rail(site_source(old))
+            except Exception:                               # noqa: BLE001 -- a label, not the purchase
+                carried = ""
+        if carried:
+            return source_text(carried)
+    return source_text(own)
+
+
 # ── alerts, throttled ────────────────────────────────────────────────────────
 
 def _quiet_hour(now: Optional[datetime] = None) -> bool:
@@ -701,6 +763,7 @@ class Run:
         self._header: Optional[list] = None
         self._values: Optional[list] = None
         self._created: Optional[dict] = None   # the body the purchase answered with
+        self._rails: dict = {}                  # order id -> its Purchase cell (rail())
         self.bought = 0
 
     def hdr(self) -> list:
@@ -711,6 +774,18 @@ class Run:
         if self._header is None:
             self._header = _hdr(self.ws)
         return self._header
+
+    def rail(self, o: dict) -> str:
+        """rail_for() for this order, worked out once per run: the buy, the
+        delivery and the green paint must all say the same thing, and the
+        replaced order's row is read from the sheet read handle() already made
+        (append() drops it, so the answer is kept rather than re-derived)."""
+        oid = str(o.get("order_id") or "")
+        if oid not in self._rails:
+            values = self._values if self._values is not None else self.ws.get_all_values()
+            self._rails[oid] = rail_for(o, values, self.hdr(),
+                                        site_source=lambda old: fb.order_facts(old).get("source"))
+        return self._rails[oid]
 
     def append(self, values: dict) -> int:
         """A receipts row. The duplicate guard's read is NOT reused for the row
@@ -859,6 +934,11 @@ class Run:
             log.warning(f"{oid}: the wallet is short of this order -- waiting for a top-up")
             return 0, ""
 
+        # The Purchase cell is settled BEFORE the money moves: for a replacement
+        # it can cost a read of the site, and nothing may stand between a
+        # purchase and the receipts row that proves it (see append_row) -- a run
+        # killed in that gap buys the package again.
+        self.rail(o)
         idem = f"waverole-{oid}-a{attempt}"
         code, body = self.st.create_order(v.plan_id, idem)
         # Once ONE answer has failed to say whether the order was created, the
@@ -885,7 +965,9 @@ class Run:
                 H_LINK_WR: o.get("order_url") or "", H_ROUTE: f"{ROUTE_PREFIX}{row.code}",
                 H_REGION: region, H_PLAN: f"{v.gb:g}GB - {v.days} days — {networks}".rstrip(" —"),
                 H_SOURCE: SUPPLIER_NAME,
-                H_PURCHASE: source_text(o.get("source") or ""),
+                # The rail -- or 'free' for a gift, or the replaced order's rail
+                # for a replacement (rail_for).
+                H_PURCHASE: self.rail(o),
                 H_BUY: f"{v.wholesale_eur * fx_of(row):.2f}$",
                 H_SELL: (f"{float(o['paid_usd']):.2f}$" if o.get("paid_usd") not in (None, "") else ""),
                 H_SALE: discount_text(o.get("list_usd"), o.get("paid_usd")),
@@ -908,7 +990,7 @@ class Run:
             # the review row is what stops the next run from doing so.
             n = self.append({**base, H_LINK_SUP: "https://wholesale.stellarsecurity.com/orders",
                              H_STATUS: ST_REVIEW})
-            paint_paid(self.ws, n, (o.get("source") or ""), self.hdr())
+            paint_paid(self.ws, n, self.rail(o), self.hdr())
             alert_now(f"{oid} needs a look: idempotency conflict",
                       f"Stellar already holds an order under key {idem} but answered 409 to a replay. "
                       f"Find it in the portal, deliver by hand or settle, then clear row {n} of the receipts sheet.")
@@ -963,7 +1045,7 @@ class Run:
         # settles it from the portal.
         n = self.append({**base, H_LINK_SUP: "https://wholesale.stellarsecurity.com/orders",
                          H_STATUS: ST_REVIEW})
-        paint_paid(self.ws, n, (o.get("source") or ""), self.hdr())
+        paint_paid(self.ws, n, self.rail(o), self.hdr())
         alert_now(f"{oid} needs a look: Stellar would not say what it did",
                   f"Stellar: {msg}\n\nThe order for {oid} ({sku}, {v.gb:g}GB/{v.days}d, "
                   f"EUR {v.wholesale_eur:.2f}) may or may not exist under key {idem} -- the first "
@@ -1087,13 +1169,34 @@ class Run:
             alert_now(f"{oid}: receipts row {n} not updated",
                       f"The eSIM is being handed to the customer now; the sheet row is missing "
                       f"its credentials and its status: {ex}")
-        report_fulfilled(oid, payload)
+        answer = report_fulfilled(oid, payload)
+        if fb.site_withholds_mail(answer):
+            # The owner settled and REPLACED this order while the package was
+            # being bought (a settle from HQ or the Orders screen does not wait
+            # for a claim), or the order already holds another eSIM. The site
+            # parked this one as a spare and did not show it; the customer has
+            # the eSIM of the order that replaced it. So: no customer mail, and
+            # the row stops reading as a second sale -- it keeps the package's
+            # credentials and its cost (the wallet WAS debited).
+            try:
+                changes = fb.mark_row_superseded(self.ws, n)
+                done = "; ".join(f"{h}: '{b}' -> '{a}'" for h, b, a in changes) or "nothing"
+            except Exception as ex:                          # noqa: BLE001
+                done = f"NOT marked ({type(ex).__name__}) -- mark it by hand"
+            log.warning(f"{oid}: the site kept Stellar order {sid} as a spare -- customer not mailed")
+            alert_now(f"{oid}: Stellar package kept as a spare -- customer NOT mailed",
+                      f"The site answered that {oid} was already replaced (or already holds a "
+                      f"different eSIM), so Stellar order {sid} was not shown or mailed to the "
+                      f"customer. Receipts row {n} holds it; changed on that row: {done}.\n\n"
+                      f"The wallet was debited. Decide: keep it as spare stock, or ask Stellar "
+                      f"for a refund.")
+            return
         log.info(f"{oid}: delivered from Stellar order {sid}")
         # Everything past this line is AFTER the customer can install: the mail
         # only because the site now holds the eSIM, the colour because it is a
         # convenience and nobody waits for it.
         self.mail(o, payload)
-        paint_paid(self.ws, n, (o.get("source") or ""), self.hdr())
+        paint_paid(self.ws, n, self.rail(o), self.hdr())
 
     def mail(self, o: dict, payload: dict):
         """The buyer's 'your eSIM is ready' email, sent from THIS step.
@@ -1123,10 +1226,13 @@ class Run:
         try:
             if not to:
                 raise ValueError("the site has no address for this order")
+            # free / replaces ride on the queue row from 2026-10-20: a gift's
+            # mail says "Free", a replacement's says it replaces the old order.
             fb.send_customer_email(to, oid, str(o.get("order_url") or ""),
                                    fb._delivery_from_record({**o, "esim": payload}),
                                    esim=payload, lang=str(o.get("lang") or ""),
-                                   total=o.get("paid_usd"))
+                                   total=o.get("paid_usd"), free=fb.is_free(o),
+                                   replaces=str(o.get("replaces") or ""))
             if not fb.report_email_sent(oid, True, address=to):
                 # The mail is out but the site does not know: the sweep will ask
                 # the Sent folder before it writes a word, so this is noise, not
