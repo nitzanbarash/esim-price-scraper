@@ -254,6 +254,10 @@ function profitText_(net, buy) {
 //     still makes it. Only the 30% ever takes a package off sale.
 //   * 1GB: 0.99-1.49 on a 10-cent grid ending in 9 - the LOWEST step that
 //     loses at most 10 cents after the processor's real fee.
+//   * a CHEAP 10GB - bought under $2.75 (CHEAP_10GB_COST) - never sells
+//     above 5.99, even when its range starts higher (the owner, 2026-10-21).
+//     A ceiling over the answer above, not a price of its own: a lower
+//     price stays, and a package nothing in the range pays stays off sale.
 //   * no step pays -> the price stays and Q says OVER_RANGE (site: sold out).
 // Margin is judged on the net (S), as P reads it. A blank range cell is the
 // off switch: that package is priced by hand, judged by the old 20% floor.
@@ -270,6 +274,11 @@ const RANGE_LOSS_1GB        = 0.10;  // 1GB may lose this much, fee included
 // left 20GB earning $3.52 and 50GB $4.80; below 20GB there is no floor.
 const DOLLAR_FLOOR          = [[20, 4.25], [30, 4.75], [40, 5.00], [50, 5.50]];
 const RANGE_EPS             = 1e-6;
+// A 10GB bought under CHEAP_10GB_COST never sells above CHEAP_10GB_PRICE -
+// price_ranges.CHEAP_10GB_* (2026-10-21). A blank range is still hands off.
+const CHEAP_10GB_GB         = 10;
+const CHEAP_10GB_COST       = 2.75;
+const CHEAP_10GB_PRICE      = 5.99;
 const OVER_RANGE   = '\u05dc\u05d0 \u05e8\u05d5\u05d5\u05d7\u05d9 \u2014 \u05de\u05e2\u05dc \u05d8\u05d5\u05d5\u05d7';
 // The scraper's proportion rule (2026-09-17): from 30GB up, a package bought
 // above its size's ceiling is not for sale, whatever it sells for. Judged
@@ -294,6 +303,12 @@ function marginPct_(price, cost) { return (netOf_(price) - cost) / cost * 100; }
 function pays_(price, cost, gb) {
   if (isOneGb_(gb)) return netOf_(price) - cost >= -RANGE_LOSS_1GB - RANGE_EPS;
   return marginPct_(price, cost) >= RANGE_RAISE_BELOW_PCT - RANGE_EPS;
+}
+
+// A 10GB bought under CHEAP_10GB_COST: it never sells above CHEAP_10GB_PRICE.
+function isCheap10gb_(gb, cost) {
+  return gb !== null && gb !== undefined && Math.abs(gb - CHEAP_10GB_GB) < RANGE_EPS &&
+         cost > 0 && cost < CHEAP_10GB_COST - RANGE_EPS;
 }
 
 // The least a sale of this size must earn in dollars; 0 = no floor.
@@ -340,8 +355,15 @@ function parseRange_(cell) {
 // Moves FROM `current` (null = unknown): up as far as it takes to pay and
 // on to the size's dollar floor (or the high end, short of it), down one
 // step over 200% while the step below still makes the floor. 1GB ignores
-// it - the lowest paying step, every time.
+// it - the lowest paying step, every time. Then the cheap-10GB ceiling.
 function reprice_(gb, cost, current, lo, hi) {
+  const price = rangePrice_(gb, cost, current, lo, hi);
+  if (price !== null && isCheap10gb_(gb, cost)) return Math.min(price, CHEAP_10GB_PRICE);
+  return price;
+}
+
+// The range rule alone: the price, or null when nothing in the range pays.
+function rangePrice_(gb, cost, current, lo, hi) {
   const grid = rangeSteps_(lo, hi, gb);
   if (!grid.length || !(cost > 0)) return null;
   if (isOneGb_(gb)) {
@@ -400,8 +422,14 @@ function checkPriceRanges() {
     [10, 4.30, 5.99, 5.99, 7.99, 6.49],         // 5.99 makes 26%: up to 6.49
     [10, 4.80, 5.99, 5.99, 7.99, 6.99],
     [10, 6.50, 5.99, 5.99, 7.99, null],         // nothing in the range pays
-    [10, 1.50, 6.99, 5.99, 7.99, 6.49],         // > 200%: one step down
-    [10, 1.50, 5.99, 5.99, 7.99, 5.99],         // ... never below the low end
+    [15, 2.00, 8.99, 7.49, 9.99, 8.49],         // > 200%: one step down
+    [15, 1.50, 7.49, 7.49, 9.99, 7.49],         // ... never below the low end
+    [10, 2.13, 6.99, 5.99, 7.99, 5.99],         // a 10GB bought under $2.75: at most 5.99
+    [10, 2.74, 7.99, 5.99, 7.99, 5.99],
+    [10, 2.75, 6.49, 5.99, 7.99, 6.49],         // $2.75 is not cheap: the range rule
+    [10, 2.40, 7.49, 6.99, 8.99, 5.99],         // 5.99 wins over a range above it
+    [10, 2.00, 4.99, 3.99, 4.99, 4.99],         // ... but a lower price stays
+    [5, 2.00, 4.99, 4.49, 5.99, 4.99],          // only 10GB
     [10, 4.30, 6.75, 5.99, 7.99, 6.99],         // off the grid -> snapped up
     [10, 4.30, 9.99, 5.99, 7.99, 7.99],         // over the top -> clamped
     [20, 5.72, 9.99, 9.99, 12.99, 10.99],       // 61% but $3.52: on to the $4.25 floor
@@ -576,7 +604,8 @@ function applyFee_(sheet, map, e) {
       const gb = map.gb === undefined ? null : num_(data[chosen][map.gb]);
       const want = cost ? reprice_(gb, cost, price, rng[0], rng[1]) : null;
       if (want !== null && (price === null || Math.abs(want - price) >= 0.005)) {
-        moves.push(key + ' ' + (price === null ? '-' : price.toFixed(2)) + ' \u2192 ' + want.toFixed(2));
+        const why = isCheap10gb_(gb, cost) && want === CHEAP_10GB_PRICE ? ' (10GB < $' + CHEAP_10GB_COST + ')' : '';
+        moves.push(key + ' ' + (price === null ? '-' : price.toFixed(2)) + ' \u2192 ' + want.toFixed(2) + why);
         priceCell = want;
         price = want;
         moved = true;

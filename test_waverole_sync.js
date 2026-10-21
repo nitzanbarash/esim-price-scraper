@@ -44,6 +44,12 @@ for _ in range(5000):
     cost = round(random.uniform(0.2, 30), 2)
     cur = None if random.random() < 0.15 else round(random.uniform(0.5, 55), 2)
     cases.append([gb, cost, cur, lo, hi, reprice(gb, cost, cur, lo, hi)])
+# The cheap-10GB bar ($2.75), cent by cent, so the two copies agree at its edge.
+for c in range(240, 311):
+    for gb in (5, 10, 15):
+        for cur, lo, hi in ((6.99, 5.99, 7.99), (None, 5.99, 7.99), (4.99, 3.99, 4.99),
+                            (7.49, 6.99, 8.99), (5.99, 4.99, 7.99), (3.99, 3.49, 3.99)):
+            cases.append([gb, c / 100, cur, lo, hi, reprice(gb, c / 100, cur, lo, hi)])
 cells = ['5.99 - 7.99', '5.99-7.99', ' $5.99 \\u2013 $7.99 ', '5,99 - 7,99', '7.99 - 5.99',
          '0 - 3', '5.99', 'abc', '5.99 ~ 7.99', '\\u200f5.99 - 7.99\\u200e', '5.99 \\u2014 7.99', '']
 print(json.dumps({'cases': cases, 'cells': [[c, parse_range(c)] for c in cells]}))
@@ -152,8 +158,40 @@ check('...and P is the new margin', cell(s, 3, 'profit'), '\ud83d\udfe2 +$1.56 (
 // The cost falls back -> no drop until the margin passes 200% (hard down).
 edit(s, 3, 'buy', '(\u20ac3.40) $3.90');
 check('cheaper cost under 200% leaves the price', cell(s, 3, 'price'), 6.99);
-edit(s, 3, 'buy', '$1.50');
-check('over 200% steps down ONE step', cell(s, 3, 'price'), 6.49);
+edit(s, 3, 'buy', '$2.80');
+check('$2.80 is not a cheap 10GB: 6.99 stays', cell(s, 3, 'price'), 6.99);
+t = edit(s, 3, 'buy', '$2.74');
+check('a 10GB bought under $2.75 comes straight down to 5.99, on both rows',
+      [cell(s, 2, 'price'), cell(s, 3, 'price')], [5.99, 5.99]);
+check('...and the toast says which rule did it',
+      t.length === 1 && t[0].indexOf('6.99 \u2192 5.99 (10GB < $2.75)') >= 0, true);
+t = edit(s, 3, 'price', '6.99');
+check('a price typed over a cheap 10GB is corrected to 5.99', cell(s, 3, 'price'), 5.99);
+check('...with a toast', t.length === 1 && t[0].indexOf('\u2192 5.99') >= 0, true);
+edit(s, 3, 'range', '6.99 - 8.99');
+check('a range that starts above 5.99 does not lift a cheap 10GB', cell(s, 3, 'price'), 5.99);
+edit(s, 3, 'range', '4.99 - 7.99');
+edit(s, 3, 'price', '5.49');
+check('a price typed BELOW 5.99 inside the range stays as typed', cell(s, 3, 'price'), '5.49');
+
+// Over 200% steps down ONE step (15GB: a 10GB that cheap is the 5.99 ceiling).
+s = makeSheet([row({ sku: '1.1.15', gb: '15gb', source: 'Stellar', buy: '$3.90', price: '8.99',
+                     range: '7.49 - 9.99', tick: TICK })]);
+edit(s, 2, 'buy', '$2.00');
+check('over 200% steps down ONE step', cell(s, 2, 'price'), 8.49);
+
+// A blank range keeps the bot out of a cheap 10GB too.
+s = twin10();
+edit(s, 3, 'range', '');
+edit(s, 3, 'price', '6.99');
+edit(s, 3, 'buy', '$2.13');
+check('a cheap 10GB with a blank range keeps its typed price', cell(s, 3, 'price'), '6.99');
+
+// A cheap cost typed on the UNTICKED row is not the site's cost either.
+s = twin10();
+s.cells[2][COL.price] = '6.99'; s.cells[1][COL.price] = '6.99';
+edit(s, 2, 'buy', '$2.13');
+check('a cheap cost on the unticked row moves nothing', cell(s, 3, 'price'), '6.99');
 
 // The unticked row's cost is not the site's cost: the price does not move.
 s = twin10();

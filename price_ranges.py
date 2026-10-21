@@ -11,7 +11,7 @@ given on 2026-10-07, is a RANGE per package in a column of its own
     5.99 - 7.99
 
 The low end is the price the package should ideally sell at and the lowest it
-may ever go; the high end is the price past which the package is too dear to
+may ever go (one exception: a cheap 10GB, below); the high end is the price past which the package is too dear to
 sell at all. Inside the range the bot moves U on the chooser's 4-hourly run
 — and the sheet's own script (waverole_sync.gs applyFee_, a JavaScript copy
 of this rule) makes the same move the moment the owner types a cost, a
@@ -38,14 +38,23 @@ copies to the same answers:
     the loss leaders: the bot always takes the LOWEST step whose loss, after
     the processor's real fee, is at most 10 cents (LOSS_1GB). Past 1.49 the
     package is off sale.
+  * a CHEAP 10GB — bought under $2.75 (CHEAP_10GB_COST) — never sells
+    above 5.99 (CHEAP_10GB_PRICE), even when its range starts higher (the
+    owner, 2026-10-21: "the price drops to 5.99"). It is a ceiling laid
+    over the answer above, not a price of its own: a 10GB the range puts
+    at 5.49 stays at 5.49, and one nothing in the range pays stays off
+    sale. 5.99 makes 96% at $2.75 and more below it, so a price the ceiling
+    sets always pays. Once the cost is $2.75 or more the range rule alone
+    decides again, from wherever the price is.
 
 The margin is judged on 'מחיר שלי' (S) — U less the processor's real cut of
 4% + $0.35 (memory: fee-ladder-vs-real-fee) — exactly as 'רווח' (P) reads
 it. Every write of U here rewrites S and T too, the way applyFee_ in
 waverole_sync.gs does on a hand edit, because API writes never fire onEdit.
 
-A blank range cell is the OFF switch: the bot leaves that package's price
-alone. The owner tunes a range by typing over it, on the ✓ row of the SKU
+A blank range cell — or one that does not read as a range — is the OFF
+switch: the bot leaves that package's price alone, the cheap-10GB ceiling
+included. The owner tunes a range by typing over it, on the ✓ row of the SKU
 (the chooser mirrors U/S/T/V and the range onto the twin row).
 
 `seed_ranges()` fills the column the first time, by the owner's recipe: for
@@ -82,6 +91,14 @@ STEP = 0.50                # the grid for every size but 1GB (…49 / …99)
 STEP_1GB = 0.10            # the 1GB grid (…9)
 LOSS_1GB = 0.10            # 1GB may lose up to this, fee included
 RANGE_1GB = (0.99, 1.49)   # 1GB's range, the same for every country
+
+# A 10GB bought under CHEAP_10GB_COST never sells above CHEAP_10GB_PRICE, the
+# range notwithstanding (the owner, 2026-10-21: "if a 10GB costs under $2.5
+# the price drops to 5.99" — the bar raised to $2.75 the same day, and 5.99
+# wins over a range that starts higher).
+CHEAP_10GB_GB = 10
+CHEAP_10GB_COST = 2.75
+CHEAP_10GB_PRICE = 5.99
 
 # The least a sale may earn in dollars, net of the real fee, by size: (size
 # from, and up, dollars). Below 20GB there is none — the 30% is enough there.
@@ -131,6 +148,12 @@ def pays(final: float, cost: float, gb: Optional[float]) -> bool:
     if is_1gb(gb):
         return net_of(final) - cost >= -LOSS_1GB - _EPS
     return margin_pct(final, cost) >= RAISE_BELOW_PCT - _EPS
+
+
+def is_cheap_10gb(gb: Optional[float], cost: Optional[float]) -> bool:
+    """A 10GB bought under CHEAP_10GB_COST: it never sells above CHEAP_10GB_PRICE."""
+    return (gb is not None and abs(gb - CHEAP_10GB_GB) < _EPS
+            and cost is not None and 0 < cost < CHEAP_10GB_COST - _EPS)
 
 
 def dollar_floor(gb: Optional[float]) -> float:
@@ -218,7 +241,17 @@ def format_range(lo: float, hi: float) -> str:
 
 def reprice(gb: Optional[float], cost: float, current: Optional[float],
             lo: float, hi: float) -> Optional[float]:
-    """The price U should hold now, or None when nothing in the range pays.
+    """The price U should hold now, or None when nothing in the range pays:
+    the range rule (_range_price), under the cheap-10GB ceiling."""
+    price = _range_price(gb, cost, current, lo, hi)
+    if price is not None and is_cheap_10gb(gb, cost):
+        return min(price, CHEAP_10GB_PRICE)
+    return price
+
+
+def _range_price(gb: Optional[float], cost: float, current: Optional[float],
+                 lo: float, hi: float) -> Optional[float]:
+    """The range rule alone: the price, or None when nothing in the range pays.
 
     `current` is what U holds today (None when unknown or off the sheet): the
     non-1GB rule moves FROM it — up as far as it takes to pay, and on to the
@@ -256,8 +289,9 @@ def reprice(gb: Optional[float], cost: float, current: Optional[float],
 
 def feasible(gb: Optional[float], cost: Optional[float], rng: Optional[tuple]) -> Optional[bool]:
     """Is there ANY price in the range that pays at this cost? None = unjudged
-    (no range, or no cost)."""
-    if rng is None or cost is None:
+    (no range, or no cost — a $0 buy cell is no cost, as profitMark_ in
+    waverole_sync.gs reads it)."""
+    if rng is None or cost is None or cost <= 0:
         return None
     return reprice(gb, cost, None, *rng) is not None
 

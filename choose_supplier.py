@@ -155,7 +155,9 @@ The sell price itself (2026-10-07, price_ranges.py). A SKU with a range in
 up to the first 50-cent step that pays 30% of cost and, from 20GB, the
 size's dollar floor (price_ranges.DOLLAR_FLOOR; short of it, the high end —
 never off sale for it), down one step a run while it pays over 200%; 1GB to the lowest 10-cent step inside 0.99–1.49 that loses
-at most 10c — with S and T rewritten the way applyFee_ would. A range on a
+at most 10c; a 10GB bought under $2.75 never above 5.99, even below the
+range's low end (price_ranges.CHEAP_10GB_*, 2026-10-21) — with S and T
+rewritten the way applyFee_ would. A range on a
 SKU also replaces the 20% floor in the verdict above: 'לא רווחי — מעל טווח'
 when no price in the range pays at a row's cost (the ceiling is still judged
 first). A blank range cell is the owner's hands-off; the range rides the
@@ -1187,7 +1189,8 @@ def mail_live_q_changes(changes: list[tuple], moves: list[tuple] = (),
              "כשהרווח יורד מתחת ל-30% ממחיר הקנייה, ויורד מדרגה אחת בריצה "
              "כשהרווח מעל 200% והמחיר מעל המינימום. אין מדרגה בטווח שמרוויחה "
              "30% → 'לא רווחי — מעל טווח'. 1GB: תמיד 0.99–1.49 בקפיצות של 10 סנט, "
-             "המדרגה הנמוכה ביותר שמפסידה עד 10 סנט כולל סליקה. "
+             "המדרגה הנמוכה ביותר שמפסידה עד 10 סנט כולל סליקה."
+             " 10GB \u05e9\u05e0\u05e7\u05e0\u05d4 \u05d1\u05e4\u05d7\u05d5\u05ea \u05de-$2.75: \u05dc\u05db\u05dc \u05d4\u05d9\u05d5\u05ea\u05e8 5.99, \u05d2\u05dd \u05db\u05e9\u05d4\u05d8\u05d5\u05d5\u05d7 \u05de\u05ea\u05d7\u05d9\u05dc \u05d2\u05d1\u05d5\u05d4 \u05d9\u05d5\u05ea\u05e8. "
              "תא טווח ריק = הבוט לא נוגע במחיר. "
              "בלי טווח: רצפת רווח 20% (1GB: הפסד עד 20%). "
              "תקרת קנייה: 30GB $10 / 40GB $14 / 50GB $18.\n")
