@@ -138,6 +138,48 @@ def mark_shelved(order_id: str, extra: dict, shelf_row: int = 0, refused: str = 
         return False
 
 
+# One writer at a time (review 2026-10-21). The fulfillment run and the
+# Stellar buyer both call shelve_extras, from two workflows in different
+# concurrency groups -- and the update network's PCs may run either. Each read
+# the tab, found the package missing and appended it: the same ICCID on two
+# 'free' rows, which the PC would serve to two customers. The duplicate check
+# below is only as good as the tab it reads, so the read and the append happen
+# under one site lease (api/orders.js shelf_lock, SET NX with a TTL that frees
+# it if a run dies). A run that does not get it shelves nothing: the extras
+# stay listed and the holder -- or the next run -- shelves them.
+SHELF_LOCK_TTL_S = 300
+NO_LOCK = ""                # the site predates the lock (400): carry on, re-reading the tab
+
+
+def take_lock(by: str) -> str | None:
+    """The lease string; NO_LOCK for a site from before the lock; None when
+    another run holds it or the site could not be asked (shelve nothing now)."""
+    try:
+        r = requests.post(fb.ORDERS_URL, json={"action": "shelf_lock", "by": by, "ttl_s": SHELF_LOCK_TTL_S},
+                          headers=_headers(), timeout=20)
+        if r.status_code == 400:
+            return NO_LOCK
+        r.raise_for_status()
+        out = r.json() or {}
+    except Exception as e:
+        log.warning(f"could not take the shelf lock: {fb._redact(str(e))} - shelving next run")
+        return None
+    if out.get("lock") and out.get("lease"):
+        return str(out["lease"])
+    log.info(f"another run ({out.get('by') or '?'}) is shelving right now - its extras stay listed")
+    return None
+
+
+def drop_lock(lease: str):
+    if not lease:
+        return
+    try:
+        requests.post(fb.ORDERS_URL, json={"action": "shelf_unlock", "lease": lease},
+                      headers=_headers(), timeout=20)
+    except Exception as e:                      # the TTL frees it
+        log.warning(f"could not give the shelf lock back (it expires by itself): {fb._redact(str(e))}")
+
+
 # ── the tab ──────────────────────────────────────────────────────────────────
 
 def stock_ws(book):
@@ -345,19 +387,34 @@ def refusal_alert(order: dict, extra: dict, why: str):
 
 # ── the run ──────────────────────────────────────────────────────────────────
 
-def shelve_extras(book, receipts_ws=None, now: datetime | None = None) -> list[dict]:
+def shelve_extras(book, receipts_ws=None, now: datetime | None = None, by: str = "cloud") -> list[dict]:
     """Put every unshelved second package the site lists on the stock tab,
     exactly once, and tell the owner once per package. Returns what was newly
     shelved, [{order_id, row, iccid_tail}], for the tests and the log.
 
     Never raises for one package's sake: each is tried on its own, and a
-    failure leaves it listed for the next run."""
+    failure leaves it listed for the next run. Runs under the site's shelf
+    lock (take_lock): two runs never read-then-append at once."""
     orders = extras_list()
     if not orders:
         return []
     if book is None:
         log.info("no spreadsheet handle here - the fulfillment bot's run shelves the extras")
         return []
+    lease = take_lock(by)
+    if lease is None:
+        return []
+    try:
+        # Listed before the lock was ours: what another run shelved meanwhile
+        # is dropped from a fresh list (and is on the tab, which is read now).
+        if lease:
+            orders = extras_list()
+        return _shelve(book, orders, receipts_ws, now)
+    finally:
+        drop_lock(lease)
+
+
+def _shelve(book, orders: list[dict], receipts_ws, now) -> list[dict]:
     try:
         ws = stock_ws(book)
     except ShelfError as e:
@@ -395,6 +452,16 @@ def shelve_extras(book, receipts_ws=None, now: datetime | None = None) -> list[d
                 session = session_cell(order, extra)
                 if not iccid and not session.startswith(STELLAR_SESSION):
                     continue                    # nothing to key a row on (the site lists none such)
+                # The tab as it is NOW, not as it was at the top of the run:
+                # the owner's hand path (bot/spares add) writes it too, and a
+                # site without the lock leaves only this re-read between two
+                # runs. One read per package; packages are rare.
+                try:
+                    header, rows = _tab_rows(ws)
+                except Exception as e:
+                    log.warning(f"order {oid}: the stock tab could not be re-read ({fb._redact(str(e))}) "
+                                "- this package waits for the next run")
+                    continue
                 have = already_on_tab(rows, iccid, session)
                 if have:
                     # Shelved by an earlier run (whose word to the site was

@@ -1484,7 +1484,7 @@ def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -
     if r.parked:
         try:
             import stock_shelf
-            stock_shelf.shelve_extras(getattr(ws, "spreadsheet", None), receipts_ws=ws)
+            stock_shelf.shelve_extras(getattr(ws, "spreadsheet", None), receipts_ws=ws, by="cloud:stellar")
         except Exception as ex:                              # noqa: BLE001
             log.warning(f"stock shelf step failed ({type(ex).__name__}) -- the fulfillment bot's run retries it")
     return r.bought

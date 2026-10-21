@@ -2244,7 +2244,7 @@ def main():
     try:
         import stock_shelf
         if book is not None:
-            stock_shelf.shelve_extras(book, receipts_ws=ws)
+            stock_shelf.shelve_extras(book, receipts_ws=ws, by="cloud:fulfillment")
     except Exception as e:
         log.error(f"stock shelf step failed: {_redact(str(e))}")
 

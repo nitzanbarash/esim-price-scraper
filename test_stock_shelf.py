@@ -46,9 +46,12 @@ class Resp:
 
 class Site:
     """GET ?status=extras and POST extra_shelved, as api/orders.js answers."""
-    def __init__(self, orders, status=200, fail_marks=False):
+    def __init__(self, orders, status=200, fail_marks=False, locked_by="", lock_status=200):
         self.orders, self.status, self.fail_marks = orders, status, fail_marks
         self.marks, self.gets = [], []
+        # The shelf lock (shelf_lock / shelf_unlock): held by another run when
+        # locked_by is set; lock_status 400 = a site from before the lock.
+        self.locked_by, self.lock_status, self.locks = locked_by, lock_status, []
 
     def get(self, url, params=None, headers=None, timeout=None):
         self.gets.append(dict(params or {}))
@@ -65,6 +68,20 @@ class Site:
         return Resp(200, {"orders": out})
 
     def post(self, url, json=None, headers=None, timeout=None):
+        act = (json or {}).get("action")
+        if act in ("shelf_lock", "shelf_unlock"):
+            self.locks.append(dict(json))
+            if self.lock_status != 200:
+                return Resp(self.lock_status, {"error": "status must be ..."})
+            if act == "shelf_unlock":
+                ok = json.get("lease") == "L1" and self.locked_by == json.get("lease")
+                if ok:
+                    self.locked_by = ""
+                return Resp(200, {"ok": True, "released": ok})
+            if self.locked_by:
+                return Resp(200, {"ok": True, "lock": False, "by": self.locked_by.split("#")[0]})
+            self.locked_by = "L1"
+            return Resp(200, {"ok": True, "lock": True, "lease": "L1"})
         if self.fail_marks:
             import requests
             raise requests.ConnectionError("site unreachable")
@@ -302,6 +319,60 @@ class TestTheEdges(Harness):
     def test_no_hebrew_literal_in_this_module(self):
         src = open(ss.__file__, encoding="utf-8").read()
         self.assertFalse(any("\u0590" <= ch <= "\u05ff" for ch in src), "Hebrew only as \\u escapes")
+
+
+class TestOneWriterAtATime(Harness):
+    """Review 2026-10-21: the fulfillment run and the Stellar buyer shelve from
+    two workflows that can overlap; both read the tab before either appended,
+    and one ICCID landed on two 'free' rows (two customers, one eSIM)."""
+
+    def test_a_run_that_does_not_get_the_lock_shelves_nothing(self):
+        site = Site([extra_order()], locked_by="cloud:stellar#abc")
+        book = Book(Tab(), receipts())
+        self.assertEqual(self.run_shelf(site, book), [])
+        self.assertEqual(len(book.tab.rows), 1, "nothing appended while another run holds the shelf")
+        self.assertEqual(site.marks, [])
+        self.assertEqual(self.alerts, [])
+
+    def test_the_lock_is_taken_and_given_back_around_the_run(self):
+        site = Site([extra_order()])
+        book = Book(Tab(), receipts())
+        self.assertEqual(len(self.run_shelf(site, book)), 1)
+        self.assertEqual([x["action"] for x in site.locks], ["shelf_lock", "shelf_unlock"])
+        self.assertEqual(site.locked_by, "", "given back")
+
+    def test_a_package_another_writer_added_mid_run_is_not_added_again(self):
+        # The tab is re-read per package: a row that appeared after the run's
+        # first look (the owner's hand path, or a site with no lock) is seen.
+        site = Site([extra_order()], lock_status=400)
+        tab = Tab()
+        book = Book(tab, receipts())
+        real = ss._tab_rows
+        calls = {"n": 0}
+
+        def rows_then_someone_appends(ws):
+            calls["n"] += 1
+            if calls["n"] == 2:     # between the run's first read and its check
+                r = [""] * len(ss.HEADER)
+                r[0], r[ss.HEADER.index(ss.H_STATUS)] = "8972000000000005678", ss.FREE
+                tab.rows.append(r)
+            return real(ws)
+        with mock.patch.object(ss, "_tab_rows", rows_then_someone_appends):
+            got = self.run_shelf(site, book)
+        self.assertEqual(got, [])
+        self.assertEqual([r[0] for r in tab.rows[1:]].count("8972000000000005678"), 1)
+        self.assertEqual(self.alerts, [], "no second alert for a package already on the shelf")
+
+    def test_a_site_that_cannot_be_asked_for_the_lock_shelves_nothing(self):
+        site = Site([extra_order()])
+
+        def boom(url, json=None, headers=None, timeout=None):
+            import requests
+            raise requests.ConnectionError("down")
+        book = Book(Tab(), receipts())
+        with mock.patch.object(site, "post", boom):
+            self.assertEqual(self.run_shelf(site, book), [])
+        self.assertEqual(len(book.tab.rows), 1)
 
 
 if __name__ == "__main__":
