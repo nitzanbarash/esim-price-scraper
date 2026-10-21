@@ -50,9 +50,10 @@ class Colors(unittest.TestCase):
         rules = rc.desired_rules(HEADER, ["esim.dog", "Stellar"], 0, 993)
         f = [r["booleanRule"]["condition"]["values"][0]["userEnteredValue"] for r in rules]
         self.assertEqual(f[0], '=LOWER(TRIM($V2))="esim.dog"')
-        self.assertIn("$Z2", f[2])
-        self.assertIn("$X2", f[4])          # loss compares Sell with Buy
-        self.assertIn("$Y2", f[5])          # discount reads the Sale column
+        self.assertIn("$S2", f[2])          # a replaced row's Sell reads Status
+        self.assertIn("$Z2", f[3])
+        self.assertIn("$X2", f[5])          # loss compares Sell with Buy
+        self.assertIn("$Y2", f[6])          # discount reads the Sale column
         moved = HEADER[:]
         moved.insert(0, "new")              # the owner inserts a column: V -> W
         f2 = rc.desired_rules(moved, ["esim.dog"], 0, 993)[0]
@@ -67,7 +68,8 @@ class Colors(unittest.TestCase):
         rules = rc.desired_rules(HEADER, [], 0, 993)
         sell = [rc._hex(r["booleanRule"]["format"]["backgroundColor"]) for r in rules
                 if r["ranges"][0]["startColumnIndex"] == 25]
-        self.assertEqual(sell, [rc.RED_REFUND, rc.RED, rc.RED, rc.DISCOUNT, rc.GREEN])
+        self.assertEqual(sell, [rc.STATUS_REPLACED, rc.RED_REFUND, rc.RED, rc.RED,
+                                rc.DISCOUNT, rc.GREEN])
 
     def test_second_run_writes_nothing_and_foreign_rules_survive(self):
         first = rc.plan(sheet([FOREIGN_RULE]), HEADER, ["esim.dog", "Stellar"])
@@ -85,7 +87,8 @@ class Colors(unittest.TestCase):
         rules = [r for r in rc.desired_rules(HEADER, [], 0, 993)
                  if r["ranges"][0]["startColumnIndex"] == 18]
         self.assertEqual([rc._hex(r["booleanRule"]["format"]["backgroundColor"]) for r in rules],
-                         [rc.STATUS_ACTIVE, rc.STATUS_DONE, rc.STATUS_FAULT])
+                         [rc.STATUS_ACTIVE, rc.STATUS_DONE, rc.STATUS_FAULT,
+                          rc.STATUS_FAULT, rc.STATUS_REPLACED])
         f = [r["booleanRule"]["condition"]["values"][0]["userEnteredValue"] for r in rules]
         self.assertEqual(f[0], '=TRIM($S2)="פעיל"')
         self.assertIn('"הסתיים"', f[1])
@@ -93,6 +96,24 @@ class Colors(unittest.TestCase):
         reqs = rc.plan(sheet([STATUS_RULE]), HEADER, [])
         self.assertEqual([q["deleteConditionalFormatRule"]["index"] for q in reqs
                           if "deleteConditionalFormatRule" in q], [0])
+
+    def test_replaced_row_is_grey_not_red(self):
+        # 2026-10-21: a replaced row's Sell is 0 on purpose; red would say
+        # "money lost". Grey wins on Sell (first rule), and on Status the
+        # "check the charge" spelling stays yellow ahead of the grey.
+        rules = rc.desired_rules(HEADER, [], 0, 993)
+        word = "\u05d4\u05d5\u05d7\u05dc\u05e4\u05d4"
+        grey = '=LEFT(TRIM($S2),6)="%s"' % word
+        sell = [r for r in rules if r["ranges"][0]["startColumnIndex"] == 25]
+        self.assertEqual(sell[0]["booleanRule"]["condition"]["values"][0]["userEnteredValue"], grey)
+        status = [r for r in rules if r["ranges"][0]["startColumnIndex"] == 18]
+        f = [r["booleanRule"]["condition"]["values"][0]["userEnteredValue"] for r in status]
+        self.assertEqual(f[-1], grey)
+        self.assertTrue(f[-2].startswith("=AND(LEFT(TRIM($S2),6)="))
+        self.assertIn(rc.CHECK_CHARGE_WORDS, f[-2])
+        # Second run still writes nothing.
+        applied = [q["addConditionalFormatRule"]["rule"] for q in rc.plan(sheet(), HEADER, [])]
+        self.assertEqual(rc.plan(sheet(applied), HEADER, []), [])
 
     def test_rules_stranded_by_a_column_move_are_rewritten(self):
         # 2026-10-07: the owner cut/pasted Status, source, buy/sale/sell one
@@ -191,21 +212,21 @@ class Usage(unittest.TestCase):
 
     def test_usage_rules_are_added_beside_the_existing_ones(self):
         # The sheet as it stood on 2026-10-06: a foreign rule, then this
-        # script's two on V and five on Z. The usage rules must ADD to those,
-        # and a second run must then write nothing.
+        # script's two on V and five on Z (six since the 10-21 grey). The usage
+        # rules must ADD to those, and a second run must then write nothing.
         ours = [r for r in rc.desired_rules(HEADER, ["esim.dog", "Stellar"], 0, 993)
                 if r["ranges"][0]["startColumnIndex"] in (21, 25)]
-        self.assertEqual(len(ours), 7)
+        self.assertEqual(len(ours), 8)
         have = [FOREIGN_RULE] + ours
         reqs = rc.plan(sheet(have), HEADER, ["esim.dog", "Stellar"])
         dels = [q["deleteConditionalFormatRule"]["index"] for q in reqs
                 if "deleteConditionalFormatRule" in q]
         self.assertTrue(all(i >= 1 for i in dels), dels)          # the foreign rule untouched
         adds = [q["addConditionalFormatRule"]["rule"] for q in reqs if "addConditionalFormatRule" in q]
-        self.assertEqual(len(adds), 15)
+        self.assertEqual(len(adds), 18)
         self.assertEqual(sum(1 for r in adds if r["ranges"][0]["startColumnIndex"] == 4), 5)
         applied = [FOREIGN_RULE] + adds
-        self.assertEqual(len(applied), 16)
+        self.assertEqual(len(applied), 19)
         self.assertEqual(rc.plan(sheet(applied), HEADER, ["esim.dog", "Stellar"]), [])
 
 

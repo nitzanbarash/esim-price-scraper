@@ -33,7 +33,8 @@ painted the neighbour). So this script owns two kinds of rule: any rule on one
 of its columns (row 2 to the grid's last row), and any rule anywhere whose
 formula is one of its own with a different column letter — those stranded
 copies are deleted and rewritten on the named column. The Status column's
-three colours (the owner's hand rules until 10-07) are owned the same way.
+three colours (the owner's hand rules until 10-07) are owned the same way, and
+since 10-21 a row whose Status says 'replaced' is grey on Status and Sell.
 It is idempotent: when the sheet already matches, it writes nothing.
 
     python receipts_colors.py            # apply
@@ -83,6 +84,16 @@ STATUS_ACTIVE = "#c6e8c9"   # פעיל
 STATUS_DONE = "#c9ddf4"     # נוצל / הסתיים
 STATUS_FAULT = "#ffeda8"    # תקלה
 STATUS_WORDS = ("פעיל", "נוצל", "הסתיים", "תקלה")
+# A row closed as replaced by another order (the bots write
+# fulfillment_bot.REPLACED_STATUS / REPLACED_CHECK_STATUS; matched by prefix, so
+# a note the owner appends still counts). Grey on BOTH Status and Sell: its Sell
+# is 0 on purpose, and the red a 0 Sell normally earns means "money lost", which
+# this row is not (owner, 2026-10-21). "Replaced - check the charge" (Buy kept:
+# the first payment was never proven unpaid) stays yellow on Status, like a
+# fault: it wants a look.
+STATUS_REPLACED = "#d9d9d9"
+REPLACED_WORD = "הוחלפה"
+CHECK_CHARGE_WORDS = "לבדוק חיוב"
 # One regex each for the two numbers. Both insist the WHOLE cell is
 # "number / number" (spaces around the slash or not): anything else -- a bare
 # number, words, a second slash -- matches neither and gets no colour. The
@@ -224,7 +235,10 @@ def desired_rules(header: list[str], dropdown: list[str], sheet_id: int,
     for name, color in supplier_colors(dropdown):
         lit = name.lower().replace('"', '""')
         rules.append(rule(src, f'=LOWER(TRIM({V}))="{lit}"', color, text=True))
+    replaced = f'LEFT(TRIM({S}),{len(REPLACED_WORD)})="{REPLACED_WORD}"'
     rules += [
+        # First: a replaced row's 0 is not a loss (see STATUS_REPLACED).
+        rule(sell, f"={replaced}", STATUS_REPLACED),
         rule(sell, f'=REGEXMATCH(LOWER(TO_TEXT({Z})),"refund")', RED_REFUND),
         rule(sell, f"=IFERROR({_num(Z)}=0,FALSE)", RED),
         rule(sell, f"=IFERROR({_num(Z)}<{_num(X)},FALSE)", RED),
@@ -237,6 +251,9 @@ def desired_rules(header: list[str], dropdown: list[str], sheet_id: int,
         rule(status, f'=TRIM({S})="פעיל"', STATUS_ACTIVE),
         rule(status, f'=OR(TRIM({S})="נוצל",TRIM({S})="הסתיים")', STATUS_DONE),
         rule(status, f'=TRIM({S})="תקלה"', STATUS_FAULT),
+        rule(status, f'=AND({replaced},ISNUMBER(SEARCH("{CHECK_CHARGE_WORDS}",{S})))',
+             STATUS_FAULT),
+        rule(status, f"={replaced}", STATUS_REPLACED),
     ]
     return rules
 
