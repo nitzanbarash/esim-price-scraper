@@ -74,8 +74,16 @@ jobs:
         run: python test_stellar_buyer.py
 
       # A duplicate eSIM email is money and trust, both already spent.
+      # Since 2026-10-21 every automatic sender goes through one send_once
+      # (sent stamp, mail lease, Sent folder), and a second PACKAGE is fine
+      # while a second EMAIL for one order is not.
       - name: Delivery dedup
         run: python test_delivery_dedup.py
+
+      # Second packages onto the stock tab: each exactly once, one alert per
+      # package, and never the eSIM the customer is using.
+      - name: Stock shelf
+        run: python test_stock_shelf.py
 
       # What the customer's eSIM mail says about money: "Free" for a gift,
       # "replaces your order WR-…" for a replacement, the price otherwise.

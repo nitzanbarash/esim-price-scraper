@@ -262,17 +262,23 @@ def claim(order_id: str) -> bool:
     return bool(r.json().get("claimed"))
 
 
-def report_fulfilled(order_id: str, esim: dict) -> dict:
+def report_fulfilled(order_id: str, esim: dict, supplier_ref: str = "") -> dict:
     """The site's answer ({} when it is not JSON). It matters since 2026-10-20:
     an order the owner settled and REPLACED while this purchase was running
     (or one that already holds another eSIM) answers late_delivery /
     customer_mail:false -- the package is parked as a spare and the customer
-    must not be mailed (fb.site_withholds_mail)."""
+    must not be mailed (fb.site_parked). From 2026-10-21 it also says
+    mail_owed:false when the customer was already mailed for the order.
+
+    supplier_ref: the Stellar order id. A Stellar package has no ICCID, so a
+    parked one is known to the stock shelf by this reference alone."""
     # days_bought: the validity actually delivered, stated outright so the
     # site can say "upgraded from 7 to 30 days" on the order page when the
     # listing bought ran longer than the one sold (site reads it off the plan
     # label too; this is the plain-words copy).
     body = {"order_id": order_id, "status": "fulfilled", "esim": esim}
+    if supplier_ref:
+        body["supplier_ref"] = str(supplier_ref)
     m = re.search(r"(\d+)\s*days?", str(esim.get("plan") or ""))
     if m:
         body["days_bought"] = int(m.group(1))
@@ -765,6 +771,7 @@ class Run:
         self._created: Optional[dict] = None   # the body the purchase answered with
         self._rails: dict = {}                  # order id -> its Purchase cell (rail())
         self.bought = 0
+        self.parked = 0                         # packages the site kept as extras (deliver())
 
     def hdr(self) -> list:
         """The receipts header, read once. The owner reorders these columns
@@ -1169,29 +1176,41 @@ class Run:
             alert_now(f"{oid}: receipts row {n} not updated",
                       f"The eSIM is being handed to the customer now; the sheet row is missing "
                       f"its credentials and its status: {ex}")
-        answer = report_fulfilled(oid, payload)
-        if fb.site_withholds_mail(answer):
+        answer = report_fulfilled(oid, payload, supplier_ref=sid)
+        if fb.site_parked(answer):
+            self.parked += 1
             # The owner settled and REPLACED this order while the package was
             # being bought (a settle from HQ or the Orders screen does not wait
             # for a claim), or the order already holds another eSIM. The site
-            # parked this one as a spare and did not show it; the customer has
+            # parked this one as an extra and did not show it; the customer has
             # the eSIM of the order that replaced it. So: no customer mail, and
             # the row stops reading as a second sale -- it keeps the package's
-            # credentials and its cost (the wallet WAS debited).
+            # credentials and its cost (the wallet WAS debited). The stock
+            # shelf (stock_shelf.py) takes it from the site's extras and sends
+            # the owner's ONE alert about it (2026-10-21) -- so this step only
+            # speaks when the row could not be marked.
             try:
                 changes = fb.mark_row_superseded(self.ws, n)
-                done = "; ".join(f"{h}: '{b}' -> '{a}'" for h, b, a in changes) or "nothing"
+                log.info(f"{oid}: the site kept Stellar order {sid} as an extra -- customer not "
+                         f"mailed; receipts row {n} marked not-a-sale ({len(changes)} change(s))")
             except Exception as ex:                          # noqa: BLE001
-                done = f"NOT marked ({type(ex).__name__}) -- mark it by hand"
-            log.warning(f"{oid}: the site kept Stellar order {sid} as a spare -- customer not mailed")
-            alert_now(f"{oid}: Stellar package kept as a spare -- customer NOT mailed",
-                      f"The site answered that {oid} was already replaced (or already holds a "
-                      f"different eSIM), so Stellar order {sid} was not shown or mailed to the "
-                      f"customer. Receipts row {n} holds it; changed on that row: {done}.\n\n"
-                      f"The wallet was debited. Decide: keep it as spare stock, or ask Stellar "
-                      f"for a refund.")
+                log.warning(f"{oid}: the site kept Stellar order {sid} as an extra; row {n} NOT marked")
+                alert_now(f"{oid}: Stellar package kept as a spare -- its receipts row is NOT marked",
+                          f"The site answered that {oid} was already replaced (or already holds a "
+                          f"different eSIM), so Stellar order {sid} was not shown or mailed to the "
+                          f"customer; it goes to the stock tab by itself. Receipts row {n} holds it "
+                          f"and still reads as a sale ({type(ex).__name__}): set its Status to "
+                          f"'{fb.REPLACED_CHECK_STATUS}', Sell 0, no discount, Mail white.")
             return
         log.info(f"{oid}: delivered from Stellar order {sid}")
+        if answer.get("mail_owed") is False:
+            # The customer's own package, and their mail already went (a run
+            # that delivered, mailed and died before the next step closed the
+            # row): the order is complete; one mail per order.
+            log.info(f"{oid}: the customer was already mailed for this order -- not mailed again")
+            paint_paid(self.ws, n, self.rail(o), self.hdr())
+            self.retire_placeholders(o, n)
+            return
         # Everything past this line is AFTER the customer can install: the mail
         # only because the site now holds the eSIM, the colour because it is a
         # convenience and nobody waits for it.
@@ -1250,57 +1269,85 @@ class Run:
         spent watching an order page for mail that was already written. The
         same send, from the same functions, a minute earlier.
 
-        The safety rules are the fulfillment bot's, unchanged, because they are
-        the ones that stop a second eSIM going out (memory: duplicate-esim-
-        email):
+        The safety rules are the fulfillment bot's, because they are the ones
+        that stop a second eSIM mail going out (memory: duplicate-esim-email),
+        and since 2026-10-21 they are literally the same code: fb.send_once,
+        the one sender every automatic path goes through -- the site's sent
+        stamp, its mail lease, the Sent folder, then the send and the ledger
+        report that hands the lease back.
 
           * NEVER before report_fulfilled. The credentials exist by
             construction here -- settle() only calls deliver() once it has
             them -- and the site holds them before anything is promised.
-          * report_email_sent() closes the order's ledger entry, which is what
-            takes it off `awaiting_email`. Without that the fulfillment bot's
-            sweep, running seconds later in the very next step, would mail the
-            same eSIM again.
-          * A send that fails is NOT retried here and is not reported as
-            anything. The order stays on `awaiting_email`, and the sweep --
-            which asks the Sent folder before it writes a word -- is the retry.
+          * The mailbox is opened only when a mail is actually due, and only
+            once (one IMAP connection is a second or two; most deliveries are
+            the first mail of their order and find nothing in Sent).
+          * A send that fails is NOT retried here. The order stays on
+            `awaiting_email`, and the fulfillment bot's sweep is the retry.
         """
         oid = str(o["order_id"])
         to = str(o.get("customer_email") or "").strip()
+        opened: dict = {}
+
+        def inbox():
+            if "box" not in opened:
+                try:
+                    opened["box"] = fb._open_inbox(attempts=1)
+                except Exception as ex:                       # noqa: BLE001
+                    log.warning(f"{oid}: cannot open the mailbox to check for an earlier send "
+                                f"({type(ex).__name__}) -- the site's stamp and lease still guard it")
+                    opened["box"] = None
+            return opened["box"]
         try:
             if not to:
                 raise ValueError("the site has no address for this order")
             # free / replaces ride on the queue row from 2026-10-20: a gift's
             # mail says "Free", a replacement's says it replaces the old order.
-            fb.send_customer_email(to, oid, str(o.get("order_url") or ""),
-                                   fb._delivery_from_record({**o, "esim": payload}),
-                                   esim=payload, lang=str(o.get("lang") or ""),
-                                   total=o.get("paid_usd"), free=fb.is_free(o),
-                                   replaces=str(o.get("replaces") or ""))
-            if not fb.report_email_sent(oid, True, address=to):
-                # The mail is out but the site does not know: the sweep will ask
-                # the Sent folder before it writes a word, so this is noise, not
-                # a second eSIM -- unless the inbox is down too. Say it.
-                log.warning(f"{oid}: the eSIM email is out but the site did not record it")
-                alert_hourly(f"{oid}: eSIM email sent, ledger not updated",
-                             f"The customer's email went out from the buyer step, but "
-                             f"/api/orders refused the email_sent report. The order is "
-                             f"still on awaiting_email; the sweep checks the Sent folder "
-                             f"before resending. If the inbox is unreachable it could mail "
-                             f"again -- look at {oid}.", self.now)
-            else:
-                log.info(f"{oid}: the eSIM email is out")
+            # The queue row stands in for the facts read: a pending order has
+            # no sent stamp, and the lease covers the minutes since.
+            got = fb.send_once(
+                inbox, oid, to,
+                lambda: fb.send_customer_email(to, oid, str(o.get("order_url") or ""),
+                                               fb._delivery_from_record({**o, "esim": payload}),
+                                               esim=payload, lang=str(o.get("lang") or ""),
+                                               total=o.get("paid_usd"), free=fb.is_free(o),
+                                               replaces=str(o.get("replaces") or "")),
+                by="cloud:stellar", facts=o)
         except Exception as ex:                              # noqa: BLE001
+            got = "failed"
+            log.warning(f"{oid}: the eSIM email did not go out here ({type(ex).__name__})")
+        finally:
+            box = opened.get("box")
+            if box is not None:
+                try:
+                    box.close()
+                except Exception:                            # noqa: BLE001
+                    pass
+        if got == "sent":
+            log.info(f"{oid}: the eSIM email is out")
+        elif got == "unconfirmed":
+            # The mail is out but the site does not know: the sweep asks the
+            # site's lease and the Sent folder before it writes a word, so this
+            # is noise, not a second eSIM -- unless the inbox is down too.
+            log.warning(f"{oid}: the eSIM email is out but the site did not record it")
+            alert_hourly(f"{oid}: eSIM email sent, ledger not updated",
+                         f"The customer's email went out from the buyer step, but "
+                         f"/api/orders refused the email_sent report. The order is "
+                         f"still on awaiting_email; the sweep checks the Sent folder "
+                         f"before resending. If the inbox is unreachable it could mail "
+                         f"again -- look at {oid}.", self.now)
+        elif got == "failed":
             # The address stays out of the log and out of the alert: this repo
             # and its Actions logs are public.
-            log.warning(f"{oid}: the eSIM email did not go out here ({type(ex).__name__}) "
-                        f"-- the delivery sweep still owes it")
+            log.warning(f"{oid}: the eSIM email did not go out here -- the delivery sweep still owes it")
             alert_hourly(f"{oid}: eSIM email not sent by the buyer",
                          f"The eSIM is delivered and the order page works, but this step could "
-                         f"not send the customer's email ({type(ex).__name__}).\n\n"
+                         f"not send the customer's email.\n\n"
                          f"The order is still on the site's awaiting_email list, so the "
                          f"fulfillment bot's sweep sends it -- this is a delay, not a loss.",
                          self.now)
+        else:
+            log.info(f"{oid}: no eSIM email from here ({got})")
 
 
 # -- readiness ---------------------------------------------------------------
@@ -1429,6 +1476,17 @@ def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -
             break
         if orders:
             log.info(f"{len(orders)} Stellar order(s) arrived while this run was working")
+    # A package this run parked (an order replaced while Stellar provisioned
+    # it) goes onto the stock tab now rather than at the fulfillment bot's
+    # next run -- and only then: a run that parked nothing has nothing to
+    # shelve, and the fulfillment bot looks every five minutes anyway. Never
+    # at the cost of the run: that bot shelves it too, whatever happens here.
+    if r.parked:
+        try:
+            import stock_shelf
+            stock_shelf.shelve_extras(getattr(ws, "spreadsheet", None), receipts_ws=ws)
+        except Exception as ex:                              # noqa: BLE001
+            log.warning(f"stock shelf step failed ({type(ex).__name__}) -- the fulfillment bot's run retries it")
     return r.bought
 
 

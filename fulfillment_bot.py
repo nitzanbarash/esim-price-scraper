@@ -400,6 +400,14 @@ class Inbox:
         self._mailed[key] = found
         return found
 
+    def note_sent(self, order_id: str, to: str):
+        """Remember a send made in THIS run. already_mailed_to caches its
+        answer per (order, address), and the answer it cached before the send
+        was "not yet" — a second sender in the same run (the delivery-mail
+        matcher, then the ledger sweep a second later) would have read that
+        stale "not yet" and written again."""
+        self._mailed[(order_id, to.lower())] = True
+
     def flag(self, uid: str):
         self.box.uid("store", uid, "+FLAGS", "(\\Flagged)")
 
@@ -1254,19 +1262,25 @@ def check_stale_pending():
     _mark_alerted(marks)
 
 
-def report_email_sent(order_id: str, ok: bool, error: str = "", address: str = "") -> bool:
+def report_email_sent(order_id: str, ok: bool, error: str = "", address: str = "",
+                      lease: str = "") -> bool:
     """Close (or keep open) this order's ledger entry. True if the site took it.
 
     Retried, because this POST is not bookkeeping — it is what stops the buyer
     being mailed again. A single lost confirmation used to be the whole story
     behind a duplicate eSIM email: the send succeeded, the site never heard so,
     and the next sweep dutifully sent a second copy.
+
+    `lease` (2026-10-21) is the mail lease send_once took: the report hands it
+    back, so the next sender does not wait out its fifteen minutes.
     """
     payload = {"order_id": order_id, "email_sent": bool(ok)}
     if error:
         payload["error"] = error[:300]
     if ok and address:
         payload["customer_email"] = address
+    if lease:
+        payload["lease"] = lease
     last = None
     for attempt in range(1, LEDGER_CONFIRM_ATTEMPTS + 1):
         try:
@@ -1281,6 +1295,130 @@ def report_email_sent(order_id: str, ok: bool, error: str = "", address: str = "
     log.warning(f"order {order_id}: ledger update failed after "
                 f"{LEDGER_CONFIRM_ATTEMPTS} tries: {_redact(str(last))}")
     return False
+
+
+# ── one email per order (2026-10-21) ─────────────────────────────────────────
+# Three senders in this repo can write a customer's "your eSIM is ready" mail
+# — process() on the supplier's delivery mail, deliver_pending_emails() on the
+# site's ledger, and the Stellar buyer the moment it delivers — plus the
+# site's own escalation. Each had its own guard, and process() had none at
+# all: the PC hands a session to the site, the site completes the order, the
+# ledger sweep mails the customer; the supplier's delivery mail lands a run
+# later, matches the still-pending receipts row, and process() mailed the
+# customer AGAIN (G2). The owner's rule since 2026-10-21 is that a second
+# PACKAGE for an order is acceptable and a second EMAIL is not, so every
+# automatic sender now goes through the one function below, with the same
+# four checks in the same order.
+MAIL_LEASE_TTL_S = 900
+
+
+def claim_mail(order_id: str, by: str, ttl_s: int = MAIL_LEASE_TTL_S) -> dict:
+    """Take the site's mail lease for this order (api/orders.js mail_claim).
+
+      {"claim": True, "lease": "..."}            ours: write the mail
+      {"claim": False, "reason": "sent"}          the mail already went
+      {"claim": False, "reason": "claimed"}       another sender is writing it NOW
+      {"claim": False, "reason": "not_owed"}      parked, closed or no eSIM yet
+      {"claim": None, "reason": "..."}            no lease to be had: a site from
+                                                  before 2026-10-21 (400), or the
+                                                  site could not be asked
+
+    The last one is NOT a refusal. A lease that cannot be taken leaves the
+    sent stamp and the Sent folder as the guards, exactly as before the lease
+    existed — withholding the mail because a bookkeeping call failed would
+    trade a duplicate that needs two failures for a no-show that needs one."""
+    try:
+        r = requests.post(ORDERS_URL, json={"action": "mail_claim", "order_id": order_id,
+                                            "by": by, "ttl_s": int(ttl_s)},
+                          timeout=20, headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+        if r.status_code == 400:
+            return {"claim": None, "reason": "old_site"}
+        r.raise_for_status()
+        out = r.json()
+    except Exception as e:
+        log.warning(f"order {order_id}: mail lease not available ({_redact(str(e))}) "
+                    f"- the sent stamp and the Sent folder still guard the mail")
+        return {"claim": None, "reason": "unreachable"}
+    if not isinstance(out, dict) or "claim" not in out:
+        return {"claim": None, "reason": "old_site"}
+    if out.get("claim") is True and out.get("lease"):
+        return {"claim": True, "lease": str(out["lease"])}
+    if out.get("claim") is False:
+        return {"claim": False, "reason": str(out.get("reason") or "claimed"),
+                "by": str(out.get("by") or "")}
+    return {"claim": None, "reason": "old_site"}
+
+
+def send_once(inbox, order_id: str, to: str, send_fn, by: str, facts: dict | None = None) -> str:
+    """Send this order's customer mail AT MOST ONCE, whoever is asking.
+
+    Returns what happened, for the caller's log:
+      'sent'         written and recorded at the site;
+      'unconfirmed'  written, but the site would not record it (the Sent
+                     folder and the lease still stop a second one);
+      'already'      it went before — the site's stamp or the Sent folder;
+      'claimed'      another sender holds the lease and is writing it now;
+      'withheld'     the site says no mail is owed (parked, closed, no eSIM);
+      'failed'       the send itself failed; the ledger keeps it for retry.
+
+    The checks, cheapest and surest first:
+      1. the site's customer_email_sent_ts on `facts` (read here when the
+         caller has not already);
+      2. the mail lease — refused, nothing is written; unavailable (an old
+         site), carry on with the two guards below;
+      3. the Sent folder — what went out is in Sent whatever the site
+         believes (memory: duplicate-esim-email). A Sent folder that cannot
+         be read is "not yet": the lease is the guard then, and a no-show is
+         worse than the duplicate that would need every guard to fail;
+      4. send, then report_email_sent with the lease, which hands it back.
+
+    `inbox` may be an Inbox, None, or a zero-argument callable returning one
+    (the Stellar buyer opens the mailbox only when a mail is due)."""
+    oid = str(order_id or "")
+    if not to:
+        report_email_sent(oid, False, "no customer address on file")
+        log.warning(f"order {oid}: still no customer address - email deferred")
+        return "failed"
+    if facts is None:
+        facts = order_facts(oid)
+    if (facts or {}).get("customer_email_sent_ts"):
+        log.info(f"order {oid}: the site says the customer was already mailed - not sent again")
+        return "already"
+    got = claim_mail(oid, by)
+    if got.get("claim") is False:
+        why = got.get("reason")
+        if why == "sent":
+            log.info(f"order {oid}: already mailed (mail lease: sent) - not sent again")
+            return "already"
+        if why == "not_owed":
+            log.info(f"order {oid}: the site owes this order no mail now - not sent")
+            return "withheld"
+        log.info(f"order {oid}: {got.get('by') or 'another sender'} is writing this mail now - not sent here")
+        return "claimed"
+    lease = got.get("lease") or ""
+    box = inbox() if callable(inbox) else inbox
+    if box is not None and box.already_mailed_to(oid, to):
+        # The buyer has it; only the bookkeeping is behind. Close the entry —
+        # and if even that will not go through, still do not send: a stale
+        # ledger row is cheaper than a second eSIM.
+        if report_email_sent(oid, True, address=to, **({"lease": lease} if lease else {})):
+            log.info(f"order {oid}: already in Sent - ledger closed, not resent")
+        else:
+            log.warning(f"order {oid}: already in Sent but the ledger would not close - still not resending")
+        return "already"
+    try:
+        send_fn()
+    except Exception as e:
+        report_email_sent(oid, False, str(e), **({"lease": lease} if lease else {}))
+        log.warning(f"order {oid}: eSIM email failed, the ledger keeps it for retry: {_redact(str(e))}")
+        return "failed"
+    if box is not None and hasattr(box, "note_sent"):
+        box.note_sent(oid, to)
+    if report_email_sent(oid, True, address=to, **({"lease": lease} if lease else {})):
+        log.info(f"order {oid}: eSIM email delivered (ledger closed)")
+        return "sent"
+    log.warning(f"order {oid}: eSIM email delivered but the site did not record it")
+    return "unconfirmed"
 
 
 def _delivery_from_record(o: dict) -> dict:
@@ -1343,34 +1481,20 @@ def deliver_pending_emails(ws):
         for o in owed:
             oid = str(o.get("order_id", ""))
             to = str(o.get("customer_email", "")).strip() or by_order.get(oid, "")
-            if not to:
-                # Nothing to send to. Keep the entry open and let the site escalate
-                # to the owner — filling the sheet's Mail column repairs it.
-                report_email_sent(oid, False, "no customer address on file")
-                log.warning(f"order {oid}: still no customer address — email deferred")
-                continue
-            if inbox is not None and inbox.already_mailed_to(oid, to):
-                # The buyer has it; only the bookkeeping is behind. Close the
-                # entry — and if even that will not go through, still do not
-                # send: a stale ledger row is cheaper than a second eSIM.
-                if report_email_sent(oid, True, address=to):
-                    log.info(f"order {oid}: already in Sent — ledger closed, not resent")
-                else:
-                    log.warning(f"order {oid}: already in Sent but the ledger would "
-                                f"not close — still not resending")
-                continue
-            try:
-                # free / replaces ride on the awaiting row from 2026-10-20;
-                # an older site sends neither and the mail is as before.
-                send_customer_email(to, oid, str(o.get("order_url", "")),
-                                    _delivery_from_record(o), esim=o.get("esim") or {},
-                                    lang=str(o.get("lang", "")), total=o.get("paid_usd"),
-                                    free=is_free(o), replaces=str(o.get("replaces") or ""))
-                report_email_sent(oid, True, address=to)
-                log.info(f"order {oid}: eSIM email delivered (ledger closed)")
-            except Exception as e:
-                report_email_sent(oid, False, str(e))
-                log.warning(f"order {oid}: eSIM email failed, will retry: {_redact(str(e))}")
+            # Nothing to send to: send_once keeps the entry open and lets the
+            # site escalate to the owner — filling the sheet's Mail column
+            # repairs it. The awaiting row IS the site's fresh word that the
+            # mail has not gone (the list leaves out every stamped order), so
+            # it stands in for the facts read; the lease covers the minutes
+            # since. free / replaces ride on the row from 2026-10-20; an older
+            # site sends neither and the mail is as before.
+            send_once(inbox, oid, to,
+                      lambda o=o, to=to, oid=oid: send_customer_email(
+                          to, oid, str(o.get("order_url", "")), _delivery_from_record(o),
+                          esim=o.get("esim") or {}, lang=str(o.get("lang", "")),
+                          total=o.get("paid_usd"), free=is_free(o),
+                          replaces=str(o.get("replaces") or "")),
+                      by="cloud:sweep", facts=o)
     finally:
         if inbox is not None:
             inbox.close()
@@ -1392,6 +1516,11 @@ def report_fulfilled(order_id: str, delivery: dict, details: dict):
             "networks": delivery.get("network", ""),
         },
     }
+    # Which purchase this is (2026-10-21): the delivery mail's own session. A
+    # site that parks the package records it on the extra; one that serves it
+    # marks that session as the customer's, and watches any other.
+    if m := SESSION_ID_RE.search(str(delivery.get("success_url") or "")):
+        payload["supplier_session"] = m.group(1)
     r = requests.post(ORDERS_URL, json=payload, timeout=20,
                       headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
     r.raise_for_status()
@@ -1400,7 +1529,7 @@ def report_fulfilled(order_id: str, delivery: dict, details: dict):
     except Exception:
         answer = {}
     answer = answer if isinstance(answer, dict) else {}
-    if site_withholds_mail(answer):
+    if site_parked(answer):
         log.warning(f"order {order_id}: the site kept this package as a spare "
                     f"(late_delivery) - the customer is NOT to be mailed")
     else:
@@ -1408,21 +1537,35 @@ def report_fulfilled(order_id: str, delivery: dict, details: dict):
     return answer
 
 
-def site_withholds_mail(answer: dict) -> bool:
-    """The site's answer to a 'fulfilled' report says this package must NOT
-    reach the customer (api/orders.js, 2026-10-20):
+def site_parked(answer: dict) -> bool:
+    """The site's answer to a 'fulfilled' report says it PARKED this package
+    (api/orders.js, 2026-10-20) — it is not the customer's:
 
       * the order was settled and REPLACED by another one, which carries the
-        customer's eSIM — the package is parked on the record as late_esim;
+        customer's eSIM — the package is kept on the record as an extra;
       * the order already holds a DIFFERENT eSIM, which the customer may have
-        installed — the second package is parked the same way, and the first
+        installed — the second package is kept the same way, and the first
         one's mail stays owed on the delivery ledger.
 
-    Either way the mail must not go, and report_email_sent must not be called:
-    in the second case it would close the ledger entry of the eSIM the
-    customer actually needs. An older site answers neither key, and that
-    reads as "go ahead", exactly as before."""
+    This is the question for the RECEIPTS ROW: a parked package's row stops
+    reading as a sale. An older site answers neither key, and that reads as
+    "not parked", exactly as before."""
     return bool(answer.get("late_delivery")) or answer.get("customer_mail") is False
+
+
+def site_withholds_mail(answer: dict) -> bool:
+    """The site's answer says the customer must NOT be mailed for this report:
+    the package was parked (site_parked), or — 2026-10-21 — the mail is simply
+    not owed any more (`mail_owed: false`: it already went, from another
+    sender). Either way the mail must not go, and report_email_sent must not
+    be called: for a parked package it would close the ledger entry of the
+    eSIM the customer actually needs.
+
+    Only the mail. A plain answer with mail_owed:false is the customer's OWN
+    package reported again after the mail went (the delivery mail arriving
+    after the sweep mailed them, G2) — that row is the sale, and treating it
+    like a parked one would zero it."""
+    return site_parked(answer) or answer.get("mail_owed") is False
 
 
 def order_facts(order_id: str) -> dict:
@@ -1443,6 +1586,44 @@ def order_facts(order_id: str) -> dict:
     except Exception as e:
         log.warning(f"order {order_id}: could not read the order's facts: {_redact(str(e))}")
         return {}
+
+
+def site_park_extra(order_id: str, session_id: str, details: dict, via: str,
+                    supplier: str = "esim.dog", supplier_ref: str = "") -> dict:
+    """Tell the site about a package it never saw, for an order that is not its
+    home (api/orders.js extra_package, 2026-10-21): the package of a REPLACED
+    receipts row whose order holds no eSIM it could be. The site keeps it on
+    the order's extras, and the stock shelf (stock_shelf.py) takes it from
+    there — the ONE alert the owner gets about it.
+
+    Returns the site's answer: {"parked": True} — or {"error": "order_waiting"}
+    (the order is still waiting for its eSIM: this package is the customer's,
+    not an extra) / {"error": "is_serving"} (it IS the eSIM on the page) on a
+    409. RAISES when the site cannot be asked, or predates the action (400)."""
+    esim = {"activation_code": details.get("activation_code", ""),
+            "qr_code": details.get("qr_code", ""), "smdp": details.get("smdp", ""),
+            "iccid": details.get("iccid", ""), "apn": details.get("apn", "")}
+    body = {"action": "extra_package", "order_id": order_id, "esim": esim, "via": via,
+            "supplier": supplier}
+    # `sid`, never `session_id`: to a site from before this action, a body
+    # with session_id and no status IS a session handover -- it would put
+    # this package on the customer's page of a failed order. Under `sid` an
+    # old site answers 400, and the owner is told instead.
+    if session_id:
+        body["sid"] = session_id
+    if supplier_ref:
+        body["supplier_ref"] = supplier_ref
+    r = requests.post(ORDERS_URL, json=body, timeout=20,
+                      headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+    if r.status_code == 409:
+        try:
+            out = r.json()
+        except Exception:
+            out = {}
+        return out if isinstance(out, dict) and out.get("error") else {"error": "conflict"}
+    r.raise_for_status()
+    out = r.json()
+    return out if isinstance(out, dict) else {}
 
 
 # ── customer "ready" email (from waverolesupply@gmail.com) ───────────────────
@@ -1668,47 +1849,92 @@ def process(inbox: Inbox, ws, d: dict):
               f"{match['row']} of the receipts sheet has every detail.")
         inbox.flag(uid)
         return
-    if site_withholds_mail(answer):
+    if site_parked(answer):
         # The site has already replaced this order (or it holds another eSIM),
         # so the package just written to row N is a second one for a customer
-        # who paid once. The site parked it as a spare and told the owner; this
-        # side owes two things: no customer mail, and a row that stops reading
-        # as a second sale. The row keeps the eSIM — it is the spare's record.
+        # who paid once. The site parked it on the order's extras; this side
+        # owes two things: no customer mail, and a row that stops reading as a
+        # second sale. The row keeps the eSIM — it is the extra's record, and
+        # stock_shelf.py reads its cost from it when it shelves the package.
+        # No alert from here any more (2026-10-21): the shelf's alert is the
+        # owner's ONE mail about this package. Only a row that could NOT be
+        # marked is worth his attention now, because that row still reads as
+        # a sale in the books.
         try:
             changes = mark_row_superseded(ws, match["row"])
             done = "; ".join(f"{h}: '{b}' -> '{a}'" for h, b, a in changes) or "nothing"
+            log.info(f"order {order_id}: second package parked by the site; receipts row "
+                     f"{match['row']} marked not-a-sale ({len(changes)} change(s))")
         except Exception as e:
             done = f"NOT marked ({_redact(str(e))}) - mark it by hand"
-        alert(f"Order {order_id}: package kept as a spare - customer NOT mailed",
-              f"The site answered that order {order_id} was already replaced, or "
-              f"already holds a different eSIM, so this delivery was not shown or "
-              f"mailed to the customer.\n\nReceipts row {match['row']} holds the "
-              f"package. Changed on that row: {done}.\n\nDecide: spare-stock "
-              f"shelf, or a supplier refund.")
+            alert(f"Order {order_id}: second package parked - its receipts row is NOT marked",
+                  f"The site answered that order {order_id} was already replaced, or already "
+                  f"holds a different eSIM, so this delivery was not shown or mailed to the "
+                  f"customer. It goes to the stock shelf by itself.\n\nReceipts row "
+                  f"{match['row']} holds the package and still reads as a sale: {done}.\n\n"
+                  f"Set its Status to '{REPLACED_CHECK_STATUS}', Sell 0, no discount, Mail white.")
         inbox.flag(uid)
         log.info(f"order {order_id}: late package parked (row {match['row']})")
         return
+    if answer.get("mail_owed") is False:
+        # The customer's OWN package, reported again after their mail already
+        # went: the PC handed the session, the site completed the order, the
+        # ledger sweep mailed them — and the supplier's delivery mail landed a
+        # run later and matched the still-pending row (G2, 2026-10-21). The row
+        # is the sale and is now complete; the mail is not owed again.
+        inbox.flag(uid)
+        log.info(f"order {order_id} COMPLETED (row {match['row']}) - the customer was already "
+                 f"mailed, not mailed again")
+        return
     # The buyer's email is now tracked in the site's delivery ledger (opened by
-    # report_fulfilled above). Send it right away for speed, but a failure here
-    # is no longer the end of the road: the entry stays open, deliver_pending_
-    # emails retries it every run, and the site escalates on its own. No alert
-    # from here — that would fire on every transient SMTP hiccup.
+    # report_fulfilled above). Send it right away for speed, through the one
+    # sender that sends an order's mail at most once (send_once): a failure
+    # here is not the end of the road, deliver_pending_emails retries it every
+    # run and the site escalates on its own. No alert from here — that would
+    # fire on every transient SMTP hiccup.
     to = match.get("customer_email", "")
     # The receipts row cannot say whether this order is a gift or replaces an
     # earlier one; the site's record can (one read, and only on this path —
-    # the sweep's rows already carry both).
+    # the sweep's rows already carry both). The same read carries the sent
+    # stamp send_once checks first.
     facts = order_facts(order_id)
-    try:
-        send_customer_email(to, order_id, match.get("order_url", ""), d, esim=details,
-                            free=is_free(facts) if facts else None,
-                            replaces=str(facts.get("replaces") or ""))
-        report_email_sent(order_id, True, address=to)
-    except Exception as e:
-        report_email_sent(order_id, False, str(e))
-        log.warning(f"order {order_id}: eSIM email failed, ledger keeps it "
-                    f"for retry: {_redact(str(e))}")
+    send_once(inbox, order_id, to,
+              lambda: send_customer_email(to, order_id, match.get("order_url", ""), d, esim=details,
+                                          free=is_free(facts) if facts else None,
+                                          replaces=str(facts.get("replaces") or "")),
+              by="cloud:delivery", facts=facts)
     inbox.flag(uid)
     log.info(f"order {order_id} COMPLETED (row {match['row']})")
+
+
+def sale_cells_from_facts(facts: dict, values: list | None = None, hdr: list | None = None) -> dict:
+    """The Sell, Sale and Purchase cells of an order's sale row, rebuilt from
+    the site's own record of it ({paid_usd, list_usd, source, free, replaces}
+    from order_facts) — in the very spelling the buyers write them: the Sell
+    as '6.99$', the Sale as the PC bot's and the Stellar buyer's discount text
+    ('-' for none), the Purchase as the rail (or the replaced order's rail, or
+    'free' for a gift; stellar_buyer.rail_for). For a row whose sale has to be
+    written back with no live row to copy it from (G4). {} when the record
+    says nothing: a cell left as it was beats a cell guessed."""
+    import stellar_buyer as sb      # here, not at the top: stellar_buyer imports this module
+    facts = facts or {}
+    out = {}
+    free = is_free(facts)
+    try:
+        paid = float(facts.get("paid_usd")) if facts.get("paid_usd") not in (None, "") else None
+    except (TypeError, ValueError):
+        paid = None
+    if free:
+        out[H_SELL] = "0.00$"
+    elif paid is not None and paid > 0:
+        out[H_SELL] = f"{paid:.2f}$"
+        if sale := sb.discount_text(facts.get("list_usd"), paid):
+            out[H_SALE] = sale
+    rail = sb.rail_for(facts, values or [], hdr or [],
+                       site_source=lambda old: order_facts(old).get("source"))
+    if rail and rail != sb.SOURCE_UNKNOWN:
+        out[H_PURCHASE] = rail
+    return out
 
 
 def _late_alert_body(late: dict, d: dict) -> str:
@@ -1750,17 +1976,62 @@ def handle_replaced_delivery(inbox, ws, d: dict, late: dict):
         owner.
     The customer is never mailed from here: when this package is theirs, they
     have had it since the site completed the order, and the delivery ledger
-    owns that mail."""
+    owns that mail.
+
+    A spare (2026-10-21) is no longer only an alert asking the owner to shelve
+    it by hand: it is reported to the site as an extra of its order
+    (site_park_extra), and stock_shelf.py puts it on the stock tab and sends
+    the ONE alert about it. Only a spare that cannot be reported — no order
+    number on the row, a site that cannot be asked or predates the action —
+    still alerts from here."""
     uid, oid = d["uid"], str(late.get("order_id") or "").strip()
     age = datetime.now(timezone.utc) - d["received_at"]
     head = _late_alert_body(late, d)
+    got_details: dict = {}
 
-    def spare(why: str):
+    def details_of() -> dict:
+        if not got_details:
+            got_details.update(fetch_esim_details(d.get("success_urls") or [d["success_url"]]) or {})
+            if got_details.get("used_url"):
+                d["success_url"] = got_details["used_url"]
+        return got_details
+
+    def spare_alert(why: str, extra: str = ""):
         alert(f"Order {oid or '?'}: a package arrived for a REPLACED order",
               head + why + "\n\nNOTHING was sent to the customer and nothing was written "
-              "to the sheet or the site.\n\nThe package is real and paid for: put it on the "
-              f"spare-stock shelf, or ask the supplier for a refund. If row {late['row']} says "
-              "Buy 0, the charge was booked as not made - put the cost back.")
+              "to the sheet." + extra + "\n\nThe package is real and paid for: put it on the "
+              f"spare-stock shelf (python -m bot.spares add {late['row']}), or ask the supplier for "
+              f"a refund. If row {late['row']} says Buy 0, the charge was booked as not made - put "
+              "the cost back.")
+        inbox.flag(uid)
+
+    def spare(why: str):
+        if not oid:
+            spare_alert(why)
+            return
+        det = details_of()
+        if not (det.get("activation_code") or det.get("iccid")):
+            undecided("the supplier's page did not give this package's details yet")
+            return
+        m = SESSION_ID_RE.search(str(d.get("success_url") or ""))
+        try:
+            ans = site_park_extra(oid, m.group(1) if m else "", det, via="cloud:replaced-row")
+        except Exception as e:
+            spare_alert(why, f" The site could not be told about it ({_redact(str(e))}), so it is "
+                             "NOT on the order's extras and will not reach the stock shelf by itself.")
+            return
+        if ans.get("error") == "order_waiting":
+            undecided(f"the site says {oid} is still waiting for its eSIM, so this package may be "
+                      f"the customer's")
+            return
+        if ans.get("error"):
+            spare_alert(why, f" The site refused it as an extra ('{ans.get('error')}')"
+                             + (" - it says this IS the eSIM on the customer's page, so it must "
+                                "never be shelved: compare the rows by hand."
+                                if ans.get("error") == "is_serving" else "."))
+            return
+        log.info(f"order {oid}: the package of replaced row {late['row']} is parked on the site as "
+                 f"an extra ({why.split('.')[0]}) - the stock shelf takes it from there")
         inbox.flag(uid)
 
     def undecided(why: str):
@@ -1807,9 +2078,7 @@ def handle_replaced_delivery(inbox, ws, d: dict, late: dict):
         undecided("the site predates the 2026-10-20 second-package guard, and reporting a "
                   "different eSIM to it would replace the one on the customer's page")
         return
-    details = fetch_esim_details(d.get("success_urls") or [d["success_url"]])
-    if details.get("used_url"):
-        d["success_url"] = details["used_url"]
+    details = details_of()
     if not details.get("activation_code"):
         # The site compares by activation code (it always holds one when
         # esim_ready); without ours the comparison would prove nothing, and
@@ -1821,9 +2090,13 @@ def handle_replaced_delivery(inbox, ws, d: dict, late: dict):
     except Exception as e:
         undecided(f"the site report failed ({_redact(str(e))})")
         return
-    if site_withholds_mail(answer):
-        spare(f"The site holds a DIFFERENT eSIM for {oid} - the one the customer has - and "
-              f"kept this one aside as a spare (late_esim).")
+    if site_parked(answer):
+        # The site holds a DIFFERENT eSIM for the order — the one the customer
+        # has — and kept this one as an extra: the shelf takes it, and its
+        # alert is the owner's one mail about it.
+        log.info(f"order {oid}: the package of replaced row {late['row']} is NOT the customer's; "
+                 f"the site parked it as an extra - the stock shelf takes it from there")
+        inbox.flag(uid)
         return
 
     # The site already held THIS package: it is the customer's eSIM. Row
@@ -1840,11 +2113,25 @@ def handle_replaced_delivery(inbox, ws, d: dict, late: dict):
         for name in (H_SELL, H_SALE, H_PURCHASE):
             if name in hdr and hdr.index(name) < len(src) and src[hdr.index(name)].strip():
                 sale[name] = src[hdr.index(name)].strip()
+    src_note = f"from row {live[0]}" if sale else ""
+    if not sale:
+        # No live row to take the sale from (G4, 2026-10-21): the second
+        # package's delivery mail was processed FIRST, its row was marked as
+        # the parked spare, and by the time this one's mail arrived there was
+        # no row left reading as the sale. The site's record of the order
+        # still says what the customer paid, how, and at what list price.
+        try:
+            sale = sale_cells_from_facts(facts, ws.get_all_values(), hdr)
+        except Exception as e:                      # a label, never the swap
+            log.warning(f"order {oid}: could not rebuild the sale from the site: {_redact(str(e))}")
+            sale = {}
+        sale = {k: v for k, v in sale.items() if k in hdr}
+        src_note = "from the site's record of the order"
     if sale:
         ws.update_cells([gspread.Cell(n, hdr.index(k) + 1, v) for k, v in sale.items()],
                         value_input_option="USER_ENTERED")
         notes.append(f"row {n}: eSIM filled in, Status active, "
-                     + ", ".join(f"{k} '{v}'" for k, v in sale.items()) + f" (from row {live[0]})")
+                     + ", ".join(f"{k} '{v}'" for k, v in sale.items()) + f" ({src_note})")
     else:
         notes.append(f"row {n}: eSIM filled in, Status active - its Sell is NOT restored "
                      f"(no live row to take it from): type what the customer paid")
@@ -1911,6 +2198,7 @@ def _needs_a_human(e: Exception) -> bool:
 
 def main():
     ws = None
+    book = None
     mail_error = None
     try:
         inbox = _open_inbox()
@@ -1918,7 +2206,8 @@ def main():
             deliveries = inbox.unprocessed()
             log.info(f"{len(deliveries)} unprocessed delivery email(s)")
             if deliveries:
-                ws = sheet_client().open_by_key(RECEIPTS_SHEET_ID).sheet1
+                book = sheet_client().open_by_key(RECEIPTS_SHEET_ID)
+                ws = book.sheet1
             for d in deliveries:
                 try:
                     process(inbox, ws, d)
@@ -1943,10 +2232,21 @@ def main():
     # just failed above gets a second chance in this same run.
     try:
         if ws is None:
-            ws = sheet_client().open_by_key(RECEIPTS_SHEET_ID).sheet1
+            book = sheet_client().open_by_key(RECEIPTS_SHEET_ID)
+            ws = book.sheet1
         deliver_pending_emails(ws)
     except Exception as e:
         log.error(f"delivery ledger sweep failed: {_redact(str(e))}")
+
+    # Second packages onto the stock shelf (2026-10-21). After the mail, never
+    # before it: a customer waiting for their eSIM comes first, a spare can
+    # wait five minutes. One GET when there is nothing to shelve.
+    try:
+        import stock_shelf
+        if book is not None:
+            stock_shelf.shelve_extras(book, receipts_ws=ws)
+    except Exception as e:
+        log.error(f"stock shelf step failed: {_redact(str(e))}")
 
     # The purchase-side net: a paid order still 'pending' means NOTHING is
     # buying it (PC off, bot dead, stuck ledger claim). Independent of the

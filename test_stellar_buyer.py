@@ -259,6 +259,36 @@ NOW_TOP = datetime(2026, 9, 10, 4, 1, tzinfo=fb.TZ)     # alerts pass
 NOW_MID = datetime(2026, 9, 10, 4, 30, tzinfo=fb.TZ)    # hourly alerts held
 
 
+class FakeMailbox:
+    """The fulfillment bot's mailbox, as the buyer's send_once sees it: what is
+    already in Sent (2026-10-21: the buyer checks Sent before it writes), and
+    whether the run closed it. Never a network connection."""
+    def __init__(self, sent=()):
+        self.sent = {(o, a.lower()) for o, a in sent}
+        self.closed = False
+        self.asked = []
+
+    def already_mailed_to(self, order_id, to):
+        self.asked.append(order_id)
+        return (order_id, to.lower()) in self.sent
+
+    def note_sent(self, order_id, to):
+        self.sent.add((order_id, to.lower()))
+
+    def close(self):
+        self.closed = True
+
+
+mailboxes: list = []            # every mailbox a run opened, in order
+mailbox_sent: list = []         # (order_id, address) pairs already in Sent for the next run
+
+
+def fake_open_inbox(attempts=1):
+    box = FakeMailbox(mailbox_sent)
+    mailboxes.append(box)
+    return box
+
+
 def scenario(orders, stellar: StellarFake, ws: Ws | None = None, rows=None, claim_by="", now=NOW_TOP,
              plans=PLANS, settle_wait=5, fail_report=False, site=None):
     """Wire the fakes in, run once, hand everything back."""
@@ -268,7 +298,9 @@ def scenario(orders, stellar: StellarFake, ws: Ws | None = None, rows=None, clai
     mails.clear()
     sleeps.clear()
     downloads.clear()
+    mailboxes.clear()
     sb.fb.send_customer_email = fake_send
+    sb.fb._open_inbox = fake_open_inbox
     sb.requests.get, sb.requests.post = site.get, site.post
     def _fetch(key):
         downloads.append(key)
@@ -1204,7 +1236,23 @@ check("...but is no longer a sale",
       and ws36.col(2, sb.H_SALE) == "", f"{ws36.col(2, sb.H_STATUS)} {ws36.col(2, sb.H_SELL)}")
 check("no green paint - the Mail cell is set WHITE (a spare banked no money)",
       ws36.formats == [("A2", {"backgroundColor": fb.WHITE_BG})], str(ws36.formats))
-check("the owner is told once", len(alerts) == 1 and "spare" in alerts[0][0], str(alerts))
+# 2026-10-21: the site keeps the package as an extra and the stock shelf
+# (stock_shelf.py) puts it on the stock tab with the owner's ONE alert about
+# it. A second "kept as a spare" mail from here would be two mails for one
+# package -- so this step says nothing when the row was marked.
+check("the owner is NOT mailed from here (the stock shelf's alert is the one)", alerts == [], str(alerts))
+
+
+class FormatFails(Ws):
+    def update_cells(self, cells, value_input_option=None):
+        if any(c.value == fb.REPLACED_CHECK_STATUS for c in cells):
+            raise RuntimeError("Sheets said no")
+        return super().update_cells(cells, value_input_option)
+
+
+site, ws36b, _, _ = scenario([order()], StellarFake(), site=LateSite([order()]), ws=FormatFails())
+check("...but a row that could NOT be marked still reads as a sale, and that is told, once",
+      len(alerts) == 1 and "NOT marked" in alerts[0][0] and mails == [], str(alerts))
 
 print("\n37. an esim.dog placeholder re-bought on Stellar is not counted twice (review 2026-10-20)")
 # rebuy_order.py 's': the esim.dog checkout of WR-TEST01 ended uncertain (a
@@ -1246,6 +1294,71 @@ check("the buyer's own Stellar attempts are never retired (they settle themselve
 print("   ...a Stellar order that FAILS leaves the esim.dog row the sale")
 _, ws37b, _, _ = scenario([order()], StellarFake(statuses=("failed",)), ws=Ws([dog_row]))
 check("nothing delivered, the placeholder untouched", ws37b.rows[1] == dog_row, str(ws37b.rows[1]))
+
+
+print("\n38. one email per order: the buyer's mail goes through fb.send_once (2026-10-21)")
+# The site's mail lease, its sent stamp and the Sent folder -- the same four
+# checks every automatic sender makes, so a Stellar delivery can never mail a
+# customer a second time for one order.
+
+
+class LeaseSite(Site):
+    """A site that hands out (or refuses) the mail lease."""
+    def __init__(self, orders, answer, fulfilled=None):
+        super().__init__(orders)
+        self.answer, self.fulfilled = answer, fulfilled
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        if json and json.get("action") == "mail_claim":
+            self.posts.append(dict(json))
+            return Resp(200, dict(self.answer))
+        if json and json.get("status") == "fulfilled" and self.fulfilled is not None:
+            self.posts.append(dict(json))
+            return Resp(200, dict(self.fulfilled))
+        return super().post(url, json=json, headers=headers, timeout=timeout)
+
+
+site, _, _, _ = scenario([order()], StellarFake(),
+                         site=LeaseSite([order()], {"ok": True, "claim": True, "lease": "cloud:stellar#ab12"}))
+claims = [p for p in site.posts if p.get("action") == "mail_claim"]
+sent = [p for p in site.posts if p.get("email_sent") is True]
+check("the lease is asked for, as cloud:stellar, before the mail", len(claims) == 1 and claims[0]["by"] == "cloud:stellar"
+      and site.posts.index(claims[0]) < site.posts.index(sent[0]), str(site.posts))
+check("...the mail goes once and the ledger report hands the lease back",
+      len(mails) == 1 and len(sent) == 1 and sent[0].get("lease") == "cloud:stellar#ab12", str(sent))
+check("...the mailbox was opened once, asked, and closed",
+      len(mailboxes) == 1 and mailboxes[0].asked == ["WR-TEST01"] and mailboxes[0].closed, str(len(mailboxes)))
+fulfilled_posts = site.reports("fulfilled")
+check("the site is told WHICH Stellar order it is (supplier_ref) - a parked one has no ICCID",
+      fulfilled_posts and fulfilled_posts[0].get("supplier_ref") == "so-1", str(fulfilled_posts[:1]))
+
+site, _, _, _ = scenario([order()], StellarFake(),
+                         site=LeaseSite([order()], {"ok": True, "claim": False, "reason": "claimed", "by": "cloud:sweep"}))
+check("another sender holding the lease: no mail from here, no ledger report",
+      mails == [] and not [p for p in site.posts if "email_sent" in p] and alerts == [], str(site.posts))
+
+site, _, _, _ = scenario([order()], StellarFake(),
+                         site=LeaseSite([order()], {"ok": True, "claim": False, "reason": "sent", "sent_ts": "x"}))
+check("the site says the mail already went: no mail", mails == [] and not mailboxes, str(mails))
+
+mailbox_sent.append(("WR-TEST01", "buyer@example.com"))
+try:
+    site, _, _, _ = scenario([order()], StellarFake())
+finally:
+    mailbox_sent.clear()
+check("already in Sent (a lost confirmation): no second mail, the ledger is closed instead",
+      mails == [] and [p for p in site.posts if p.get("email_sent") is True], str(site.posts))
+
+site, ws38, _, _ = scenario([order()], StellarFake(),
+                            site=LeaseSite([order()], {"ok": True}, fulfilled={"ok": True, "status": "fulfilled",
+                                                                                "mail_owed": False}))
+check("the site says the customer was already mailed for this order: no mail, the row is still the sale",
+      mails == [] and not [p for p in site.posts if p.get("action") == "mail_claim"]
+      and ws38.col(2, sb.H_STATUS) == sb.ST_ACTIVE and ws38.col(2, sb.H_SELL) == "6.99$",
+      f"{mails} {ws38.col(2, sb.H_STATUS)}")
+
+site, _, _, _ = scenario([order()], StellarFake())
+check("an older site (no lease in the answer) still mails, once", len(mails) == 1, str(mails))
 
 
 # ── summary (last, so it gates the exit code) ────────────────────────────────
