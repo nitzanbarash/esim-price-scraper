@@ -47,7 +47,7 @@ import json
 import re
 import sys
 
-from fulfillment_bot import RECEIPTS_SHEET_ID, sheet_client
+from bot_common import RECEIPTS_SHEET_ID, sheet_client
 
 COL_SOURCE = "מקור - source"
 COL_SELL = "מכירה - Sell"
@@ -85,7 +85,7 @@ STATUS_DONE = "#c9ddf4"     # נוצל / הסתיים
 STATUS_FAULT = "#ffeda8"    # תקלה
 STATUS_WORDS = ("פעיל", "נוצל", "הסתיים", "תקלה")
 # A row closed as replaced by another order (the bots write
-# fulfillment_bot.REPLACED_STATUS / REPLACED_CHECK_STATUS; matched by prefix, so
+# bot_common.REPLACED_STATUS / REPLACED_CHECK_STATUS; matched by prefix, so
 # a note the owner appends still counts). Grey on BOTH Status and Sell: its Sell
 # is 0 on purpose, and the red a 0 Sell normally earns means "money lost", which
 # this row is not (owner, 2026-10-21). "Replaced - check the charge" (Buy kept:

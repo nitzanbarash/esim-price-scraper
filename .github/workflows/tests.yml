@@ -145,3 +145,8 @@ jobs:
       # rewrites nothing — a rule duplicated every 4 hours would pile up.
       - name: Receipts colours
         run: python test_receipts_colors.py
+
+      # The jobs the update network ships to the PCs reach no buying code
+      # (bot_common.py holds what they share with fulfillment_bot).
+      - name: Shared helpers, no buyer
+        run: python test_bot_common.py

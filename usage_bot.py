@@ -58,7 +58,7 @@ import gspread
 import requests
 
 import stellar_usage
-from fulfillment_bot import (
+from bot_common import (
     ORDERS_URL, RECEIPTS_SHEET_ID, TZ, alert, env, fetch_esim_details,
     fetch_usage, is_replaced_status, sheet_client, _redact, _row_time,
 )
