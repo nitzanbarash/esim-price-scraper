@@ -47,6 +47,18 @@ jobs:
       - name: Price fallback
         run: python test_price_fallback.py
 
+      # Which regional plan a row is on is which countries the customer is
+      # promised. A plan esim.dog widened once moved two Asia rows to another
+      # product overnight (2026-10-23); this pins that it never happens again
+      # — not to a bigger plan that holds our countries either.
+      - name: Regional plan growth
+        run: python test_region_plan_growth.py
+
+      # A package the owner took off sale by hand stays off: the scrape used
+      # to rewrite the stock cell the next morning (Asia 1GB, 2026-10-23).
+      - name: Owner hold
+        run: python test_owner_hold.py
+
       # The books decide what the business believes it earned. The money logic
       # is pure, so there is no excuse for finding out it is wrong from a
       # nightly run that already wrote the numbers down.

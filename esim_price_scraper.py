@@ -322,6 +322,39 @@ OVER_CEILING_LABEL = 'לא רווחי — מעל תקרה'
 UNPROFITABLE_LABEL = 'לא רווחי'
 REGIONAL_CODE_RE = re.compile(r'^\d+\.0[A-Z]?\.')
 
+# The owner's own hold (2026-10-23, Asia 1GB: "שפשוט ירד מהמלאי בינתיים"). A
+# stock cell that starts with these words was typed by the owner to take the
+# row off the site whatever it costs. The row is still read and priced, but
+# this run never rewrites that cell — choose_supplier.py, stellar_prices.py
+# and the sheet's applyFee_ already keep an owner's word, and this run was
+# the one that wiped it the next morning. Deleting the word puts the row back
+# on sale at once; a verdict the bot reached meanwhile (out of stock, route
+# refused) was only in J, and the next scrape writes it again.
+OWNER_HOLD_LABEL = 'מושבת ידנית'
+# The margin words: no news to the owner while the row is held anyway.
+PROFIT_WORDS = frozenset({UNPROFITABLE_LABEL, OVER_CEILING_LABEL, ''})
+_BIDI_MARKS = re.compile("[\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def owner_hold(stock_cell) -> bool:
+    """Whether a stock cell carries the owner's hold (OWNER_HOLD_LABEL)."""
+    return _BIDI_MARKS.sub("", str(stock_cell or "")).strip().startswith(OWNER_HOLD_LABEL)
+
+
+def drop_held_stock_writes(updates: List[Dict], stock_letter: str, held) -> List[Dict]:
+    """The pending cell writes minus every write to a held row's stock cell.
+
+    A range is that cell only when it is the stock column's letter followed by
+    digits alone ('Q12' — never 'QA12' when the column is Q)."""
+    keep = []
+    for u in updates:
+        rng = u['range']
+        tail = rng[len(stock_letter):] if rng.startswith(stock_letter) else ''
+        if tail.isdigit() and int(tail) in held:
+            continue
+        keep.append(u)
+    return keep
+
 # How long the scrape may run before it stops itself and saves what it has.
 # The workflow allows more than this, deliberately: a run killed from OUTSIDE
 # dies at an arbitrary point with nothing able to report what it skipped,
@@ -537,6 +570,80 @@ def parse_coverage_codes(text: str) -> List[str]:
         if c not in out:
             out.append(c)
     return out
+
+
+# How many countries esim.dog may add to the PINNED plan and it is still ours.
+# Asia Mini gained one (the Philippines) on 2026-10-23. A pinned id that now
+# carries many more is more likely a different product behind the old id than
+# our plan grown, and the row is left for the owner to look at.
+REGION_GROWTH_MAX_ADDED = 3
+
+
+def region_pin_verdict(pinned_count: int, pinned_isos, want: Optional[int], want_isos) -> str:
+    """What to do with the plan a pinned link (…&plan=rp_…) opened on.
+
+    'keep'   — the count the sheet asks for, or the sheet names no count.
+    'grew'   — a count up to REGION_GROWTH_MAX_ADDED above the sheet's, and
+               every country the sheet sells is still in it: esim.dog
+               widened OUR plan (same id), so the row stays on it. Asia Mini
+               gained the Philippines on 2026-10-23 (12 → 13); a count-only
+               test went back to the list, took the one other 12-country card
+               — China and Cambodia in, Australia and New Zealand out — and
+               10GB went from $6.81 to $19.99 and off the site. The panel
+               holding exactly the sheet's countries under a new count is the
+               same verdict: the id and the countries agree, the count lags.
+    'search' — anything else: back to the list. Without the sheet's
+               countries (or the panel's) nothing says the plan only grew.
+    """
+    if want is None or pinned_count == want:
+        return 'keep'
+    want_set, got = set(want_isos or ()), set(pinned_isos or ())
+    # Bounded on the CARD's count, not the panel's: a panel can lag its card
+    # (the new country without its bullet line yet), and a lagging panel
+    # behind an 18-country card must not pass for a plan that gained one.
+    # A smaller count is never growth, whatever the panel still lists.
+    if (want_set and got and got >= want_set
+            and want < pinned_count <= want + REGION_GROWTH_MAX_ADDED
+            and len(got - want_set) <= pinned_count - want):
+        return 'grew'
+    return 'search'
+
+
+def region_search_order(plans: List[Dict], want: int, want_isos) -> List[Dict]:
+    """The cards to open, in order: the sheet's count, cheapest first.
+
+    Each is opened and kept only when it carries exactly the sheet's
+    countries (region_coverage_accepts) — even when ONE card has the count:
+    one card is not proof it is ours (Asia 1GB and 10GB each had a single
+    12-country card once ours became 13 — the wrong one).
+
+    Never a bigger card. esim.dog's regional plans nest — Asia Grande holds
+    every Mini country — so "a bigger card that holds our countries" is as
+    often another product as ours under a new id, and nothing on the page
+    tells the two apart. Growth is accepted on the pinned id alone
+    (region_pin_verdict); off the pin, no exact match leaves the row as it is.
+
+    Without the sheet's countries there is nothing to compare: the cheapest
+    card with the count alone, as before.
+    """
+    exact = sorted((p for p in plans if p['countries'] == want), key=lambda p: p['price'])
+    return exact if set(want_isos or ()) else exact[:1]
+
+
+def region_coverage_accepts(got_isos, want_isos) -> bool:
+    """Whether an opened card's panel lists exactly the sheet's countries."""
+    got, want_set = set(got_isos or ()), set(want_isos or ())
+    if not want_set:
+        return True
+    return bool(got) and got == want_set
+
+
+def region_growth_note(old_count: int, new_count: int, added) -> str:
+    """The J-column line for a pinned plan whose count esim.dog changed."""
+    extra = ",".join(added)
+    return (f"📈 מספר המדינות בחבילה השתנה אצל הספק: {old_count} → {new_count}"
+            + (f" (נוספו: {extra})" if extra else "")
+            + f" — נשארה אותה חבילה, הווריאנט עודכן ל־{new_count}")
 
 
 def force_fixed_gb_tab(url: str) -> str:
@@ -1081,12 +1188,35 @@ class ESIMScraper:
 
         # A pinned link (…&plan=rp_…) opens with its card selected and no
         # list. The count the sheet asks for → that is the plan, read as it
-        # stands. Any other count → esim.dog changed what the id points at;
-        # back to the list, exactly as if the id were not there (a dead id
-        # the page drops by itself, and the list paints as usual).
-        chosen, opened = None, False
+        # stands. Another count that still holds every one of the sheet's
+        # countries → esim.dog widened OUR plan, and the row stays on it
+        # (region_pin_verdict). Anything else → esim.dog changed what the id
+        # points at; back to the list, exactly as if the id were not there
+        # (a dead id the page drops by itself, and the list paints as usual).
+        want_isos = set(parse_coverage_arg(coverage))
+        chosen, opened, grew = None, False, None
         pre = await self.preselected_region_plan(page)
-        if pre is not None and (want is None or pre['countries'] == want):
+        verdict = 'search'
+        if pre is not None:
+            pinned_isos = (await self.selected_plan_coverage(page)
+                           if want is not None and pre['countries'] != want else [])
+            verdict = region_pin_verdict(pre['countries'], pinned_isos, want, want_isos)
+            if verdict == 'grew':
+                grew = (want, pre['countries'], [c for c in pinned_isos if c not in want_isos])
+                print(f"  📈 Pinned plan grew {want} → {pre['countries']} countries "
+                      f"(+{','.join(grew[2])}) and still covers the sheet's — keeping it")
+        if verdict == 'search' and pre is not None and not want_isos:
+            # The pinned plan's count moved and the sheet has no country list
+            # to say whether it only grew. The cheapest card with the old
+            # count is how 1GB and 10GB left Asia Mini on 2026-10-23 — so a
+            # pinned row is left as it is; only an unpinned row is picked by
+            # count alone.
+            print(f"  ⚠️  Pinned plan shows {pre['countries']} countries, the sheet wants {want} "
+                  f"and lists none — the row is left as it is")
+            return dict(empty, note=f"מספר המדינות בחבילה הנעוצה השתנה ({want} → {pre['countries']}) "
+                                    f"ואין רשימה בעמודת 'מדינות בחבילה' להשוות — "
+                                    f"השורה לא הוחלפה, לבדוק ידנית")
+        if verdict != 'search':
             chosen, opened = pre, True
         else:
             if pre is not None:
@@ -1098,31 +1228,36 @@ class ESIMScraper:
             if not plans:
                 return dict(empty, note='No plans found on region page')
             if want is not None:
-                matches = sorted((p for p in plans if p['countries'] == want),
-                                 key=lambda p: p['price'])
-                if matches:
-                    chosen = matches[0]
-                # Several cards with the count, and the sheet knows which
-                # countries it sells: open them cheapest first and keep the
-                # one with THOSE countries. Cheapest-by-count alone would
-                # quietly move the row to another plan (Asia 10GB has two
-                # 12-country cards) and the site would follow it.
-                want_isos = set(parse_coverage_arg(coverage))
-                if want_isos and len(matches) > 1:
-                    for cand in matches:
+                order = region_search_order(plans, want, want_isos)
+                if not want_isos:
+                    chosen = order[0] if order else None
+                else:
+                    # The sheet knows which countries it sells: open the
+                    # candidates and keep the card with THOSE countries, even
+                    # when only one card has the count. Cheapest-by-count
+                    # quietly moved Asia 1GB and 10GB to another plan on
+                    # 2026-10-23, and the site followed it.
+                    for cand in order:
                         try:
                             await self.open_region_plan(page, cand)
                             await page.wait_for_timeout(2500)
                         except Exception:
                             continue
-                        if set(await self.selected_plan_coverage(page)) == want_isos:
+                        got = await self.selected_plan_coverage(page)
+                        if region_coverage_accepts(got, want_isos):
                             chosen, opened = cand, True
                             break
                         await self.choose_another(page)
                         await self.expand_region_plans(page)
-                    else:
-                        print(f"  ⚠️  No {want}-country card covers the sheet's countries — "
-                              f"cheapest by count; 'מדינות בחבילה' will be rewritten")
+                    if chosen is None:
+                        # Never move the row to another product: no price, so
+                        # the row keeps its link, price and stock, and J says
+                        # why. The purchase bot's own country check still
+                        # stands guard over the pinned link.
+                        options = ", ".join(f"{p['countries']} מדינות ${p['price']:.2f}" for p in plans)
+                        print(f"  ⚠️  No card carries the sheet's countries — the row is left as it is")
+                        return dict(empty, note=f"אין חבילה עם המדינות שבעמודת 'מדינות בחבילה' — "
+                                                f"השורה לא הוחלפה, לבדוק ידנית. {len(plans)} חבילות: {options}")
             if chosen is None:
                 options = ", ".join(f"{p['countries']} מדינות ${p['price']:.2f}" for p in plans)
                 return dict(empty, note=f"בחר וריאנט (מספר מדינות) בעמודת 'וריאנט (אזורי)' — "
@@ -1145,6 +1280,17 @@ class ESIMScraper:
         coverage = await self.selected_plan_coverage(page)
         if coverage and len(coverage) != chosen['countries']:
             print(f"  ⚠️  Card says {chosen['countries']} countries, the panel lists {len(coverage)}: {','.join(coverage)}")
+        # Whichever way the card was reached — above all a pinned card whose
+        # count did not move, which is otherwise taken unread — it must still
+        # carry every country the sheet sells. A country swapped out under
+        # the same id and count is a different product to the customer, and
+        # writing its list would take the country off the site in silence.
+        # An empty panel is a bad read, not a verdict.
+        lost = sorted(want_isos - set(coverage)) if (want_isos and coverage) else []
+        if lost:
+            print(f"  ⚠️  The plan lacks {','.join(lost)} from the sheet's countries — the row is left as it is")
+            return dict(empty, note=f"בחבילה חסרות מדינות מעמודת 'מדינות בחבילה' ({','.join(lost)}) — "
+                                    f"השורה לא הוחלפה, לבדוק ידנית")
 
         net_info = await self.extract_network_info(page)
         if net_info['blocked']:
@@ -1167,6 +1313,10 @@ class ESIMScraper:
             'route': '',
             'plan_id': plan_id,
             'coverage': ",".join(coverage),
+            # A widened plan: the variant follows it (the next run then reads
+            # a plain 'keep'), and J says what changed.
+            'variant_now': grew[1] if grew else None,
+            'grew_note': region_growth_note(*grew) if grew else "",
             'out_of_stock': False,
             'note': "",
         }
@@ -1497,6 +1647,8 @@ class ESIMScraper:
                     'old_price': _get('price'),
                     'variant': _get('variant'),
                     'old_changed': _get('changed'),
+                    # Read for the owner's hold only (owner_hold).
+                    'old_stock': _get('stock'),
                     'my_price': _get('my_price'),
                     'old_gb': _get('gb'),
                     'old_validity': _get('validity'),
@@ -1557,8 +1709,20 @@ class ESIMScraper:
         ts = datetime.now().strftime("%Y-%m-%d %H:%M")
         updates = []
 
+        # Rows the owner took off sale by hand: every stock write below goes
+        # through put(), so this one check covers them all.
+        owner_held = {it['row'] for it in items if owner_hold(it.get('old_stock'))}
+        if owner_held:
+            print(f"🔒 Held off sale by the owner ('{OWNER_HOLD_LABEL}'): "
+                  f"row{'s' if len(owner_held) > 1 else ''} {', '.join(map(str, sorted(owner_held)))}")
+
         def put(row, key, value):
             if key not in col:
+                return
+            if key == 'stock' and row in owner_held:
+                if value and value not in PROFIT_WORDS:
+                    print(f"  🔒 Row {row}: held by the owner — the bot's own verdict "
+                          f"'{value}' stays in J only")
                 return
             updates.append({'range': f'{col_letter(col[key])}{row}',
                             'values': [[value]]})
@@ -1572,6 +1736,22 @@ class ESIMScraper:
                 updates.clear()
                 return
             self.setup_google_sheets()
+            # A hold typed while this run was going (a run takes up to an
+            # hour): re-read the stock column just before writing, so the
+            # bot's verdict never lands on a word the owner put there since.
+            if 'stock' in col:
+                letter = col_letter(col['stock'])
+                try:
+                    live = self.sheet_service.spreadsheets().values().get(
+                        spreadsheetId=SHEET_ID, range=f'{letter}2:{letter}'
+                    ).execute(num_retries=3).get('values', [])
+                    owner_held.update(i + 2 for i, v in enumerate(live)
+                                      if v and owner_hold(v[0]))
+                except Exception as e:
+                    print(f"  ⚠️ could not re-read the stock column for holds: {e}")
+                updates[:] = drop_held_stock_writes(updates, letter, owner_held)
+                if not updates:
+                    return
             CHUNK = 50
             for i in range(0, len(updates), CHUNK):
                 batch = updates[i:i + CHUNK]
@@ -1736,6 +1916,14 @@ class ESIMScraper:
             elif '/regions' in it['link']:
                 put(r, 'route', '')  # regional plans have no route colour — keep O clean
 
+            # A regional plan esim.dog widened under us stays the row's plan
+            # (region_pin_verdict); the variant follows it so the next run
+            # reads a plain 'keep', and the note rides in J — after the price
+            # arrow, which stays first because the next run keys on it.
+            grew_note = res.get('grew_note') or ''
+            if res.get('variant_now'):
+                put(r, 'variant', res['variant_now'])
+
             # ── Price change tracking ──
             if price_changed:
                 diff = new_val - old_val
@@ -1744,10 +1932,13 @@ class ESIMScraper:
                 sign = '+' if diff > 0 else '-'
                 changed = f"{arrow} {sign}${abs(diff):.2f} ({sign}{abs(pct):.1f}%)"
                 put(r, 'prev', old)
-                put(r, 'changed', changed)
+                put(r, 'changed', f"{changed} · {grew_note}" if grew_note else changed)
                 put(r, 'last_change', datetime.now().strftime("%Y-%m-%d"))
             elif first_time:
-                put(r, 'changed', "First check")
+                put(r, 'changed', grew_note or "First check")
+            elif grew_note:
+                put(r, 'changed', grew_note)
+                put(r, 'last_change', datetime.now().strftime("%Y-%m-%d"))
             else:
                 oc = (it.get('old_changed') or "").strip()
                 is_real = oc.startswith('↑') or oc.startswith('↓') or oc == "First check"
@@ -1772,15 +1963,16 @@ class ESIMScraper:
                     print(f"  📌 Row {r}: link pinned to plan {res['plan_id']}")
             if alt:
                 put(r, 'link', alt['link'])
-                put(r, 'changed',
-                    f"↔ {alt['from_days']}d → {alt['days']}d ({new_price})")
+                moved = f"↔ {alt['from_days']}d → {alt['days']}d ({new_price})"
+                put(r, 'changed', f"{moved} · {grew_note}" if grew_note else moved)
                 put(r, 'last_change', datetime.now().strftime("%Y-%m-%d"))
                 print(f"  🔗 Row {r}: link now {alt['link']}")
             elif res.get('day_window_note'):
                 # The row is on a day it should not be sold at and the search
                 # came back empty-handed, so it stays exactly as it is. Said
                 # out loud in J, this is the row the owner has to look at.
-                put(r, 'changed', res['day_window_note'])
+                put(r, 'changed', f"{res['day_window_note']} · {grew_note}"
+                    if grew_note else res['day_window_note'])
                 print(f"  ⚠️  Row {r}: {res['day_window_note']}")
 
             # ── Profitability check ──
