@@ -1,0 +1,49 @@
+# The update network's outside watcher.
+#
+# Every "computer stopped" mail is sent by the network itself, so when ALL
+# the computers are off nobody is left to send it (2026-11-02: a power cut
+# took both PCs down for six days without a single mail). Every ~10 minutes
+# this asks the site (fn=net_watch, Bearer ORDERS_TOKEN -- the secret this repo
+# already holds for price_log). The site mails the owner once when no report
+# has arrived for 30 minutes, reminds every 6 hours, and mails once when the
+# network is back. The decision and the mail live on the site; this job only
+# knocks. A failed knock turns the run red, and GitHub mails that too.
+name: Network watch
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: net-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ask the site whether the network is reporting
+        env:
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+        run: |
+          set -u
+          if [ -z "${ORDERS_TOKEN}" ]; then echo "ORDERS_TOKEN is not set"; exit 1; fi
+          code=0
+          for i in 1 2 3; do
+            code=$(curl -sS -o out.json -w '%{http_code}' --max-time 40 \
+              -X POST 'https://www.waverole.com/api/admin?fn=net_watch' \
+              -H "Authorization: Bearer ${ORDERS_TOKEN}" \
+              -H 'Content-Type: application/json' --data '{}') || code=0
+            [ "$code" = "200" ] && break
+            sleep 20
+          done
+          # The answer holds no secret: state, report age, whether a mail went out.
+          python3 -c "import json;d=json.load(open('out.json'));x=d.get('data') or {};print({k:x.get(k) for k in ('state','age_s','mailed','recovered')}, d.get('error'))" 2>/dev/null || head -c 300 out.json
+          # Pushed before the site learned net_watch: say so once a run, stay green
+          # (a red run every 10 minutes would be 144 GitHub mails a day).
+          if [ "$code" = "404" ] && grep -q unknown_fn out.json; then echo "the site has no net_watch yet (deploy the site)"; exit 0; fi
+          [ "$code" = "200" ] || { echo "HTTP $code"; exit 1; }
