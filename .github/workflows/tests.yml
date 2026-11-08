@@ -32,6 +32,11 @@ jobs:
       - name: Usage bot
         run: python test_usage_bot.py
 
+      # The 10-minute feed to the order page (usage_live.py, run by the PCs):
+      # site only, never the sheet, only readings that moved.
+      - name: Live usage
+        run: python test_usage_live.py
+
       # Which receipts-sheet cells a refund recorded at the site marks red.
       - name: Refund marks
         run: python test_refund_marks.py
