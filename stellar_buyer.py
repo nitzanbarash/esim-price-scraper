@@ -74,7 +74,7 @@ WORKER = "gha:stellar"               # what the shared claim records
 ROUTE_PREFIX = "Stellar "            # receipts Route: 'Stellar JC059'
 
 MAX_EUR = float(os.getenv("STELLAR_MAX_EUR", "30"))       # one order
-MAX_ORDERS_PER_RUN = int(os.getenv("STELLAR_MAX_PER_RUN", "5"))
+MAX_ORDERS_PER_RUN = int(os.getenv("STELLAR_MAX_PER_RUN", "10"))   # 10 since 2026-11-08: one whole purchase of several (the site sells up to 10 in one payment)
 PRICE_TOL = 0.005        # a rounding cent over the sheet is not a price rise
 # How far the listing we are about to buy may sit ABOVE the euros the sheet
 # priced the row at before this bot refuses to buy. It is a MONEY-safety bar,
