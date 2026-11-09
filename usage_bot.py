@@ -716,8 +716,17 @@ def main() -> int:
         usage.update(fetch_usage(known[i:i + USAGE_CHUNK]))
     log.info(f"esim.dog reported on {len(usage)} of {len(known)} package(s)")
 
-    st_usage = stellar_usage.fetch_usage(
-        [t["link"] for t in todo if t["source"] == SRC_STELLAR and t["link"]])
+    # The sim id memory (2026-11-09): one call a known package instead of two.
+    # It lives in the working folder: kept between runs on the update
+    # network's computers, gone with each GitHub run (no harm, just two calls).
+    st_links = [t["link"] for t in todo if t["source"] == SRC_STELLAR and t["link"]]
+    sims = stellar_usage.load_sim_ids()
+    st_usage = stellar_usage.fetch_usage(st_links, sim_ids=sims)
+    for u, r in st_usage.items():
+        if isinstance(r, dict) and r.get("sim_id"):
+            sims[u] = str(r["sim_id"])
+    if st_links:
+        stellar_usage.save_sim_ids(sims, st_links)
 
     # ── decide, then write the sheet ONCE ──
     cells, site_items, counts = [], [], {ACTIVE: 0, USED_UP: 0, EXPIRED: 0}

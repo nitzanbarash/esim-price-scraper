@@ -78,6 +78,14 @@ TIMEOUT = 30
 # sheet top-down. Their meters simply stopped. So calls are paced to a window
 # under the limit, and a 429 that slips through waits and asks once more.
 RATE_LIMIT = 55          # calls allowed per window, a little under Stellar's 60
+# The limit is per IP, and the update network's computers share one (the same
+# office line): two jobs reading at once on two PCs must split the 60 between
+# them. STELLAR_RATE_LIMIT lowers this run's share (2026-11-09: usage 25 +
+# usage_live 30 on the network). Never above 55.
+try:
+    RATE_LIMIT = max(1, min(int(os.getenv("STELLAR_RATE_LIMIT", "") or RATE_LIMIT), 55))
+except ValueError:
+    pass
 RATE_WINDOW = 60.0       # seconds
 RETRY_WAIT = 61.0        # when the 429 names no better time
 _recent: deque = deque()  # monotonic times of the calls made in the window
@@ -416,7 +424,57 @@ def _note_endpoint(endpoint: str, blob) -> list[str]:
     return notes
 
 
-def _one(s, url) -> Result:
+# An order's eSIM never changes, so its sim_id is asked for once and kept
+# (2026-11-09, before many more packages): with it a package costs ONE call
+# (the meter) instead of two (order, then meter). The file lives in the job's
+# working folder; losing it only costs one run at two calls a package.
+SIM_ID_CACHE = "stellar_sim_ids.json"
+
+
+def load_sim_ids(path: str = SIM_ID_CACHE) -> dict:
+    """{portal url: sim_id} remembered from earlier runs ({} when none)."""
+    try:
+        import json
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return {str(k): str(v) for k, v in d.items() if k and v} if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sim_ids(found: dict, keep, path: str = SIM_ID_CACHE) -> None:
+    """Remember sim_ids for the urls still in `keep` (finished ones drop out)."""
+    import json
+    keep = set(keep)
+    d = {u: v for u, v in found.items() if u in keep and v}
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        log.warning(f"sim id cache not saved ({type(e).__name__}): next run asks for each order again")
+
+
+def _meter_by_sim(s, sim_id) -> Result:
+    """The one-call path for a package whose sim_id is known; None = use the long path."""
+    try:
+        meter = _get(s, f"{BASE}/esims/{sim_id}/usage")
+    except Exception:
+        return None
+    got = map_usage(meter)
+    if isinstance(got, dict):
+        got["sim_id"] = sim_id
+        _note_endpoint(EP_USAGE, meter)
+        return got
+    return None
+
+
+def _one(s, url, sim_id: str = "") -> Result:
+    if sim_id:
+        got = _meter_by_sim(s, sim_id)
+        if got is not None:
+            return got
     oid = order_id_from_url(url)
     if not oid:
         log.warning("stellar row has no readable portal link -- left untouched")
@@ -479,12 +537,19 @@ def _one(s, url) -> Result:
     return Unknown(keys=sorted(set(seen)))
 
 
-def fetch_usage(order_urls, session=None, key: Optional[str] = None) -> dict:
+def fetch_usage(order_urls, session=None, key: Optional[str] = None,
+                sim_ids: Optional[dict] = None, deadline: Optional[float] = None) -> dict:
     """{portal url -> reading | Unknown | None}, one entry per url given.
 
     Keyed by the url the caller passed, not by order id: the receipts row holds
     the url, and handing back anything else would make the caller re-derive the
     id and re-introduce every parsing trap this module already handles.
+
+    sim_ids   {url: sim_id} known from earlier runs: those packages cost one
+              call. Every reading carries its sim_id, for the caller to keep.
+    deadline  a time.monotonic() value: urls not reached by then come back
+              None ("not asked"), never a reading - the caller puts them first
+              next run. Without it every url is read.
     """
     global _logged_endpoint, _stale_rows
     _logged_endpoint, _stale_rows = False, 0     # one sweep, one endpoint line
@@ -492,7 +557,9 @@ def fetch_usage(order_urls, session=None, key: Optional[str] = None) -> dict:
     urls = [u for u in (order_urls or [])]
     if not urls:
         return {}
-    key = (key or os.getenv("STELLAR_API_KEY", "")).strip()
+    # STELLAR_USAGE_KEY: the read-only key (orders:read + esims:read) the
+    # update network's computers hold; it is all a meter needs.
+    key = (key or os.getenv("STELLAR_API_KEY", "") or os.getenv("STELLAR_USAGE_KEY", "")).strip()
     if not key:
         # Not an outage and not an error: the PC copy of this repo has no
         # Stellar key by design (memory: stellar-key-placement). Every Stellar
@@ -501,11 +568,17 @@ def fetch_usage(order_urls, session=None, key: Optional[str] = None) -> dict:
         return {u: None for u in urls}
     s = _session(key, session)
     out = {}
+    sim_ids = sim_ids or {}
+    late = 0
     for u in urls:
         if u in out:
             continue
+        if deadline is not None and time.monotonic() >= deadline:
+            out[u] = None
+            late += 1
+            continue
         try:
-            out[u] = _one(s, u)
+            out[u] = _one(s, u, sim_ids.get(u, ""))
         except Exception as e:
             # Belt and braces. Nothing in this module may raise into the sweep.
             log.warning(f"stellar usage: {type(e).__name__} -- row left untouched")
@@ -516,5 +589,6 @@ def fetch_usage(order_urls, session=None, key: Optional[str] = None) -> dict:
              + (f" - {unknown} in an unrecognised shape (left untouched)" if unknown else "")
              # Written, pushed and counted like any other -- see _freshness.
              + (f" - {_stale_rows} the supplier flagged as not fresh (still written)"
-                if _stale_rows else ""))
+                if _stale_rows else "")
+             + (f" - {late} left for the next run (time budget)" if late else ""))
     return out

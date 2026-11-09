@@ -882,7 +882,8 @@ with mock.patch.object(usage_bot, "sheet_client", lambda: ws), \
      mock.patch.object(usage_bot, "fetch_usage", lambda ic: {
          "8972011": {"used_gb": 0.5, "total_gb": 5.0, "expires": "", "status": ""},
          "8972099": {"used_gb": 2.0, "total_gb": 5.0, "expires": "", "status": ""}}), \
-     mock.patch.object(usage_bot.stellar_usage, "fetch_usage", lambda urls: {
+     mock.patch.object(usage_bot.stellar_usage, "save_sim_ids", lambda *a, **k: None), \
+     mock.patch.object(usage_bot.stellar_usage, "fetch_usage", lambda urls, **kw: {
          O2: Unknown(keys=["installation.activation_code", "sim_id"]),
          O3: {"used_gb": 1.0, "total_gb": 5.0, "expires": "", "status": ""},
          O4: None}):
@@ -957,7 +958,8 @@ with mock.patch.object(usage_bot, "sheet_client", lambda: ws2), \
      mock.patch.object(usage_bot, "push_to_site", lambda items: 0), \
      mock.patch.object(usage_bot, "alert", lambda su, bo: alerts2.append((su, bo))), \
      mock.patch.object(usage_bot, "fetch_usage", lambda ic: {}), \
-     mock.patch.object(usage_bot.stellar_usage, "fetch_usage", lambda urls: {}):
+     mock.patch.object(usage_bot.stellar_usage, "save_sim_ids", lambda *a, **k: None), \
+     mock.patch.object(usage_bot.stellar_usage, "fetch_usage", lambda urls, **kw: {}):
     check("the run finished", usage_bot.main(), 0)
 body = alerts2[0][1]
 check("one mail for the lot", len(alerts2), 1)
@@ -988,7 +990,8 @@ with mock.patch.object(usage_bot, "sheet_client", lambda: ws3), \
      mock.patch.object(usage_bot, "push_to_site", lambda items: 0), \
      mock.patch.object(usage_bot, "alert", lambda su, bo: None), \
      mock.patch.object(usage_bot, "fetch_usage", lambda ic: {}), \
-     mock.patch.object(usage_bot.stellar_usage, "fetch_usage", lambda urls: {}):
+     mock.patch.object(usage_bot.stellar_usage, "save_sim_ids", lambda *a, **k: None), \
+     mock.patch.object(usage_bot.stellar_usage, "fetch_usage", lambda urls, **kw: {}):
     check("the run finished", usage_bot.main(), 0)
 w3 = {(c.row, c.col): c.value for c in ws3.written}
 check("the gift's discount is filled in", w3.get((2, UC["\u05d4\u05e0\u05d7\u05d4 - Sale"] + 1)),

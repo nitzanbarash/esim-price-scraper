@@ -19,7 +19,10 @@ AND total, or the answer is Unknown and usage_bot writes nothing at all.
 Run:  python3 test_stellar_usage.py
 """
 
+import os
 import sys
+import tempfile
+import time
 from unittest import mock
 
 import stellar_usage
@@ -177,6 +180,7 @@ check("and the VPN's date never leaves it",
 # -- and through the network, where usage_bot sees it ------------------------
 print("\n-- what the sweep is handed --")
 URL = "https://wholesale.stellarsecurity.com/orders/o1"
+URL2 = "https://wholesale.stellarsecurity.com/orders/o2"
 
 
 class _Resp:
@@ -252,6 +256,42 @@ res = stellar_usage.fetch_usage(
     [URL], session=_Session(_api(meter=VPN_ONLY, esim=VPN_ONLY)), key="k")
 check("a vpn-only package is Unknown, so the row is left untouched",
       isinstance(res[URL], Unknown), True)
+
+# A known sim id (2026-11-09): ONE call, straight to the meter.
+seen = []
+res = stellar_usage.fetch_usage(
+    [URL], session=_Session(_api(meter=REAL_METER, seen=seen)), key="k",
+    sim_ids={URL: "s1"})
+check("known sim id: the meter only", seen, ["/esims/s1/usage"])
+check("...and the reading is the same", res[URL]["used_gb"], 1.0)
+seen = []
+res = stellar_usage.fetch_usage(
+    [URL], session=_Session(_api(meter_code=404, esim=REAL_ESIM, seen=seen)), key="k",
+    sim_ids={URL: "s1"})
+check("a known sim id whose meter fails walks the long path",
+      seen, ["/esims/s1/usage", "/orders/o1", "/esims/s1/usage", "/esims/s1"])
+check("...and is still never a guessed reading", isinstance(res[URL], dict), False)
+
+# A deadline already past: nothing asked, every url "not asked" (None).
+seen = []
+res = stellar_usage.fetch_usage(
+    [URL, URL2], session=_Session(_api(meter=REAL_METER, seen=seen)), key="k",
+    deadline=time.monotonic() - 1)
+check("past the deadline: no call", seen, [])
+check("...and no reading, so nothing is retired or sent", res, {URL: None, URL2: None})
+
+# The read-only key the PCs hold is enough.
+with mock.patch.dict(os.environ, {"STELLAR_API_KEY": "", "STELLAR_USAGE_KEY": "ro"}):
+    seen = []
+    res = stellar_usage.fetch_usage([URL], session=_Session(_api(meter=REAL_METER, seen=seen)))
+    check("STELLAR_USAGE_KEY is used when STELLAR_API_KEY is absent", isinstance(res[URL], dict), True)
+
+# The sim id memory survives a run and drops finished packages.
+_d = tempfile.mkdtemp()
+_p = os.path.join(_d, "s.json")
+stellar_usage.save_sim_ids({URL: "s1", URL2: "s2"}, [URL], path=_p)
+check("sim ids saved for live packages only", stellar_usage.load_sim_ids(_p), {URL: "s1"})
+check("no file: empty memory", stellar_usage.load_sim_ids(os.path.join(_d, "none.json")), {})
 
 # Nothing in the module may raise into the sweep.
 res = stellar_usage.fetch_usage(

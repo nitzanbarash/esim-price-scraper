@@ -91,22 +91,46 @@ class Unknown(dict):
     pass
 
 
-def fake_s2(urls, key=None):
+def fake_s2(urls, key=None, sim_ids=None, deadline=None):
     calls["s2"].append((list(urls), key))
+    calls.setdefault("s2kw", []).append((dict(sim_ids or {}), deadline))
     return {urls[0]: {"used_gb": 3.5, "total_gb": 10.0, "expires": ""}}
 
 
 fake_st.fetch_usage = fake_s2
+fake_st.saved = []
+fake_st.load_sim_ids = lambda: {}
+fake_st.save_sim_ids = lambda found, keep: fake_st.saved.append((dict(found), list(keep)))
 sys.modules["stellar_usage"] = fake_st
 os.environ["STELLAR_RATE_LIMIT"] = "90"
 r = ul.readings(todo, "k-test")
 check("with a key: s2 read too", sorted(r), ["WR-A", "WR-D"])
 check("key handed to the s2 reader", calls["s2"][-1][1], "k-test")
 check("rate capped under the supplier's 60", fake_st.RATE_LIMIT, 55)
-fake_st.fetch_usage = lambda urls, key=None: {u: None for u in urls}
+fake_st.fetch_usage = lambda urls, key=None, **kw: {u: None for u in urls}
 check("s2 'could not ask' is never sent", sorted(ul.readings(todo, "k")), ["WR-A"])
-fake_st.fetch_usage = lambda urls, key=None: {u: Unknown() for u in urls}
+fake_st.fetch_usage = lambda urls, key=None, **kw: {u: Unknown() for u in urls}
 check("s2 unknown shape is never sent", sorted(ul.readings(todo, "k")), ["WR-A"])
+
+print("\nmany packages (2026-11-09)")
+s2rows = [{"order_id": o, "s2": True, "iccid": "", "link": "L" + o} for o in ("WR-1", "WR-2", "WR-3")]
+cache = {"WR-1": [1, 5, 300.0], "WR-2": [1, 5, 100.0]}
+check("never-sent first, then the oldest send", [t["order_id"] for t in ul.s2_order(s2rows, cache)],
+      ["WR-3", "WR-2", "WR-1"])
+fake_st.fetch_usage = lambda urls, key=None, sim_ids=None, deadline=None: (
+    calls.setdefault("order", []).append((list(urls), deadline))
+    or {urls[0]: {"used_gb": 1.0, "total_gb": 5.0, "expires": "", "sim_id": "SIM9"}})
+fake_st.saved.clear()
+import time as _t
+r = ul.readings(s2rows, "k", cache, _t.time())
+urls, dl = calls["order"][-1]
+check("the reader is asked in that order", urls, ["LWR-3", "LWR-2", "LWR-1"])
+check("with a deadline inside the budget", 0 < dl - _t.monotonic() <= ul.S2_BUDGET_S, True)
+check("a sim id that came back is remembered", fake_st.saved[-1][0], {"LWR-3": "SIM9"})
+check("only for packages still live", fake_st.saved[-1][1], ["LWR-3", "LWR-2", "LWR-1"])
+r = ul.readings(s2rows, "k", cache, _t.time() - 10_000)
+check("a run already past its budget still gets a short window", calls["order"][-1][1] - _t.monotonic() > 20, True)
+fake_st.fetch_usage = fake_s2
 
 print("\ndue")
 read = {"WR-A": {"used_gb": 1.234, "total_gb": 5.0, "expires": "x"}}

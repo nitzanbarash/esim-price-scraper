@@ -8,10 +8,10 @@ Runs on the update network's computers (waverole-net job `usage_live`, every
 supplier for their meter, and sends the readings to the site (usage_batch).
 
 What it never does, on purpose:
-  * write the receipts sheet: the 4-hourly sweep (usage_bot.py, GitHub
-    Actions) stays the sheet's only writer, with its Status, activation,
-    discount and refund columns. Two writers on one sheet would overwrite
-    each other's cells.
+  * write the receipts sheet: the full sweep (usage_bot.py) is the sheet's
+    writer, with its Status, activation, discount and refund columns. Since
+    2026-11-09 it runs on the update network about once an hour (GitHub
+    Actions every 4 hours stays as the backup); this job only feeds the site.
   * mail anyone. The 90/98/100% notices are sent by the site, once per
     order (alertNN_sent on the order), whoever brings the reading.
   * retire a package or judge one "finished": a package that does not
@@ -60,6 +60,12 @@ REFRESH_S = 3600          # every package is sent at least this often
 SITE_CHUNK = 100
 S1_CHUNK = 50             # fetch_usage splits further into the supplier's own batch size
 DEFAULT_S2_RATE = 30
+# s2 reads stop after this many seconds of the run (2026-11-09, before many
+# more packages): the network ends the job at 580 s (lease), and a run that is
+# cut there sends nothing at all. Packages not reached are read FIRST next run
+# (oldest reading first), so a big fleet is covered over two or three runs
+# instead of never. One call a package (sim id memory): ~200 packages a run.
+S2_BUDGET_S = 420
 
 
 def _load_cache(path=CACHE) -> dict:
@@ -111,7 +117,16 @@ def live_rows(rows: list[list[str]]) -> tuple[list[dict], int]:
     return out, mismatched
 
 
-def readings(todo: list[dict], s2_key: str) -> dict:
+def s2_order(s2: list[dict], cache: dict) -> list[dict]:
+    """Never-sent packages first, then the ones whose last send is oldest."""
+    def last(t):
+        prev = cache.get(t["order_id"])
+        return float(prev[2] or 0) if isinstance(prev, list) and len(prev) == 3 else 0.0
+    return sorted(s2, key=lambda t: (last(t), t["order_id"]))
+
+
+def readings(todo: list[dict], s2_key: str, cache: dict | None = None,
+             t0: float | None = None) -> dict:
     """{order_id: {used_gb, total_gb, expires}} for every package that answered."""
     out = {}
     s1 = [t for t in todo if not t["s2"] and t["iccid"]]
@@ -134,7 +149,21 @@ def readings(todo: list[dict], s2_key: str) -> dict:
         except ValueError:
             rate = DEFAULT_S2_RATE
         stellar_usage.RATE_LIMIT = max(1, min(rate, 55))
-        st = stellar_usage.fetch_usage([t["link"] for t in s2], key=s2_key)
+        s2 = s2_order(s2, cache or {})
+        try:
+            budget = float(os.getenv("USAGE_LIVE_S2_BUDGET_S", str(S2_BUDGET_S)))
+        except ValueError:
+            budget = S2_BUDGET_S
+        # The budget counts from the start of the run (t0 is time.time()).
+        spent = time.time() - t0 if t0 else 0.0
+        deadline = time.monotonic() + max(30.0, budget - spent)
+        sims = stellar_usage.load_sim_ids()
+        st = stellar_usage.fetch_usage([t["link"] for t in s2], key=s2_key,
+                                       sim_ids=sims, deadline=deadline)
+        for u, r in st.items():
+            if isinstance(r, dict) and r.get("sim_id"):
+                sims[u] = str(r["sim_id"])
+        stellar_usage.save_sim_ids(sims, [t["link"] for t in s2])
         for t in s2:
             u = st.get(t["link"])
             # Only a real reading: None / Unknown mean "we could not ask".
@@ -184,8 +213,8 @@ def main() -> int:
     log.info(f"{len(todo)} live package(s)" + (f", {mismatched} skipped (supplier columns disagree)" if mismatched else ""))
     if not todo:
         return 0
-    read = readings(todo, os.getenv("STELLAR_USAGE_KEY", "").strip())
     cache = _load_cache()
+    read = readings(todo, os.getenv("STELLAR_USAGE_KEY", "").strip(), cache, t0)
     now = time.time()
     items = due(read, cache, now)
     if not items:
