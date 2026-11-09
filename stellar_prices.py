@@ -96,7 +96,7 @@ import requests
 
 import day_policy
 from choose_supplier import PROFIT_MARKS, usd_outside_parens
-from esim_price_scraper import HEADER_KEYS, SHEET_ID, col_letter
+from esim_price_scraper import HEADER_KEYS, SHEET_ID, col_letter, israel_now, stamp
 
 FEED_URL = "https://stellarsecurity.com/assets/esim/products.index.json"   # retail; fallback only
 API_URL = "https://wholesale.stellarsecurity.com/api/v1/plans"
@@ -945,9 +945,9 @@ def main(argv=None) -> int:
     print(f"💱 EUR→USD {fx:.4f} ({fx_src})")
 
     decisions = [d for d in (decide(cat, r) for r in rows) if d is not None]
-    now = datetime.now()
+    now = israel_now()        # Israel time + who wrote it (owner, 2026-11-09)
     updates = header_update(values, col) + plan_updates(
-        decisions, fx, now.strftime("%Y-%m-%d %H:%M"), now.strftime("%Y-%m-%d"))
+        decisions, fx, stamp(now), now.strftime("%Y-%m-%d"))
 
     print(f"\n📋 {len(rows)} Stellar rows, {len(decisions)} with a code, "
           f"{len(rows) - len(decisions)} left alone\n")

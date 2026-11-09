@@ -55,6 +55,46 @@ import day_policy
 import esimdog_guard
 S1_PACER = esimdog_guard.Pacer()
 
+
+# -- Who wrote the "last updated" stamp (owner, 2026-11-09) --
+# The stamp says WHEN and WHO, so the owner can tell a GitHub run from one
+# of the computers at a glance: "2026-11-09 20:30 git". Israel time always:
+# GitHub runs in UTC, which made a 10:28 run read as "08:28" in the sheet.
+# The tag goes AFTER the time, so every reader that takes the leading
+# "YYYY-MM-DD HH:MM" (stalest-first sort, waverole_sync.gs toDate_) still works.
+def who_wrote() -> str:
+    """'git' on GitHub Actions, the node's name (pc-a, pc-b...) on the update
+    network, 'mac' for a run by hand."""
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        return "git"
+    if os.getenv("NET_FENCE_FILE"):            # set by the network for every job it runs
+        try:
+            base = os.environ.get("LOCALAPPDATA") or ""
+            with open(os.path.join(base, "WaveroleNet", "config.json"), encoding="utf-8") as f:
+                node = str(json.load(f).get("node_id") or "").strip()
+            if re.fullmatch(r"[A-Za-z0-9_-]{1,20}", node):
+                return node
+        except (OSError, ValueError, AttributeError):
+            pass
+        return "pc"
+    return "mac"
+
+
+def israel_now() -> datetime:
+    """Now on Israel's clock. A Windows Python may have no time-zone data;
+    the computers' own clocks are set to Israel, so local time is the fallback."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Asia/Jerusalem")).replace(tzinfo=None)
+    except Exception:
+        return datetime.now()
+
+
+def stamp(now: Optional[datetime] = None) -> str:
+    """The 'last updated' cell: Israel time, then who wrote it."""
+    now = now or israel_now()
+    return f"{now:%Y-%m-%d %H:%M} {who_wrote()}"
+
 # ── Google Sheets ────────────────────────────────────────────────
 SHEET_ID = "108D3BUV-MNcIuRZuKUgb-E-b1Ra8moxWZZyI5JxnyRo"
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
@@ -1728,7 +1768,7 @@ class ESIMScraper:
               f"{oldest or '(never updated)'}")
 
         print(f"\n📋 Checking {len(items)} packages...\n")
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        ts = stamp()
         updates = []
 
         # Rows the owner took off sale by hand: every stock write below goes

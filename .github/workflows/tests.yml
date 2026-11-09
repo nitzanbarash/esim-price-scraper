@@ -42,6 +42,10 @@ jobs:
       - name: s1 load guard
         run: python test_esimdog_guard.py
 
+      # The 'last updated' stamp: Israel time + who wrote it (git / pc-a / mac).
+      - name: last-updated stamp
+        run: python test_stamp.py
+
       # Which receipts-sheet cells a refund recorded at the site marks red.
       - name: Refund marks
         run: python test_refund_marks.py
