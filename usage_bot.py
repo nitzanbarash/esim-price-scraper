@@ -57,6 +57,7 @@ from datetime import datetime, timedelta, timezone
 import gspread
 import requests
 
+import esimdog_guard
 import stellar_usage
 from bot_common import (
     ORDERS_URL, RECEIPTS_SHEET_ID, TZ, alert, env, fetch_esim_details,
@@ -715,6 +716,12 @@ def main() -> int:
     for i in range(0, len(known), USAGE_CHUNK):
         usage.update(fetch_usage(known[i:i + USAGE_CHUNK]))
     log.info(f"esim.dog reported on {len(usage)} of {len(known)} package(s)")
+    # s1 refused this computer, now or a little while ago (esimdog_guard):
+    # its silence means "not asked", never "the supplier forgot this eSIM",
+    # so no s1 row may be retired, re-metered or touched on this run.
+    s1_blind = esimdog_guard.paused() > 0
+    if s1_blind:
+        log.warning("s1 paused on this computer - every s1 row is left exactly as it was")
 
     # The sim id memory (2026-11-09): one call a known package instead of two.
     # It lives in the working folder: kept between runs on the update
@@ -730,7 +737,7 @@ def main() -> int:
 
     # ── decide, then write the sheet ONCE ──
     cells, site_items, counts = [], [], {ACTIVE: 0, USED_UP: 0, EXPIRED: 0}
-    skipped = unmetered = 0
+    skipped = unmetered = skipped_s1 = 0
     unmetered_rows: list[str] = []
 
     # ── self-heal the source column ──
@@ -788,6 +795,9 @@ def main() -> int:
                              + " — left untouched")
                 continue
         else:
+            if s1_blind:
+                skipped_s1 += 1
+                continue
             u = usage.get(t["iccid"]) if t["iccid"] else None
         # One package must never take the sweep down with it. A single
         # unreadable date from the supplier used to raise out of the whole
@@ -894,7 +904,8 @@ def main() -> int:
     log.info(f"sheet: {len(cells)} cell(s) updated · still active {counts[ACTIVE]} · "
              f"used up {counts[USED_UP]} · finished {counts[EXPIRED]}"
              + (f" · SKIPPED {skipped}" if skipped else "")
-             + (f" · Stellar unmetered {unmetered}" if unmetered else ""))
+             + (f" · Stellar unmetered {unmetered}" if unmetered else "")
+             + (f" · s1 paused, {skipped_s1} left as they were" if skipped_s1 else ""))
     if skipped:
         alert("Usage bot skipped some packages",
               f"{skipped} of {len(todo)} package(s) could not be read this run "

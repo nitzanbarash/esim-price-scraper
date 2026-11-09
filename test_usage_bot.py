@@ -945,6 +945,31 @@ check("activation followed the data",
       written.get((2, UC["הופעל - Activated"] + 1)), "Activated")
 
 
+print("\n-- s1 paused on this computer (esimdog_guard, 2026-11-09) --")
+# A refusal from s1 means "not asked". The same sheet, with s1 silent because
+# this computer is paused: no s1 row may be metered, retired or touched.
+ws_p = _WS(U_ROWS)
+pushed_p = []
+with mock.patch.object(usage_bot, "sheet_client", lambda: ws_p), \
+     mock.patch.object(usage_bot, "ensure_status_colours", lambda *a: None), \
+     mock.patch.object(usage_bot, "list_prices", dict), \
+     mock.patch.object(usage_bot, "push_to_site", lambda items: pushed_p.extend(items) or len(items)), \
+     mock.patch.object(usage_bot, "alert", lambda su, bo: None), \
+     mock.patch.object(usage_bot.esimdog_guard, "paused", lambda *a, **k: 1800.0), \
+     mock.patch.object(usage_bot, "fetch_usage", lambda ic: {}), \
+     mock.patch.object(usage_bot.stellar_usage, "save_sim_ids", lambda *a, **k: None), \
+     mock.patch.object(usage_bot.stellar_usage, "fetch_usage", lambda urls, **kw: {
+         O3: {"used_gb": 1.0, "total_gb": 5.0, "expires": "", "status": ""}}):
+    check("a paused run still finishes", usage_bot.main(), 0)
+w_p = {(c.row, c.col): c.value for c in ws_p.written}
+s1_cols = (UC["GB (0/X) - ניצול"] + 1, UC["סטטוס - Status"] + 1, UC["הופעל - Activated"] + 1)
+check("the s1 rows' meter, status and activation are untouched",
+      [k for k in w_p if k[0] in (2, 8) and k[1] in s1_cols], [])
+check("no s1 reading reaches the customer's page",
+      [i["order_id"] for i in pushed_p if i["order_id"] in ("WR-1", "WR-7")], [])
+check("s2 is unaffected", w_p.get((4, UC["GB (0/X) - ניצול"] + 1)), "1 / 5")
+
+
 print("\n-- a mis-edited dropdown must not arrive as a wall of order numbers --")
 # One bad drag down the 'מקור' column mismatches the whole sheet. The COUNT is
 # what a person acts on; a mail naming 300 orders is a mail nobody opens.

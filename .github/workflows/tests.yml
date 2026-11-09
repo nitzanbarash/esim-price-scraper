@@ -37,6 +37,11 @@ jobs:
       - name: Live usage
         run: python test_usage_live.py
 
+      # The s1 load guard: each computer's own pace, and the pause after a
+      # refusal that stops every s1 call there (and never retires a row).
+      - name: s1 load guard
+        run: python test_esimdog_guard.py
+
       # Which receipts-sheet cells a refund recorded at the site marks red.
       - name: Refund marks
         run: python test_refund_marks.py

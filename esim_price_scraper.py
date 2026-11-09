@@ -51,6 +51,9 @@ from esim_country_data import (
     country_from_slug, make_country_code, make_region_code, hebrew_name,
 )
 import day_policy
+# The s1 load guard (2026-11-09): this computer's own pace and pause.
+import esimdog_guard
+S1_PACER = esimdog_guard.Pacer()
 
 # ── Google Sheets ────────────────────────────────────────────────
 SHEET_ID = "108D3BUV-MNcIuRZuKUgb-E-b1Ra8moxWZZyI5JxnyRo"
@@ -1342,7 +1345,26 @@ class ESIMScraper:
                 browser = await p.chromium.launch(headless=True)
                 page = await (await browser.new_context()).new_page()
                 try:
-                    await page.goto(clean_url, wait_until='domcontentloaded', timeout=30000)
+                    await S1_PACER.wait_async()
+                    resp = await page.goto(clean_url, wait_until='domcontentloaded', timeout=30000)
+                    try:
+                        title = await page.title()
+                    except Exception:
+                        title = ""
+                    if esimdog_guard.is_refusal(resp.status if resp else None, title):
+                        # The site pushed back. Not one more page from this
+                        # computer: the pause file stops the price sweep, the
+                        # usage sweep and the live usage here for an hour or
+                        # more. Rows already saved stay; the rest keep their
+                        # prices (nothing is written for a page never read).
+                        info = esimdog_guard.refused(
+                            f"HTTP {resp.status if resp else '?'} on a price page")
+                        esimdog_guard.notify(info, "the price sweep")
+                        print(f"  \u26d4 s1 refused this computer - price sweep stopped, "
+                              f"no s1 calls for {info['pause_s'] // 60} min")
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                        os._exit(1)
                     if info['type'] == 'region':
                         await page.wait_for_timeout(5000)
                         return await self.scrape_region(page, info, variant, coverage)
@@ -2019,6 +2041,14 @@ class ESIMScraper:
 
 
 async def main():
+    # The catalogue listing (SCRAPE_LIST_GROUPS) reads only the sheet: never paused.
+    left = 0 if SCRAPE_LIST_GROUPS else esimdog_guard.paused()
+    if left:
+        # s1 refused this computer a little while ago (esimdog_guard): read
+        # nothing, write nothing, and let the next run try again.
+        print(f"\u23f8 s1 paused on this computer for {left / 60:.0f} more min "
+              "(it refused us) - nothing read this run")
+        return
     scraper = ESIMScraper()
     skipped = await scraper.run()
     # The daily watchdog reads this run's conclusion. A green tick over a

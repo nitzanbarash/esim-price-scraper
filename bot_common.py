@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 import gspread
 import requests
 
+import esimdog_guard
+
 # The same logger name as before the move, so the lines these helpers write
 # read exactly as they did in every job's log.
 log = logging.getLogger("fulfillment")
@@ -117,6 +119,9 @@ def _usage_request(iccids: list[str], provider) -> list:
     """
     rows: list = []
     for start in range(0, len(iccids), USAGE_BATCH):
+        if esimdog_guard.paused():
+            # s1 refused this computer (esimdog_guard): not one more call.
+            break
         chunk = iccids[start:start + USAGE_BATCH]
         payload = {"iccidList": chunk}
         if provider is not None:
@@ -125,6 +130,10 @@ def _usage_request(iccids: list[str], provider) -> list:
             r = requests.post(SUPPLIER_USAGE_URL, json=payload,
                               headers={"Accept": "application/json",
                                        "User-Agent": "Mozilla/5.0"}, timeout=60)
+            if esimdog_guard.is_refusal(r.status_code):
+                info = esimdog_guard.refused(f"HTTP {r.status_code} on the usage endpoint")
+                esimdog_guard.notify(info, "a usage read")
+                break
             r.raise_for_status()
             rows += (r.json() or {}).get("usage") or []
         except Exception as e:
@@ -149,6 +158,9 @@ def fetch_usage(iccids: list[str]) -> dict:
     iccids = [re.sub(r"\D", "", str(i or "")) for i in iccids]
     iccids = [i for i in iccids if i]
     if not iccids:
+        return {}
+    if left := esimdog_guard.paused():
+        log.info(f"s1 paused on this computer for {left / 60:.0f} more min - usage not asked")
         return {}
 
     out = {}
@@ -228,6 +240,8 @@ def _fetch_one_esim(success_url: str) -> dict:
     Returns {} while the eSIM is still being provisioned, so the caller simply
     retries on its next run.
     """
+    if esimdog_guard.paused():
+        return {}
     m = SESSION_ID_RE.search(success_url or "")
     if not m:
         return {}

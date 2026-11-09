@@ -14,3 +14,8 @@ venv/
 
 # macOS
 .DS_Store
+
+# Runtime memory of the usage jobs and the s1 guard (work folder files)
+esimdog_pause.json
+stellar_sim_ids.json
+usage_live_cache.json
