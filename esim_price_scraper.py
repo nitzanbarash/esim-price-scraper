@@ -274,6 +274,36 @@ SCRAPE_LIST_GROUPS = os.environ.get('SCRAPE_LIST_GROUPS', '') == '1'
 # Shadow mode for the network's first days: read and price everything, write
 # nothing. The would-be writes are counted and dropped.
 SCRAPE_DRY_RUN = os.environ.get('SCRAPE_DRY_RUN', '') == '1'
+# ...and kept (owner, 2026-11-09: "check first" before the computers write):
+# each shadow run saves the cells it WOULD have written, so they can be held
+# against what GitHub wrote, cell by cell. One file per country group, the
+# newest run only, in the job's working folder.
+DRY_WRITES_DIR = "dry_writes"
+
+
+def save_dry_writes(updates, groups=None, ts="") -> Optional[str]:
+    """Keep this shadow run's would-be writes; returns the file, or None."""
+    name = "-".join(sorted(groups if groups is not None else SCRAPE_GROUPS)) or "all"
+    name = re.sub(r"[^a-z0-9_-]", "_", name.lower())[:60]
+    path = os.path.join(DRY_WRITES_DIR, name + ".json")
+    try:
+        os.makedirs(DRY_WRITES_DIR, exist_ok=True)
+        old = {}
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                old = json.load(f)
+        if old.get("ts") != ts:                     # a new run starts a new file
+            old = {"ts": ts, "writes": {}}
+        for u in updates:
+            v = (u.get("values") or [[""]])[0]
+            old["writes"][u["range"]] = v[0] if v else ""
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(old, f, ensure_ascii=True)
+        os.replace(tmp, path)
+        return path
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
 
 # Built on first use, never at import. An asyncio.Semaphore belongs to the loop
 # that first awaits it, and awaiting it from a second loop raises "bound to a
@@ -1793,8 +1823,10 @@ class ESIMScraper:
             if not updates:
                 return
             if SCRAPE_DRY_RUN:
+                kept = save_dry_writes(updates, ts=ts)
                 print(f"  🧪 dry run: {len(updates)} cell writes dropped "
-                      f"(through package {done_count}/{len(items)})")
+                      f"(through package {done_count}/{len(items)})"
+                      + (f", kept in {kept}" if kept else ""))
                 updates.clear()
                 return
             self.setup_google_sheets()

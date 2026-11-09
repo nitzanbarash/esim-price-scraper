@@ -19,3 +19,4 @@ venv/
 esimdog_pause.json
 stellar_sim_ids.json
 usage_live_cache.json
+dry_writes/

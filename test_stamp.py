@@ -41,6 +41,22 @@ with mock.patch.dict(os.environ, dict(clean, NET_FENCE_FILE="x", LOCALAPPDATA=d)
 check("the date leads, so the stalest-first sort still works",
       sorted(["2026-11-09 20:30 git", "2026-11-08 23:59 pc-a"])[0], "2026-11-08 23:59 pc-a")
 
+print("\nshadow runs keep their would-be writes")
+os.chdir(tempfile.mkdtemp())
+u1 = [{"range": "G12", "values": [["$2.30"]]}, {"range": "I12", "values": [["2026-11-09 20:30 pc-a"]]}]
+p = e.save_dry_writes(u1, groups={"gb"}, ts="t1")
+check("one file per group", os.path.basename(p or ""), "gb.json")
+e.save_dry_writes([{"range": "G13", "values": [["$4.22"]]}], groups={"gb"}, ts="t1")
+with open(p) as f:
+    d = json.load(f)
+check("a run's batches add up", sorted(d["writes"]), ["G12", "G13", "I12"])
+e.save_dry_writes([{"range": "G14", "values": [["$1"]]}], groups={"gb"}, ts="t2")
+with open(p) as f:
+    d = json.load(f)
+check("a new run starts over", (d["ts"], sorted(d["writes"])), ("t2", ["G14"]))
+check("no group: all.json", os.path.basename(e.save_dry_writes([], groups=set(), ts="x") or ""), "all.json")
+check("a strange group name is made safe", os.path.basename(e.save_dry_writes([], groups={"../x"}, ts="x") or ""), "___x.json")
+
 print()
 if _fails:
     print(f"{len(_fails)} FAILED: {', '.join(_fails)}")
