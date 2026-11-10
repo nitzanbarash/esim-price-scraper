@@ -279,6 +279,11 @@ const RANGE_EPS             = 1e-6;
 const CHEAP_10GB_GB         = 10;
 const CHEAP_10GB_COST       = 2.75;
 const CHEAP_10GB_PRICE      = 5.99;
+// ... and a 20GB bought under CHEAP_20GB_COST never sells above CHEAP_20GB_PRICE
+// (price_ranges.CHEAP_20GB_*, the owner, 2026-11-10).
+const CHEAP_20GB_GB         = 20;
+const CHEAP_20GB_COST       = 6.00;
+const CHEAP_20GB_PRICE      = 8.99;
 const OVER_RANGE   = '\u05dc\u05d0 \u05e8\u05d5\u05d5\u05d7\u05d9 \u2014 \u05de\u05e2\u05dc \u05d8\u05d5\u05d5\u05d7';
 // The scraper's proportion rule (2026-09-17): from 30GB up, a package bought
 // above its size's ceiling is not for sale, whatever it sells for. Judged
@@ -309,6 +314,19 @@ function pays_(price, cost, gb) {
 function isCheap10gb_(gb, cost) {
   return gb !== null && gb !== undefined && Math.abs(gb - CHEAP_10GB_GB) < RANGE_EPS &&
          cost > 0 && cost < CHEAP_10GB_COST - RANGE_EPS;
+}
+
+// A 20GB bought under CHEAP_20GB_COST: it never sells above CHEAP_20GB_PRICE.
+function isCheap20gb_(gb, cost) {
+  return gb !== null && gb !== undefined && Math.abs(gb - CHEAP_20GB_GB) < RANGE_EPS &&
+         cost > 0 && cost < CHEAP_20GB_COST - RANGE_EPS;
+}
+
+// The price a cheap package may not exceed, or null when it is not one.
+function cheapCap_(gb, cost) {
+  if (isCheap10gb_(gb, cost)) return CHEAP_10GB_PRICE;
+  if (isCheap20gb_(gb, cost)) return CHEAP_20GB_PRICE;
+  return null;
 }
 
 // The least a sale of this size must earn in dollars; 0 = no floor.
@@ -358,7 +376,8 @@ function parseRange_(cell) {
 // it - the lowest paying step, every time. Then the cheap-10GB ceiling.
 function reprice_(gb, cost, current, lo, hi) {
   const price = rangePrice_(gb, cost, current, lo, hi);
-  if (price !== null && isCheap10gb_(gb, cost)) return Math.min(price, CHEAP_10GB_PRICE);
+  const cap = cheapCap_(gb, cost);
+  if (price !== null && cap !== null) return Math.min(price, cap);
   return price;
 }
 
@@ -604,7 +623,9 @@ function applyFee_(sheet, map, e) {
       const gb = map.gb === undefined ? null : num_(data[chosen][map.gb]);
       const want = cost ? reprice_(gb, cost, price, rng[0], rng[1]) : null;
       if (want !== null && (price === null || Math.abs(want - price) >= 0.005)) {
-        const why = isCheap10gb_(gb, cost) && want === CHEAP_10GB_PRICE ? ' (10GB < $' + CHEAP_10GB_COST + ')' : '';
+        const cap = cheapCap_(gb, cost);
+        const why = cap !== null && want === cap
+          ? (isCheap20gb_(gb, cost) ? ' (20GB < $' + CHEAP_20GB_COST + ')' : ' (10GB < $' + CHEAP_10GB_COST + ')') : '';
         moves.push(key + ' ' + (price === null ? '-' : price.toFixed(2)) + ' \u2192 ' + want.toFixed(2) + why);
         priceCell = want;
         price = want;

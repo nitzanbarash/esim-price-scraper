@@ -38,6 +38,8 @@ copies to the same answers:
     the loss leaders: the bot always takes the LOWEST step whose loss, after
     the processor's real fee, is at most 10 cents (LOSS_1GB). Past 1.49 the
     package is off sale.
+  * a CHEAP 20GB — bought under $6 (CHEAP_20GB_COST) — never sells above
+    8.99, the same way (the owner, 2026-11-10).
   * a CHEAP 10GB — bought under $2.75 (CHEAP_10GB_COST) — never sells
     above 5.99 (CHEAP_10GB_PRICE), even when its range starts higher (the
     owner, 2026-10-21: "the price drops to 5.99"). It is a ceiling laid
@@ -100,6 +102,13 @@ CHEAP_10GB_GB = 10
 CHEAP_10GB_COST = 2.75
 CHEAP_10GB_PRICE = 5.99
 
+# The same ceiling for a 20GB (the owner, 2026-11-10: "every 20GB bought under
+# $6 from today on, by law, goes up on the site at 8.99"). Over the range
+# like the 10GB one, and the dollar floor does not hold it back.
+CHEAP_20GB_GB = 20
+CHEAP_20GB_COST = 6.00
+CHEAP_20GB_PRICE = 8.99
+
 # The least a sale may earn in dollars, net of the real fee, by size: (size
 # from, and up, dollars). Below 20GB there is none — the 30% is enough there.
 DOLLAR_FLOOR = ((20, 4.25), (30, 4.75), (40, 5.00), (50, 5.50))
@@ -154,6 +163,21 @@ def is_cheap_10gb(gb: Optional[float], cost: Optional[float]) -> bool:
     """A 10GB bought under CHEAP_10GB_COST: it never sells above CHEAP_10GB_PRICE."""
     return (gb is not None and abs(gb - CHEAP_10GB_GB) < _EPS
             and cost is not None and 0 < cost < CHEAP_10GB_COST - _EPS)
+
+
+def is_cheap_20gb(gb: Optional[float], cost: Optional[float]) -> bool:
+    """A 20GB bought under CHEAP_20GB_COST: it never sells above CHEAP_20GB_PRICE."""
+    return (gb is not None and abs(gb - CHEAP_20GB_GB) < _EPS
+            and cost is not None and 0 < cost < CHEAP_20GB_COST - _EPS)
+
+
+def cheap_cap(gb: Optional[float], cost: Optional[float]) -> Optional[float]:
+    """The price a cheap package may not exceed, or None when it is not one."""
+    if is_cheap_10gb(gb, cost):
+        return CHEAP_10GB_PRICE
+    if is_cheap_20gb(gb, cost):
+        return CHEAP_20GB_PRICE
+    return None
 
 
 def dollar_floor(gb: Optional[float]) -> float:
@@ -244,8 +268,9 @@ def reprice(gb: Optional[float], cost: float, current: Optional[float],
     """The price U should hold now, or None when nothing in the range pays:
     the range rule (_range_price), under the cheap-10GB ceiling."""
     price = _range_price(gb, cost, current, lo, hi)
-    if price is not None and is_cheap_10gb(gb, cost):
-        return min(price, CHEAP_10GB_PRICE)
+    cap = cheap_cap(gb, cost)
+    if price is not None and cap is not None:
+        return min(price, cap)
     return price
 
 

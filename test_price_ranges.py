@@ -136,11 +136,11 @@ print("\n-- from 20GB up: the dollar floor beside the 30% (owner, 2026-10-13) --
 check("the floor by size", [pr.dollar_floor(g) for g in (1, 5, 10, 15, 20, 30, 40, 50, 75, 100)],
       [0, 0, 0, 0, 4.25, 4.75, 5.0, 5.5, 5.5, 5.5])
 check("Hungary 20GB cost 5.72 at 9.99: 61% but $3.52 → 10.99 ($4.48)",
-      pr.reprice(20, 5.72, 9.99, 9.99, 12.99), 10.99)
+      pr._range_price(20, 5.72, 9.99, 9.99, 12.99), 10.99)
 check("Japan 50GB cost 15.96 at 21.99: 30% but $4.80 → 22.99 ($5.76)",
       pr.reprice(50, 15.96, 21.99, 16.99, 22.99), 22.99)
 check("already past the floor: stays (11.49 on 5.72 earns $4.96)",
-      pr.reprice(20, 5.72, 11.49, 9.99, 12.99), 11.49)
+      pr._range_price(20, 5.72, 11.49, 9.99, 12.99), 11.49)
 check("10GB has no floor: 5.99 on $4.00 earns $1.40 and stays",
       pr.reprice(10, 4.00, 5.99, 5.99, 7.99), 5.99)
 check("short of the floor inside the range: the high end, still on sale (30GB on 11.89: 17.49 earns $4.55)",
@@ -153,7 +153,7 @@ check("over 200%, the step down still makes the floor: down (20GB on 1.50, 7.49 
 check("over 200%, the step down would miss the floor: stays (6.49 earns $4.38, 5.99 would earn $3.90)",
       pr.reprice(20, 1.50, 6.49, 5.99, 8.99), 6.49)
 check("no current price: from the low end, on to the floor (20GB on 5.72)",
-      pr.reprice(20, 5.72, None, 9.99, 12.99), 10.99)
+      pr._range_price(20, 5.72, None, 9.99, 12.99), 10.99)
 check("an empty grid: None", pr.reprice(10, 3.0, 6.49, 6.00, 6.40), None)
 check("feasible: some step pays", pr.feasible(10, 5.0, (5.99, 7.99)), True)
 check("feasible: none does", pr.feasible(10, 7.0, (5.99, 7.99)), False)
@@ -178,7 +178,15 @@ check("a cheap 10GB under a range from 6.99 is for sale", pr.feasible(10, 2.0, (
 check("'10gb' as the sheet writes it is 10", pr.is_cheap_10gb(10.0, 2.0), True)
 check("only 10GB: a 15GB at $2 keeps the range rule", pr.reprice(15, 2.0, 8.99, 7.49, 9.99), 8.49)
 check("only 10GB: a 5GB at $2 keeps the range rule", pr.reprice(5, 2.0, 4.99, 4.49, 5.99), 4.99)
-check("only 10GB: a 20GB at $2 stays at its low end", pr.reprice(20, 2.0, 9.99, 9.99, 12.99), 9.99)
+check("a 20GB at $2 is a cheap 20GB now: 8.99 over a range from 9.99", pr.reprice(20, 2.0, 9.99, 9.99, 12.99), 8.99)
+check("cheap 20GB: Germany $4.48 at 9.99 → 8.99", pr.reprice(20, 4.48, 9.99, 9.99, 12.99), 8.99)
+check("cheap 20GB: $5.87 at 12.49 → 8.99", pr.reprice(20, 5.87, 12.49, 9.99, 12.99), 8.99)
+check("cheap 20GB: $5.99 is still under 6", pr.reprice(20, 5.99, 9.99, 9.99, 12.99), 8.99)
+check("20GB at exactly $6.00 keeps the range rule", pr.reprice(20, 6.00, 9.99, 9.99, 12.99), 11.49)
+check("20GB at $6.50 keeps the range rule", pr.reprice(20, 6.50, 10.99, 9.99, 12.99), 11.99)
+check("a lower 20GB price stays: a ceiling, never a lift", pr.reprice(20, 3.0, 7.99, 6.99, 9.99), 7.99)
+check("only 20GB: a 30GB at $5 is not capped at 8.99", pr.reprice(30, 5.0, 12.99, 11.99, 14.99) != 8.99, True)
+check("cheap_cap: 10GB / 20GB / none", (pr.cheap_cap(10, 2.0), pr.cheap_cap(20, 4.0), pr.cheap_cap(20, 7.0)), (5.99, 8.99, None))
 check("no cost: nothing", pr.reprice(10, None, 6.99, 5.99, 7.99), None)
 check("zero cost: nothing", pr.reprice(10, 0, 6.99, 5.99, 7.99), None)
 check("5.99 pays well at the bar: 96% at $2.75", round(pr.margin_pct(5.99, 2.75)), 96)

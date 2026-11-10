@@ -50,6 +50,12 @@ for c in range(240, 311):
         for cur, lo, hi in ((6.99, 5.99, 7.99), (None, 5.99, 7.99), (4.99, 3.99, 4.99),
                             (7.49, 6.99, 8.99), (5.99, 4.99, 7.99), (3.99, 3.49, 3.99)):
             cases.append([gb, c / 100, cur, lo, hi, reprice(gb, c / 100, cur, lo, hi)])
+# The cheap-20GB bar ($6.00), cent by cent, the same way.
+for c in range(560, 641):
+    for gb in (15, 20, 30):
+        for cur, lo, hi in ((9.99, 9.99, 12.99), (None, 9.99, 12.99), (12.49, 9.99, 12.99),
+                            (7.99, 6.99, 9.99), (8.49, 7.99, 8.99)):
+            cases.append([gb, c / 100, cur, lo, hi, reprice(gb, c / 100, cur, lo, hi)])
 cells = ['5.99 - 7.99', '5.99-7.99', ' $5.99 \\u2013 $7.99 ', '5,99 - 7,99', '7.99 - 5.99',
          '0 - 3', '5.99', 'abc', '5.99 ~ 7.99', '\\u200f5.99 - 7.99\\u200e', '5.99 \\u2014 7.99', '']
 print(json.dumps({'cases': cases, 'cells': [[c, parse_range(c)] for c in cells]}))
