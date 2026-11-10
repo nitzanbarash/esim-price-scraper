@@ -44,8 +44,8 @@ for _ in range(5000):
     cost = round(random.uniform(0.2, 30), 2)
     cur = None if random.random() < 0.15 else round(random.uniform(0.5, 55), 2)
     cases.append([gb, cost, cur, lo, hi, reprice(gb, cost, cur, lo, hi)])
-# The cheap-10GB bar ($2.75), cent by cent, so the two copies agree at its edge.
-for c in range(240, 311):
+# The 10GB ladder edges ($3 / $3.50 / $4), cent by cent, so the two copies agree there.
+for c in range(280, 421):
     for gb in (5, 10, 15):
         for cur, lo, hi in ((6.99, 5.99, 7.99), (None, 5.99, 7.99), (4.99, 3.99, 4.99),
                             (7.49, 6.99, 8.99), (5.99, 4.99, 7.99), (3.99, 3.49, 3.99)):
@@ -151,7 +151,7 @@ const cell = function (sheet, sheetRow, key) { return sheet.cells[sheetRow - 1][
 function twin10() {
   return makeSheet([
     row({ sku: '1.1.10', gb: '10gb', source: 'esim.dog', buy: '$4.10', price: '5.99', range: '5.99 - 7.99' }),
-    row({ sku: '1.1.10', gb: '10gb', source: 'Stellar', buy: '(\u20ac3.40) $3.90', price: '5.99',
+    row({ sku: '1.1.10', gb: '10gb', source: 'Stellar', buy: '(\u20ac3.50) $4.10', price: '5.99',
           range: '5.99 - 7.99', tick: TICK })
   ]);
 }
@@ -166,25 +166,29 @@ check('...and the owner is told why', t.length === 1 && t[0].indexOf('5.99 \u219
 check('...and P is the new margin', cell(s, 3, 'profit'), '\ud83d\udfe2 +$1.56 (+32.5%)');
 
 // The cost falls back -> no drop until the margin passes 200% (hard down).
-edit(s, 3, 'buy', '(\u20ac3.40) $3.90');
+edit(s, 3, 'buy', '(\u20ac3.50) $4.10');
 check('cheaper cost under 200% leaves the price', cell(s, 3, 'price'), 6.99);
-edit(s, 3, 'buy', '$2.80');
-check('$2.80 is not a cheap 10GB: 6.99 stays', cell(s, 3, 'price'), 6.99);
-t = edit(s, 3, 'buy', '$2.74');
-check('a 10GB bought under $2.75 comes straight down to 5.99, on both rows',
-      [cell(s, 2, 'price'), cell(s, 3, 'price')], [5.99, 5.99]);
+edit(s, 3, 'buy', '$4.00');
+check('$4.00 is not on the 10GB ladder: 6.99 stays', cell(s, 3, 'price'), 6.99);
+t = edit(s, 3, 'buy', '$3.99');
+check('a 10GB bought under $4 comes straight down to 5.97, on both rows',
+      [cell(s, 2, 'price'), cell(s, 3, 'price')], [5.97, 5.97]);
 check('...and the toast says which rule did it',
-      t.length === 1 && t[0].indexOf('6.99 \u2192 5.99 (10GB < $2.75)') >= 0, true);
+      t.length === 1 && t[0].indexOf('6.99 \u2192 5.97 (10GB ladder)') >= 0, true);
+edit(s, 3, 'buy', '$3.20');
+check('under $3.50 -> 5.49', cell(s, 3, 'price'), 5.49);
+edit(s, 3, 'buy', '$2.74');
+check('under $3 -> 4.97', cell(s, 3, 'price'), 4.97);
 t = edit(s, 3, 'price', '6.99');
-check('a price typed over a cheap 10GB is corrected to 5.99', cell(s, 3, 'price'), 5.99);
-check('...with a toast', t.length === 1 && t[0].indexOf('\u2192 5.99') >= 0, true);
+check('a price typed over a cheap 10GB is corrected to 4.97', cell(s, 3, 'price'), 4.97);
+check('...with a toast', t.length === 1 && t[0].indexOf('\u2192 4.97') >= 0, true);
 edit(s, 3, 'range', '6.99 - 8.99');
-check('a range that starts above 5.99 does not lift a cheap 10GB', cell(s, 3, 'price'), 5.99);
-edit(s, 3, 'range', '4.99 - 7.99');
-edit(s, 3, 'price', '5.49');
-check('a price typed BELOW 5.99 inside the range stays as typed', cell(s, 3, 'price'), '5.49');
+check('a range that starts above 4.97 does not lift a cheap 10GB', cell(s, 3, 'price'), 4.97);
+edit(s, 3, 'range', '3.99 - 7.99');
+edit(s, 3, 'price', '4.49');
+check('a price typed BELOW 4.97 inside the range stays as typed', cell(s, 3, 'price'), '4.49');
 
-// Over 200% steps down ONE step (15GB: a 10GB that cheap is the 5.99 ceiling).
+// Over 200% steps down ONE step (15GB: a 10GB that cheap is on the 10GB ladder).
 s = makeSheet([row({ sku: '1.1.15', gb: '15gb', source: 'Stellar', buy: '$3.90', price: '8.99',
                      range: '7.49 - 9.99', tick: TICK })]);
 edit(s, 2, 'buy', '$2.00');
@@ -257,7 +261,7 @@ check('...and changes nothing else', JSON.stringify(s.cells), before);
 
 // Moving the tick prices the package at the NEW row's cost.
 s = twin10();
-edit(s, 2, 'buy', '$4.50');           // 5.99 pays 38% at Stellar's cost, 20% at this one
+edit(s, 2, 'buy', '$4.50');           // 5.99 pays 32% at Stellar's cost, 20% at this one
 check('a cost on the unticked row still moves nothing', cell(s, 3, 'price'), '5.99');
 edit(s, 3, 'tick', '');
 edit(s, 2, 'tick', TICK);

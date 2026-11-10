@@ -155,8 +155,8 @@ The sell price itself (2026-10-07, price_ranges.py). A SKU with a range in
 up to the first 50-cent step that pays 30% of cost and, from 20GB, the
 size's dollar floor (price_ranges.DOLLAR_FLOOR; short of it, the high end —
 never off sale for it), down one step a run while it pays over 200%; 1GB to the lowest 10-cent step inside 0.99–1.49 that loses
-at most 10c; a 10GB bought under $2.75 never above 5.99, even below the
-range's low end (price_ranges.CHEAP_10GB_*, 2026-10-21) — with S and T
+at most 10c; a 10GB on the ladder (under $3/$3.50/$4 → never above 4.97/5.49/
+5.97), even below the range's low end (price_ranges.CHEAP_10GB_LADDER, 2026-11-10) — with S and T
 rewritten the way applyFee_ would. A range on a
 SKU also replaces the 20% floor in the verdict above: 'לא רווחי — מעל טווח'
 when no price in the range pays at a row's cost (the ceiling is still judged

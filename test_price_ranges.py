@@ -14,8 +14,9 @@ The owner's rules, 2026-10-07, each pinned below:
       the lower step still makes it,
     * 1GB: 0.99–1.49 on a 10-cent grid, the LOWEST step that loses at most
       10 cents after the processor's real fee,
-    * a 10GB bought under $2.75 never sells above 5.99, even when its range
-      starts higher; a lower price stays (2026-10-21),
+    * a 10GB follows a ladder by cost — under $3 / $3.50 / $4 → 4.97 / 5.49 /
+      5.97 — a ceiling even when its range starts higher; a lower price
+      stays (2026-11-10, replacing 10-21's under $2.75 → 5.99),
     * a blank range cell = hands off (the old 20% floor still judges),
     * the range belongs to the package: carried on a switch, mirrored onto
       the twin, and read off the twin when the owner typed it there,
@@ -118,17 +119,17 @@ check("under 30% → up as far as it takes (Canada 5GB, cost 4.25)",
 check("Greece 50GB cost 15.91 at 20.99 (24%): 21.99 pays 30% but earns $4.85 → 22.99 ($5.81)",
       pr.reprice(50, 15.91, 20.99, 16.99, 22.99), 22.99)
 check("30% exactly stays", pr.reprice(10, 4.00, 5.99, 5.99, 7.99), 5.99 if pr.margin_pct(5.99, 4.0) >= 30 else 6.49)
-check("inside the band: stays", pr.reprice(10, 3.0, 6.49, 5.99, 7.99), 6.49)
-check("over 200% → ONE step down (15GB: a 10GB that cheap is the 5.99 rule)",
+check("inside the band: stays", pr._range_price(10, 3.0, 6.49, 5.99, 7.99), 6.49)
+check("over 200% → ONE step down (15GB: a 10GB that cheap is the 10GB ladder)",
       pr.reprice(15, 2.0, 8.99, 7.49, 9.99), 8.49)
 check("over 200% at the low end stays", pr.reprice(15, 1.5, 7.49, 7.49, 9.99), 7.49)
 check("still over 200% after one step: the next run takes the next",
       pr.reprice(15, 1.5, 7.99, 7.49, 9.99), 7.49)
 check("no step pays → None (Canada 20GB, cost 12.90)", pr.reprice(20, 12.9, 14.49, 14.49, 17.49), None)
-check("off-grid current is snapped up first", pr.reprice(10, 3.0, 7.37, 5.99, 7.99), 7.49)
-check("current above the high end is pulled to it", pr.reprice(10, 3.0, 9.99, 5.99, 7.99), 7.99)
+check("off-grid current is snapped up first", pr._range_price(10, 3.0, 7.37, 5.99, 7.99), 7.49)
+check("current above the high end is pulled to it", pr._range_price(10, 3.0, 9.99, 5.99, 7.99), 7.99)
 check("…and if even that does not pay, None", pr.reprice(10, 7.0, 9.99, 5.99, 7.99), None)
-check("current below the low end is lifted to it", pr.reprice(10, 3.0, 4.99, 5.99, 7.99), 5.99)
+check("current below the low end is lifted to it", pr._range_price(10, 3.0, 4.99, 5.99, 7.99), 5.99)
 check("no current price: from the low end", pr.reprice(10, 4.5, None, 5.99, 7.99), 6.49)
 check("no cost: None", pr.reprice(10, None, 6.49, 5.99, 7.99), None)
 
@@ -160,22 +161,24 @@ check("feasible: none does", pr.feasible(10, 7.0, (5.99, 7.99)), False)
 check("feasible: no range → unjudged", pr.feasible(10, 7.0, None), None)
 check("feasible: no cost → unjudged", pr.feasible(10, None, (5.99, 7.99)), None)
 
-print("\n-- a cheap 10GB (bought under $2.75) never sells above 5.99 --")
-check("Germany $2.13 at 6.99 → 5.99, not one step", pr.reprice(10, 2.13, 6.99, 5.99, 7.99), 5.99)
-check("$2.62 at 6.49 → 5.99", pr.reprice(10, 2.62, 6.49, 5.99, 7.99), 5.99)
-check("$2.74 is cheap", pr.reprice(10, 2.74, 7.99, 5.99, 7.99), 5.99)
-check("$2.75 is not: the range rule (6.49 makes 114%, stays)", pr.reprice(10, 2.75, 6.49, 5.99, 7.99), 6.49)
-check("$2.75 at 5.99 stays 5.99 (96%)", pr.reprice(10, 2.75, 5.99, 5.99, 7.99), 5.99)
-check("unknown current price → 5.99", pr.reprice(10, 2.0, None, 5.99, 7.99), 5.99)
-check("5.99 wins over a range that starts higher", pr.reprice(10, 2.5, 7.49, 6.99, 8.99), 5.99)
-check("…but a lower price stays: a ceiling, never a lift", pr.reprice(10, 2.0, 4.99, 3.99, 4.99), 4.99)
-check("…and the range's own step-down still works under it (260% at 5.99 → 5.49)",
-      pr.reprice(10, 1.5, 5.99, 4.99, 7.99), 5.49)
-check("a range nothing pays stays off sale: the ceiling never rescues (3.99 makes 29%)",
-      pr.reprice(10, 2.7, 3.99, 3.49, 3.99), None)
+print("\n-- the 10GB ladder: under $3/$3.50/$4 → 4.97/5.49/5.97 --")
+check("Germany $2.13 at 6.99 → 4.97, not one step", pr.reprice(10, 2.13, 6.99, 5.99, 7.99), 4.97)
+check("Germany $2.13 at 4.99 → 4.97", pr.reprice(10, 2.13, 4.99, 4.99, 7.99), 4.97)
+check("$2.99 → 4.97, $3.00 → 5.49", (pr.cheap_cap(10, 2.99), pr.cheap_cap(10, 3.00)), (4.97, 5.49))
+check("$3.49 → 5.49, $3.50 → 5.97", (pr.cheap_cap(10, 3.49), pr.cheap_cap(10, 3.50)), (5.49, 5.97))
+check("$3.99 → 5.97, $4.00 → no ladder", (pr.cheap_cap(10, 3.99), pr.cheap_cap(10, 4.00)), (5.97, None))
+check("Korea $3.08 at 6.99 → 5.49", pr.reprice(10, 3.08, 6.99, 5.99, 7.99), 5.49)
+check("China $3.92 at 6.99 → 5.97", pr.reprice(10, 3.92, 6.99, 5.99, 7.99), 5.97)
+check("$4.00 is not on the ladder: the range rule (5.99 makes 30%?)",
+      pr.reprice(10, 4.00, 6.49, 5.99, 7.99), pr._range_price(10, 4.00, 6.49, 5.99, 7.99))
+check("unknown current price → the step", pr.reprice(10, 2.0, None, 5.99, 7.99), 4.97)
+check("the step wins over a range that starts higher", pr.reprice(10, 3.2, 7.49, 6.99, 8.99), 5.49)
+check("…but a lower price stays: a ceiling, never a lift", pr.reprice(10, 2.0, 3.99, 3.49, 3.99), 3.99)
+check("a range nothing pays stays off sale: the ceiling never rescues",
+      pr.reprice(10, 2.9, 3.99, 3.49, 3.99), None)
 check("a range too narrow to hold a step: off sale, as before", pr.reprice(10, 2.0, 6.0, 6.0, 6.1), None)
-check("a cheap 10GB under a range from 6.99 is for sale", pr.feasible(10, 2.0, (6.99, 8.99)), True)
 check("'10gb' as the sheet writes it is 10", pr.is_cheap_10gb(10.0, 2.0), True)
+check("is_cheap_10gb: under $4", (pr.is_cheap_10gb(10, 3.99), pr.is_cheap_10gb(10, 4.0)), (True, False))
 check("only 10GB: a 15GB at $2 keeps the range rule", pr.reprice(15, 2.0, 8.99, 7.49, 9.99), 8.49)
 check("only 10GB: a 5GB at $2 keeps the range rule", pr.reprice(5, 2.0, 4.99, 4.49, 5.99), 4.99)
 check("a 20GB at $2 is a cheap 20GB now: 8.99 over a range from 9.99", pr.reprice(20, 2.0, 9.99, 9.99, 12.99), 8.99)
@@ -186,7 +189,7 @@ check("20GB at exactly $6.00 keeps the range rule", pr.reprice(20, 6.00, 9.99, 9
 check("20GB at $6.50 keeps the range rule", pr.reprice(20, 6.50, 10.99, 9.99, 12.99), 11.99)
 check("a lower 20GB price stays: a ceiling, never a lift", pr.reprice(20, 3.0, 7.99, 6.99, 9.99), 7.99)
 check("only 20GB: a 30GB at $5 is not capped at 8.99", pr.reprice(30, 5.0, 12.99, 11.99, 14.99) != 8.99, True)
-check("cheap_cap: 10GB / 20GB / none", (pr.cheap_cap(10, 2.0), pr.cheap_cap(20, 4.0), pr.cheap_cap(20, 7.0)), (5.99, 8.99, None))
+check("cheap_cap: 10GB / 20GB / none", (pr.cheap_cap(10, 2.0), pr.cheap_cap(20, 4.0), pr.cheap_cap(20, 7.0)), (4.97, 8.99, None))
 check("30GB ladder: Italy $6.69 at 13.49 → 10.99", pr.reprice(30, 6.69, 13.49, 13.49, 17.49), 10.99)
 check("30GB ladder: $6.99 → 10.99, $7.00 → 11.99", (pr.cheap_cap(30, 6.99), pr.cheap_cap(30, 7.00)), (10.99, 11.99))
 check("30GB ladder: $7.87 → 11.99", pr.reprice(30, 7.87, 14.99, 13.49, 17.49), 11.99)
@@ -286,16 +289,16 @@ check("over 200% at the low end: nothing", decide([r]), [])
 
 r = row(2, "2.49.10", 2.13, final=6.99)
 d = decide([r])
-check("a cheap 10GB: 6.99 → 5.99 in one run", writes(d[0], "final"), [(2, 5.99)])
-check("…S and T follow", (writes(d[0], "my_price"), writes(d[0], "fee")), ([(2, 5.40)], [(2, 0.8)]))
-check("…the move is reported", d[0].price_move, (6.99, 5.99))
+check("a cheap 10GB: 6.99 → 4.97 in one run", writes(d[0], "final"), [(2, 4.97)])
+check("…S and T follow", (writes(d[0], "my_price"), writes(d[0], "fee")), ([(2, 4.42)], [(2, 0.6)]))
+check("…the move is reported", d[0].price_move, (6.99, 4.97))
 apply_to([r], d)
 check("…a second run writes nothing", decide([r]), [])
-r = row(2, "2.49.10", 2.13, final=5.99)
-check("a cheap 10GB already at 5.99: nothing", decide([r]), [])
+r = row(2, "2.49.10", 2.13, final=4.97)
+check("a cheap 10GB already at 4.97: nothing", decide([r]), [])
 r = row(2, "2.0.10", 2.4, final=7.49, rng="6.99 - 8.99")
-check("a cheap 10GB under a range that starts at 6.99: still 5.99",
-      writes(decide([r])[0], "final"), [(2, 5.99)])
+check("a cheap 10GB under a range that starts at 6.99: still 4.97",
+      writes(decide([r])[0], "final"), [(2, 4.97)])
 r = row(2, "2.49.10", 2.13, final=6.99, rng="")
 check("a cheap 10GB with a BLANK range: hands off",
       [w for x in decide([r]) for w in x.writes if w[1] == "final"], [])
@@ -352,16 +355,16 @@ check("reported once", d[0].price_move, (5.99, 6.99))
 a = row(2, "2.49.10", 2.29, final=6.99, chosen="")                 # dog, unticked
 b = row(3, "2.49.10", 2.13, source="Stellar", final=6.99)             # Stellar, ticked
 d = decide([a, b])
-check("a cheap 10GB twin: the ✓ row goes to 5.99 and the twin is mirrored it",
-      sorted(writes(d[0], "final")), [(2, 5.99), (3, 5.99)])
+check("a cheap 10GB twin: the ✓ row goes to 4.97 and the twin is mirrored it",
+      sorted(writes(d[0], "final")), [(2, 4.97), (3, 4.97)])
 apply_to([a, b], d)
 check("second run: nothing", [x.writes for x in decide([a, b])], [[]])
-a = row(2, "2.30.10", 2.82, final=6.49)                               # dog ticked at $2.82
-b = row(3, "2.30.10", 3.10, source="Stellar", final=6.49, chosen="")
+a = row(2, "2.30.10", 4.20, final=6.49)                               # dog ticked at $4.20
+b = row(3, "2.30.10", 4.40, source="Stellar", final=6.49, chosen="")
 d = decide([a, b])
-check("the ✓ row's cost decides: $2.82 is not cheap, 6.49 stays", writes(d[0], "final"), [])
-a = row(2, "2.30.10", 2.76, final=6.49)                               # ✓ row just over the bar
-b = row(3, "2.30.10", 2.74, source="Stellar", final=6.49, chosen="")  # twin under it, < 1% cheaper
+check("the ✓ row's cost decides: $4.20 is not cheap, 6.49 stays", writes(d[0], "final"), [])
+a = row(2, "2.30.10", 4.01, final=6.49)                               # ✓ row just over the bar
+b = row(3, "2.30.10", 3.99, source="Stellar", final=6.49, chosen="")  # twin under it, < 1% cheaper
 d = decide([a, b])
 check("…even when the unticked twin is the cheap one (no switch inside 1%)",
       (d[0].action, writes(d[0], "final")), ("keep", []))

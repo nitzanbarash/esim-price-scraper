@@ -41,14 +41,14 @@ copies to the same answers:
   * a CHEAP 20GB — bought under $6 (CHEAP_20GB_COST) — never sells above
     8.99, the same way (the owner, 2026-11-10); a 30GB follows a ladder by
     cost — under $7/8/9/10/11 → 10.99/11.99/12.99/14.49/15.99 (CHEAP_30GB_LADDER).
-  * a CHEAP 10GB — bought under $2.75 (CHEAP_10GB_COST) — never sells
-    above 5.99 (CHEAP_10GB_PRICE), even when its range starts higher (the
-    owner, 2026-10-21: "the price drops to 5.99"). It is a ceiling laid
+  * a CHEAP 10GB follows a ladder by cost (the owner, 2026-11-10, replacing
+    the 10-21 "under $2.75 → 5.99"): bought under $3 → 4.97, under $3.50 →
+    5.49, under $4 → 5.97 (CHEAP_10GB_LADDER). Each step is a ceiling laid
     over the answer above, not a price of its own: a 10GB the range puts
-    at 5.49 stays at 5.49, and one nothing in the range pays stays off
-    sale. 5.99 makes 96% at $2.75 and more below it, so a price the ceiling
-    sets always pays. Once the cost is $2.75 or more the range rule alone
-    decides again, from wherever the price is.
+    lower stays lower, and one nothing in the range pays stays off sale.
+    The steps sit off the .49/.99 grid on purpose (the owner's prices). At
+    the top edge of each step the margin is 29% / 26% / 23% — under the 30%
+    rule; the owner's call. From $4 up the range rule alone decides again.
 
 The margin is judged on 'מחיר שלי' (S) — U less the processor's real cut of
 4% + $0.35 (memory: fee-ladder-vs-real-fee) — exactly as 'רווח' (P) reads
@@ -95,13 +95,12 @@ STEP_1GB = 0.10            # the 1GB grid (…9)
 LOSS_1GB = 0.10            # 1GB may lose up to this, fee included
 RANGE_1GB = (0.99, 1.49)   # 1GB's range, the same for every country
 
-# A 10GB bought under CHEAP_10GB_COST never sells above CHEAP_10GB_PRICE, the
-# range notwithstanding (the owner, 2026-10-21: "if a 10GB costs under $2.5
-# the price drops to 5.99" — the bar raised to $2.75 the same day, and 5.99
-# wins over a range that starts higher).
+# A ladder for 10GB (the owner, 2026-11-10, replacing the 10-21 "under $2.75
+# → 5.99"): bought under $3 → 4.97, under $3.50 → 5.49, under $4 → 5.97. Each
+# step is a ceiling (never a lift) over the range.
 CHEAP_10GB_GB = 10
-CHEAP_10GB_COST = 2.75
-CHEAP_10GB_PRICE = 5.99
+CHEAP_10GB_LADDER = ((3.00, 4.97), (3.50, 5.49), (4.00, 5.97))
+CHEAP_10GB_COST = CHEAP_10GB_LADDER[-1][0]   # the top of the ladder: $4
 
 # The same ceiling for a 20GB (the owner, 2026-11-10: "every 20GB bought under
 # $6 from today on, by law, goes up on the site at 8.99"). Over the range
@@ -170,7 +169,7 @@ def pays(final: float, cost: float, gb: Optional[float]) -> bool:
 
 
 def is_cheap_10gb(gb: Optional[float], cost: Optional[float]) -> bool:
-    """A 10GB bought under CHEAP_10GB_COST: it never sells above CHEAP_10GB_PRICE."""
+    """A 10GB bought under CHEAP_10GB_COST ($4): on the 10GB ladder."""
     return (gb is not None and abs(gb - CHEAP_10GB_GB) < _EPS
             and cost is not None and 0 < cost < CHEAP_10GB_COST - _EPS)
 
@@ -181,16 +180,23 @@ def is_cheap_20gb(gb: Optional[float], cost: Optional[float]) -> bool:
             and cost is not None and 0 < cost < CHEAP_20GB_COST - _EPS)
 
 
+def _ladder(ladder, cost: float) -> Optional[float]:
+    for below, price in ladder:
+        if cost < below - _EPS:
+            return price
+    return None
+
+
 def cheap_cap(gb: Optional[float], cost: Optional[float]) -> Optional[float]:
     """The price a cheap package may not exceed, or None when it is not one."""
-    if is_cheap_10gb(gb, cost):
-        return CHEAP_10GB_PRICE
+    if gb is None or cost is None or cost <= 0:
+        return None
+    if abs(gb - CHEAP_10GB_GB) < _EPS:
+        return _ladder(CHEAP_10GB_LADDER, cost)
     if is_cheap_20gb(gb, cost):
         return CHEAP_20GB_PRICE
-    if gb is not None and abs(gb - CHEAP_30GB_GB) < _EPS and cost is not None and cost > 0:
-        for below, price in CHEAP_30GB_LADDER:
-            if cost < below - _EPS:
-                return price
+    if abs(gb - CHEAP_30GB_GB) < _EPS:
+        return _ladder(CHEAP_30GB_LADDER, cost)
     return None
 
 

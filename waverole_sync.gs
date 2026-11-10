@@ -254,10 +254,11 @@ function profitText_(net, buy) {
 //     still makes it. Only the 30% ever takes a package off sale.
 //   * 1GB: 0.99-1.49 on a 10-cent grid ending in 9 - the LOWEST step that
 //     loses at most 10 cents after the processor's real fee.
-//   * a CHEAP 10GB - bought under $2.75 (CHEAP_10GB_COST) - never sells
-//     above 5.99, even when its range starts higher (the owner, 2026-10-21).
-//     A ceiling over the answer above, not a price of its own: a lower
-//     price stays, and a package nothing in the range pays stays off sale.
+//   * a CHEAP 10GB follows a ladder by cost (the owner, 2026-11-10): bought
+//     under $3 / $3.50 / $4 never sells above 4.97 / 5.49 / 5.97, even when
+//     its range starts higher. A ceiling over the answer above, not a price
+//     of its own: a lower price stays, and a package nothing in the range
+//     pays stays off sale.
 //   * no step pays -> the price stays and Q says OVER_RANGE (site: sold out).
 // Margin is judged on the net (S), as P reads it. A blank range cell is the
 // off switch: that package is priced by hand, judged by the old 20% floor.
@@ -274,11 +275,11 @@ const RANGE_LOSS_1GB        = 0.10;  // 1GB may lose this much, fee included
 // left 20GB earning $3.52 and 50GB $4.80; below 20GB there is no floor.
 const DOLLAR_FLOOR          = [[20, 4.25], [30, 4.75], [40, 5.00], [50, 5.50]];
 const RANGE_EPS             = 1e-6;
-// A 10GB bought under CHEAP_10GB_COST never sells above CHEAP_10GB_PRICE -
-// price_ranges.CHEAP_10GB_* (2026-10-21). A blank range is still hands off.
+// A 10GB by a ladder of [bought under $, never above] - price_ranges.CHEAP_10GB_LADDER
+// (the owner, 2026-11-10). A blank range is still hands off.
 const CHEAP_10GB_GB         = 10;
-const CHEAP_10GB_COST       = 2.75;
-const CHEAP_10GB_PRICE      = 5.99;
+const CHEAP_10GB_LADDER     = [[3.00, 4.97], [3.50, 5.49], [4.00, 5.97]];
+const CHEAP_10GB_COST       = 4.00;   // the top of the ladder
 // ... and a 20GB bought under CHEAP_20GB_COST never sells above CHEAP_20GB_PRICE
 // (price_ranges.CHEAP_20GB_*, the owner, 2026-11-10).
 const CHEAP_20GB_GB         = 20;
@@ -313,7 +314,7 @@ function pays_(price, cost, gb) {
   return marginPct_(price, cost) >= RANGE_RAISE_BELOW_PCT - RANGE_EPS;
 }
 
-// A 10GB bought under CHEAP_10GB_COST: it never sells above CHEAP_10GB_PRICE.
+// A 10GB bought under CHEAP_10GB_COST ($4): on the 10GB ladder.
 function isCheap10gb_(gb, cost) {
   return gb !== null && gb !== undefined && Math.abs(gb - CHEAP_10GB_GB) < RANGE_EPS &&
          cost > 0 && cost < CHEAP_10GB_COST - RANGE_EPS;
@@ -326,14 +327,15 @@ function isCheap20gb_(gb, cost) {
 }
 
 // The price a cheap package may not exceed, or null when it is not one.
+function ladder_(steps, cost) {
+  for (let k = 0; k < steps.length; k++) if (cost < steps[k][0] - RANGE_EPS) return steps[k][1];
+  return null;
+}
 function cheapCap_(gb, cost) {
-  if (isCheap10gb_(gb, cost)) return CHEAP_10GB_PRICE;
+  if (gb === null || gb === undefined || !(cost > 0)) return null;
+  if (Math.abs(gb - CHEAP_10GB_GB) < RANGE_EPS) return ladder_(CHEAP_10GB_LADDER, cost);
   if (isCheap20gb_(gb, cost)) return CHEAP_20GB_PRICE;
-  if (gb !== null && gb !== undefined && Math.abs(gb - CHEAP_30GB_GB) < RANGE_EPS && cost > 0) {
-    for (let k = 0; k < CHEAP_30GB_LADDER.length; k++) {
-      if (cost < CHEAP_30GB_LADDER[k][0] - RANGE_EPS) return CHEAP_30GB_LADDER[k][1];
-    }
-  }
+  if (Math.abs(gb - CHEAP_30GB_GB) < RANGE_EPS) return ladder_(CHEAP_30GB_LADDER, cost);
   return null;
 }
 
@@ -451,11 +453,11 @@ function checkPriceRanges() {
     [10, 6.50, 5.99, 5.99, 7.99, null],         // nothing in the range pays
     [15, 2.00, 8.99, 7.49, 9.99, 8.49],         // > 200%: one step down
     [15, 1.50, 7.49, 7.49, 9.99, 7.49],         // ... never below the low end
-    [10, 2.13, 6.99, 5.99, 7.99, 5.99],         // a 10GB bought under $2.75: at most 5.99
-    [10, 2.74, 7.99, 5.99, 7.99, 5.99],
-    [10, 2.75, 6.49, 5.99, 7.99, 6.49],         // $2.75 is not cheap: the range rule
-    [10, 2.40, 7.49, 6.99, 8.99, 5.99],         // 5.99 wins over a range above it
-    [10, 2.00, 4.99, 3.99, 4.99, 4.99],         // ... but a lower price stays
+    [10, 2.13, 6.99, 5.99, 7.99, 4.97],         // 10GB ladder: under $3 -> at most 4.97
+    [10, 3.08, 6.99, 5.99, 7.99, 5.49],         // under $3.50 -> 5.49
+    [10, 3.92, 6.99, 5.99, 7.99, 5.97],         // under $4 -> 5.97
+    [10, 2.40, 7.49, 6.99, 8.99, 4.97],         // the step wins over a range above it
+    [10, 2.00, 3.99, 3.49, 3.99, 3.99],         // ... but a lower price stays
     [5, 2.00, 4.99, 4.49, 5.99, 4.99],          // only 10GB
     [10, 4.30, 6.75, 5.99, 7.99, 6.99],         // off the grid -> snapped up
     [10, 4.30, 9.99, 5.99, 7.99, 7.99],         // over the top -> clamped
@@ -633,7 +635,7 @@ function applyFee_(sheet, map, e) {
       if (want !== null && (price === null || Math.abs(want - price) >= 0.005)) {
         const cap = cheapCap_(gb, cost);
         const why = cap !== null && want === cap
-          ? (isCheap20gb_(gb, cost) ? ' (20GB < $' + CHEAP_20GB_COST + ')' : isCheap10gb_(gb, cost) ? ' (10GB < $' + CHEAP_10GB_COST + ')' : ' (30GB ladder)') : '';
+          ? (isCheap20gb_(gb, cost) ? ' (20GB < $' + CHEAP_20GB_COST + ')' : isCheap10gb_(gb, cost) ? ' (10GB ladder)' : ' (30GB ladder)') : '';
         moves.push(key + ' ' + (price === null ? '-' : price.toFixed(2)) + ' \u2192 ' + want.toFixed(2) + why);
         priceCell = want;
         price = want;
