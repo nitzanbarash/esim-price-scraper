@@ -56,6 +56,10 @@ for c in range(560, 641):
         for cur, lo, hi in ((9.99, 9.99, 12.99), (None, 9.99, 12.99), (12.49, 9.99, 12.99),
                             (7.99, 6.99, 9.99), (8.49, 7.99, 8.99)):
             cases.append([gb, c / 100, cur, lo, hi, reprice(gb, c / 100, cur, lo, hi)])
+# The 30GB ladder edges, cent by cent.
+for c in range(640, 1120, 3):
+    for cur, lo, hi in ((13.49, 13.49, 17.49), (None, 13.49, 17.49), (17.49, 13.49, 17.49), (9.99, 8.99, 10.99)):
+        cases.append([30, c / 100, cur, lo, hi, reprice(30, c / 100, cur, lo, hi)])
 cells = ['5.99 - 7.99', '5.99-7.99', ' $5.99 \\u2013 $7.99 ', '5,99 - 7,99', '7.99 - 5.99',
          '0 - 3', '5.99', 'abc', '5.99 ~ 7.99', '\\u200f5.99 - 7.99\\u200e', '5.99 \\u2014 7.99', '']
 print(json.dumps({'cases': cases, 'cells': [[c, parse_range(c)] for c in cells]}))
@@ -272,8 +276,8 @@ check('1GB with nothing paying stays and goes off sale',
 // The buy ceiling is judged first, as in the scraper and the chooser.
 s = makeSheet([row({ sku: '1.1.30', gb: '30gb', source: 'esim.dog', buy: '$9.00', price: '13.49',
                      range: '13.49 - 17.49', tick: TICK })]);
-edit(s, 2, 'buy', '$10.50');
-check('a 30GB bought over $10 is over the ceiling', cell(s, 2, 'stock'), OVER_CEILING);
+edit(s, 2, 'buy', '$11.50');
+check('a 30GB bought over $11 is over the ceiling', cell(s, 2, 'stock'), OVER_CEILING);
 
 console.log((failed ? 'FAILED ' + failed + ', ' : '') + 'passed ' + passed);
 process.exit(failed ? 1 : 0);

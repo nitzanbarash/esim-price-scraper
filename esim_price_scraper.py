@@ -384,7 +384,7 @@ PROFIT_MIN_PCT_1GB = -20.0   # 1GB plans are a loss leader; a 20% loss is allowe
 # never given a cap, and an open-ended last band silently handed them the
 # 50GB one — which never bit only because one-supplier SKUs were not judged
 # until 2026-10-06. From 75GB up nothing is judged until the owner names a cap.
-BUY_CEILINGS = ((30.0, 40.0, 10.0), (40.0, 50.0, 14.0), (50.0, 75.0, 18.0))   # (size from, size to, max buy $)
+BUY_CEILINGS = ((30.0, 40.0, 11.0), (40.0, 50.0, 14.0), (50.0, 75.0, 18.0))   # (size from, size to, max buy $)
 OVER_CEILING_LABEL = 'לא רווחי — מעל תקרה'
 # No per-SKU exceptions. The owner, 2026-10-06, when asked about one: "there is
 # no exceptions list - only 1GB packages are exceptions" (the loss-leader

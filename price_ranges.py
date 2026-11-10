@@ -39,7 +39,8 @@ copies to the same answers:
     the processor's real fee, is at most 10 cents (LOSS_1GB). Past 1.49 the
     package is off sale.
   * a CHEAP 20GB — bought under $6 (CHEAP_20GB_COST) — never sells above
-    8.99, the same way (the owner, 2026-11-10).
+    8.99, the same way (the owner, 2026-11-10); a 30GB follows a ladder by
+    cost — under $7/8/9/10/11 → 10.99/11.99/12.99/14.49/15.99 (CHEAP_30GB_LADDER).
   * a CHEAP 10GB — bought under $2.75 (CHEAP_10GB_COST) — never sells
     above 5.99 (CHEAP_10GB_PRICE), even when its range starts higher (the
     owner, 2026-10-21: "the price drops to 5.99"). It is a ceiling laid
@@ -109,6 +110,15 @@ CHEAP_20GB_GB = 20
 CHEAP_20GB_COST = 6.00
 CHEAP_20GB_PRICE = 8.99
 
+# A ladder for 30GB (the owner, 2026-11-10): bought under $7 → 10.99, under $8
+# → 11.99, under $9 → 12.99, under $10 → 14.49, under $11 → 15.99. Each step
+# is a ceiling the same way as above (never a lift); the dollar floor does not
+# hold it back. Every step pays 36%+ at its top edge. $11 and up: the range
+# rule alone — and the buy ceiling (esim_price_scraper.BUY_CEILINGS, raised to
+# $11 for 30GB the same day) takes it off the site.
+CHEAP_30GB_GB = 30
+CHEAP_30GB_LADDER = ((7.00, 10.99), (8.00, 11.99), (9.00, 12.99), (10.00, 14.49), (11.00, 15.99))
+
 # The least a sale may earn in dollars, net of the real fee, by size: (size
 # from, and up, dollars). Below 20GB there is none — the 30% is enough there.
 DOLLAR_FLOOR = ((20, 4.25), (30, 4.75), (40, 5.00), (50, 5.50))
@@ -177,6 +187,10 @@ def cheap_cap(gb: Optional[float], cost: Optional[float]) -> Optional[float]:
         return CHEAP_10GB_PRICE
     if is_cheap_20gb(gb, cost):
         return CHEAP_20GB_PRICE
+    if gb is not None and abs(gb - CHEAP_30GB_GB) < _EPS and cost is not None and cost > 0:
+        for below, price in CHEAP_30GB_LADDER:
+            if cost < below - _EPS:
+                return price
     return None
 
 

@@ -284,13 +284,16 @@ const CHEAP_10GB_PRICE      = 5.99;
 const CHEAP_20GB_GB         = 20;
 const CHEAP_20GB_COST       = 6.00;
 const CHEAP_20GB_PRICE      = 8.99;
+// ... and a 30GB by a ladder of [bought under $, never above] (price_ranges.CHEAP_30GB_LADDER).
+const CHEAP_30GB_GB         = 30;
+const CHEAP_30GB_LADDER     = [[7.00, 10.99], [8.00, 11.99], [9.00, 12.99], [10.00, 14.49], [11.00, 15.99]];
 const OVER_RANGE   = '\u05dc\u05d0 \u05e8\u05d5\u05d5\u05d7\u05d9 \u2014 \u05de\u05e2\u05dc \u05d8\u05d5\u05d5\u05d7';
 // The scraper's proportion rule (2026-09-17): from 30GB up, a package bought
 // above its size's ceiling is not for sale, whatever it sells for. Judged
 // first, on the buy price alone; regional bundles are exempt. The same
 // closed bands as esim_price_scraper.py BUY_CEILINGS.
 const OVER_CEILING = '\u05dc\u05d0 \u05e8\u05d5\u05d5\u05d7\u05d9 \u2014 \u05de\u05e2\u05dc \u05ea\u05e7\u05e8\u05d4';
-const BUY_CEILINGS = [[30, 40, 10], [40, 50, 14], [50, 75, 18]];   // [size from, size to, max buy $]
+const BUY_CEILINGS = [[30, 40, 11], [40, 50, 14], [50, 75, 18]];   // [size from, size to, max buy $]
 const REGIONAL_CODE_RE = /^\d+\.0[A-Z]?\./;
 // The three margin words the bots own in Q. Any other word there (the
 // scraper's out-of-stock, the owner's own note) is more specific than ours
@@ -326,6 +329,11 @@ function isCheap20gb_(gb, cost) {
 function cheapCap_(gb, cost) {
   if (isCheap10gb_(gb, cost)) return CHEAP_10GB_PRICE;
   if (isCheap20gb_(gb, cost)) return CHEAP_20GB_PRICE;
+  if (gb !== null && gb !== undefined && Math.abs(gb - CHEAP_30GB_GB) < RANGE_EPS && cost > 0) {
+    for (let k = 0; k < CHEAP_30GB_LADDER.length; k++) {
+      if (cost < CHEAP_30GB_LADDER[k][0] - RANGE_EPS) return CHEAP_30GB_LADDER[k][1];
+    }
+  }
   return null;
 }
 
@@ -625,7 +633,7 @@ function applyFee_(sheet, map, e) {
       if (want !== null && (price === null || Math.abs(want - price) >= 0.005)) {
         const cap = cheapCap_(gb, cost);
         const why = cap !== null && want === cap
-          ? (isCheap20gb_(gb, cost) ? ' (20GB < $' + CHEAP_20GB_COST + ')' : ' (10GB < $' + CHEAP_10GB_COST + ')') : '';
+          ? (isCheap20gb_(gb, cost) ? ' (20GB < $' + CHEAP_20GB_COST + ')' : isCheap10gb_(gb, cost) ? ' (10GB < $' + CHEAP_10GB_COST + ')' : ' (30GB ladder)') : '';
         moves.push(key + ' ' + (price === null ? '-' : price.toFixed(2)) + ' \u2192 ' + want.toFixed(2) + why);
         priceCell = want;
         price = want;
