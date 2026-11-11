@@ -70,7 +70,20 @@ log = logging.getLogger("stellar-buyer")
 BASE = "https://wholesale.stellarsecurity.com/api/v1"
 PORTAL_ORDER = "https://wholesale.stellarsecurity.com/orders/{id}"
 SUPPLIER = "stellar"                 # the sheet's 'מקור' value, compared lower-case
-WORKER = "gha:stellar"               # what the shared claim records
+# What the shared claim records. GitHub's buyer is gha:stellar; the network's
+# (orders_duty.py on the PCs, 2026-11-12) is net:stellar. Two DIFFERENT names
+# on purpose: the site's claim is a SET NX, so whichever asks first owns the
+# order and the other is told 409 and keeps its hands off. Under one name
+# they would both be "already ours".
+WORKER = (os.getenv("STELLAR_WORKER") or "gha:stellar").strip()[:64]
+# Names this run may take a claim OVER from, comma-separated (empty = none).
+# Set only by a backup that has been told the other buyer is dead: an order
+# claimed by a buyer that died mid-purchase would otherwise wait out the
+# claim's whole hour. Taking over is claiming under the HOLDER's name, which
+# the site answers as "yours already"; the receipts rows and Stellar's
+# idempotency key then make this run continue that purchase, not start a
+# second one (the module text, NOT TWICE).
+TAKEOVER = tuple(x.strip() for x in (os.getenv("STELLAR_TAKEOVER") or "").split(",") if x.strip())
 ROUTE_PREFIX = "Stellar "            # receipts Route: 'Stellar JC059'
 
 MAX_EUR = float(os.getenv("STELLAR_MAX_EUR", "30"))       # one order
@@ -256,7 +269,21 @@ def claim(order_id: str) -> bool:
     r = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": WORKER},
                       headers=_site_headers(), timeout=20)
     if r.status_code == 409:
-        log.warning(f"{order_id}: held by {r.json().get('by', '?')} -- not ours")
+        try:
+            ans = r.json()
+        except Exception:                                   # noqa: BLE001
+            ans = {}
+        by = str(ans.get("by") or "")
+        # A closed order (settled, or it already has its eSIM) is nobody's,
+        # whoever holds the claim: only a plain "another buyer holds it" may
+        # be taken over.
+        if by and by in TAKEOVER and not ans.get("reason"):
+            r2 = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": by},
+                               headers=_site_headers(), timeout=20)
+            if r2.status_code == 200 and bool(r2.json().get("claimed")):
+                log.warning(f"{order_id}: taken over from {by}, which is not answering")
+                return True
+        log.warning(f"{order_id}: held by {by or '?'} -- not ours")
         return False
     r.raise_for_status()
     return bool(r.json().get("claimed"))

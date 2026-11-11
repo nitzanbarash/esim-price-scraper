@@ -99,6 +99,11 @@ jobs:
       - name: Stellar buyer
         run: python test_stellar_buyer.py
 
+      # The network's orders duty (orders_duty.py): the bell, the 150 s look,
+      # the mail bot's rhythm, and "never claim what you cannot buy".
+      - name: Orders duty tests
+        run: python test_orders_duty.py
+
       # A duplicate eSIM email is money and trust, both already spent.
       # Since 2026-10-21 every automatic sender goes through one send_once
       # (sent stamp, mail lease, Sent folder), and a second PACKAGE is fine

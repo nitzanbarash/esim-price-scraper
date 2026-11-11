@@ -15,12 +15,26 @@ name: Stellar buyer
 # buy the same order twice. Money rules and the receipts-sheet ledger:
 # stellar_buyer.py. Its key can SPEND (memory: stellar-key-placement), so it
 # is scoped to the one step.
+#
+# 2026-11-12 (owner): the BACKUP. The computers of the update network buy
+# first (orders_duty.py, claim name net:stellar). This workflow is still woken
+# by every payment and asks the site whether the network's 'orders' job is
+# alive (net_gate.sh):
+#   alive     -> waits HEAD_START_S, then runs as ever. An order a computer
+#                has claimed answers 409 and is left alone; one nobody claimed
+#                (a lost bell, a computer mid-restart) is bought here.
+#   not alive -> runs at once, exactly as before the network existed, and may
+#                take over an order a computer claimed and died holding.
+# So with the computers off, an order is bought as fast as it always was.
 on:
   repository_dispatch:
     types: [order-paid]
   workflow_dispatch: {}
   schedule:
     - cron: "*/10 * * * *"
+
+env:
+  HEAD_START_S: "20"
 
 # A run that arrives while another is buying waits its turn instead of
 # racing it; GitHub keeps one pending run per group, which is all a queue
@@ -50,6 +64,17 @@ jobs:
       # and hands whatever is left to the next run; being killed HERE is a
       # stop with nothing written and nothing said, so this must be looser
       # than the budget, not tighter.
+      # One short call to the site. It can only say "stand back a moment";
+      # whatever goes wrong with it, the buyer below runs.
+      - name: Is the network buying?
+        id: net
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          NEED_JOB: orders
+        run: bash net_gate.sh
+
       - name: Stellar buyer
         timeout-minutes: 8
         env:
@@ -57,4 +82,12 @@ jobs:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
           STELLAR_API_KEY: ${{ secrets.STELLAR_API_KEY }}
-        run: python stellar_buyer.py
+          NET_ALIVE: ${{ steps.net.outputs.skip }}
+        run: |
+          if [ "$NET_ALIVE" = "true" ]; then
+            echo "The network is buying: ${HEAD_START_S}s head start, then whatever is unclaimed is bought here."
+            sleep "$HEAD_START_S"
+          else
+            export STELLAR_TAKEOVER="net:stellar"
+          fi
+          python stellar_buyer.py

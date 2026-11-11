@@ -9,6 +9,12 @@
 # not configured, the site unreachable, no token - and the job RUNS: a backup
 # that cannot tell must do the work rather than leave it undone.
 #
+# NEED_JOB (optional): the name of ONE network job (e.g. "orders"). Then the
+# network being up is not enough: that job must have SUCCEEDED on a computer
+# within MAX_JOB_AGE_S (default 900 - longer than one run of it may last plus
+# the two minutes between reports). The site answers jobs.<name>.age_s; an
+# answer without it (an older site) is "not known", and the backup runs.
+#
 # Writes skip=true|false to $GITHUB_OUTPUT. Never fails the job.
 set -u
 out="${GITHUB_OUTPUT:-/dev/stdout}"
@@ -29,11 +35,27 @@ else
   done
   state=$(python3 -c "import json;d=json.load(open('net_gate.json'));x=d.get('data') or d;print(x.get('state') or '')" 2>/dev/null || echo "")
   age=$(python3 -c "import json;d=json.load(open('net_gate.json'));x=d.get('data') or d;print(x.get('age_s') if x.get('age_s') is not None else '')" 2>/dev/null || echo "")
+  job="${NEED_JOB:-}"
+  jage=""
+  if [ -n "$job" ]; then
+    jage=$(NEED_JOB="$job" python3 -c "
+import json, os
+d = json.load(open('net_gate.json')); x = d.get('data') or d
+a = ((x.get('jobs') or {}).get(os.environ['NEED_JOB']) or {}).get('age_s')
+print(int(a) if isinstance(a, (int, float)) and not isinstance(a, bool) and a >= 0 else '')" 2>/dev/null || echo "")
+  fi
   rm -f net_gate.json
   echo "network: HTTP ${code}, state '${state}', last report ${age:-?}s ago"
   if [ "$code" = "200" ] && [ "$state" = "ok" ]; then
-    skip=true
-    echo "The network is up and doing this job - this GitHub backup is skipped."
+    if [ -z "$job" ]; then
+      skip=true
+      echo "The network is up and doing this job - this GitHub backup is skipped."
+    elif [ -n "$jage" ] && [ "$jage" -le "${MAX_JOB_AGE_S:-900}" ]; then
+      skip=true
+      echo "The network's '${job}' job last succeeded ${jage}s ago - it is doing this, the GitHub backup stands back."
+    else
+      echo "The network is up but its '${job}' job has no success within ${MAX_JOB_AGE_S:-900}s (last: ${jage:-unknown}s) - this GitHub backup runs."
+    fi
   else
     echo "The network is not reporting - this GitHub backup runs."
   fi

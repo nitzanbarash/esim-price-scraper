@@ -64,8 +64,11 @@ class Site:
             raise requests.ConnectionError("site unreachable")
         self.posts.append(dict(json))
         if "claim" in json:
-            if self.claim_by:
-                return Resp(409, {"ok": False, "claimed": False, "by": self.claim_by})
+            # The site's SET NX: the holder's own name is "yours already",
+            # any other name is 409 (with a reason when the order is closed).
+            if self.claim_by and (json["claim"] != self.claim_by or getattr(self, "claim_reason", "")):
+                return Resp(409, {"ok": False, "claimed": False, "by": self.claim_by,
+                                  **({"reason": self.claim_reason} if getattr(self, "claim_reason", "") else {})})
             return Resp(200, {"ok": True, "claimed": True, "by": json["claim"]})
         return Resp(200, {"ok": True})
 
@@ -1359,6 +1362,30 @@ check("the site says the customer was already mailed for this order: no mail, th
 
 site, _, _, _ = scenario([order()], StellarFake())
 check("an older site (no lease in the answer) still mails, once", len(mails) == 1, str(mails))
+
+
+# -- the two buyers (GitHub and the network) and the takeover -----------------
+print("\nT. two buyers, two names: the other one's order is left alone unless this run may take over")
+check("the default name is GitHub's", sb.WORKER == "gha:stellar" and sb.TAKEOVER == (), f"{sb.WORKER} {sb.TAKEOVER}")
+site, wsT, bought, _ = scenario([order()], (fT := StellarFake()), claim_by="net:stellar")
+check("held by the network's buyer: nothing bought, nothing reported",
+      bought == 0 and not fT.creates and not site.reports("failed") and not site.reports("fulfilled"), str(site.posts))
+sb.TAKEOVER = ("net:stellar",)
+try:
+    site, wsT, bought, logT = scenario([order()], (fT := StellarFake()), claim_by="net:stellar")
+    claims = [p["claim"] for p in site.posts if "claim" in p]
+    check("told the network's buyer is dead: the claim is taken under ITS name", claims[:2] == ["gha:stellar", "net:stellar"], str(claims))
+    check("...and the order is bought once", bought == 1 and len(fT.creates) == 1, f"{bought} {fT.creates}")
+    check("the log says it took over", "taken over from net:stellar" in logT, logT[-300:])
+    site, wsT, bought, _ = scenario([order()], (fT := StellarFake()), claim_by="pc:DESKTOP")
+    check("a holder that is not on the list is never taken over", bought == 0 and not fT.creates, str(site.posts))
+    closed = Site([order()], "net:stellar")
+    closed.claim_reason = "has_esim"
+    site, wsT, bought, _ = scenario([order()], (fT := StellarFake()), site=closed)
+    check("a closed order (it has its eSIM) is nobody's, list or no list",
+          bought == 0 and not fT.creates and len([p for p in site.posts if "claim" in p]) == 1, str(site.posts))
+finally:
+    sb.TAKEOVER = ()
 
 
 # ── summary (last, so it gates the exit code) ────────────────────────────────

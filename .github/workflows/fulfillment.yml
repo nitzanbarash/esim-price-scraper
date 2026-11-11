@@ -8,6 +8,14 @@ name: Order fulfillment (delivery emails)
 # backstop: when a Stellar order is still pending at tick time, the step
 # below wakes that workflow. Only stellar-buy.yml may ever buy from Stellar —
 # two buyers would share the claim worker name and could buy twice.
+#
+# 2026-11-12 (owner): the BACKUP of the update network. The computers run
+# this same bot (orders_duty.py) every five minutes, every 45 seconds while an
+# order is on its way. A tick here goes ahead only when the network's 'orders'
+# job has not succeeded for 15 minutes (net_gate.sh) - or when run by hand
+# with "force". Two copies running at once were always safe (the mail lease
+# on the site, the IMAP flags); the gate is there so GitHub does not do the
+# work twice, not for safety.
 on:
   schedule:
     # A BACKSTOP only: the sheet script (waverole_sync.gs fulfillmentTick)
@@ -16,7 +24,12 @@ on:
     # and each extra fire can only pile a second pending run onto the group
     # below, which GitHub then cancels as "superseded". 5 -> 15 on 2026-10-06.
     - cron: "*/15 * * * *"
-  workflow_dispatch: {}       # manual run from the Actions tab; the sheet script ticks this
+  workflow_dispatch:          # manual run from the Actions tab; the sheet script ticks this
+    inputs:
+      force:
+        description: "Run even though the network is doing this job"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -27,7 +40,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.net.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: net_gate.sh
+          sparse-checkout-cone-mode: false
+      - name: Is the network doing this job?
+        id: net
+        env:
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          NEED_JOB: orders
+          FORCE_RUN: ${{ github.event.inputs.force || 'false' }}
+        run: bash net_gate.sh
+
   fulfill:
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     runs-on: ubuntu-latest
     # The job clock starts when the job is CREATED, before a runner is
     # assigned. On 2026-10-05 a GitHub incident held runners for 10-15 min and
