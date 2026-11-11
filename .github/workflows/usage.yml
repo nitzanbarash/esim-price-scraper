@@ -13,14 +13,41 @@ on:
     # supplier is asked in batches of 50 — six runs a day is a rounding error
     # to it.
     - cron: "0 2,6,10,14,18,22 * * *"   # 05,09,13,17,21,01 Israel
-  workflow_dispatch: {}       # run it now from the Actions tab
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even though the network is up"
+        type: boolean
+        default: false
 
 concurrency:
   group: usage
   cancel-in-progress: false
 
 jobs:
+  # GitHub is the update network's BACKUP (owner, 2026-11-12): the PCs run
+  # this job themselves, so it goes ahead here only while the network is not
+  # reporting (net_gate.sh). 'force' from the Actions tab runs it anyway.
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    outputs:
+      skip: ${{ steps.net.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: net_gate.sh
+          sparse-checkout-cone-mode: false
+      - name: Is the update network up?
+        id: net
+        env:
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          FORCE_RUN: ${{ github.event.inputs.force || 'false' }}
+        run: bash net_gate.sh
+
   usage:
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30       # room for thousands of packages
     steps:

@@ -8,8 +8,15 @@ on:
   # (cron-job.org) can POST to workflow_dispatch instead.
   schedule:
     - cron: "0 7 * * *"   # 07:00 UTC = 10:00 Israel (summer) / 09:00 (winter)
-  # Manual trigger (Actions tab) + external triggers (cron-job.org).
+  # Manual trigger (Actions tab) + the sheet script's daily dispatch.
+  # Since 2026-11-12 every run is a BACKUP for the update network (net_gate.sh):
+  # it goes ahead only when the network is not reporting. 'force' runs it anyway.
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even though the network is up"
+        type: boolean
+        default: false
 
 # The sheet has one set of price columns and, since 2026-09-10, two writers:
 # this scrape and the 4-hourly stellar-prices.yml. They share this group so the
@@ -33,11 +40,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     outputs:
-      skip: ${{ steps.fresh.outputs.skip }}
+      skip: ${{ steps.net.outputs.skip == 'true' || steps.fresh.outputs.skip == 'true' }}
     steps:
+      # GitHub is the network's BACKUP (owner, 2026-11-12): the PCs scrape
+      # every country group every ~30 minutes, so this hour-long run is only
+      # wanted while the network is down. Asked on every run, dispatched or
+      # scheduled; 'force' from the Actions tab skips the question.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: net_gate.sh
+          sparse-checkout-cone-mode: false
+      - name: Is the update network up?
+        id: net
+        env:
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          FORCE_RUN: ${{ github.event.inputs.force || 'false' }}
+        run: bash net_gate.sh
+
       - name: Did a scrape already succeed in the last 16 hours?
         id: fresh
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' && steps.net.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
