@@ -1209,7 +1209,7 @@ def mail_live_q_changes(changes: list[tuple], moves: list[tuple] = (),
         msg["From"] = GMAIL_USER
         msg["To"] = ALERTS_EMAIL
         msg["Subject"] = ALERT_PREFIX + subject
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30, local_hostname="waverole.com") as s:
             s.starttls()
             s.login(GMAIL_USER, pw)
             s.send_message(msg)

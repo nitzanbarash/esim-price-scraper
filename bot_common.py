@@ -13,6 +13,7 @@ create_order or the finance bot.
 """
 
 import logging
+import json
 import os
 import re
 import smtplib
@@ -33,6 +34,10 @@ log = logging.getLogger("fulfillment")
 # ── constants ──────────────────────────────────────────────────────────────────
 
 GMAIL_USER = os.getenv("GMAIL_USER", "waverolesupply@gmail.com")
+# The name this program gives Gmail when it hands a mail over. Left to
+# smtplib it is the computer's own name or LAN address, and Gmail writes it
+# into the mail's Received header for every recipient to read.
+EHLO_NAME = "waverole.com"
 ALERTS_EMAIL = os.getenv("ALERTS_EMAIL", "uper.request@gmail.com")
 ALERT_PREFIX = "[fulfillment bot] "
 RECEIPTS_SHEET_ID = "1bWH_Zef0aNwZjLOR07hjJRZRXkrY73mX0aMLGPH6uao"
@@ -67,7 +72,7 @@ def alert(subject: str, body: str):
         msg["From"] = GMAIL_USER
         msg["To"] = ALERTS_EMAIL
         msg["Subject"] = f"{ALERT_PREFIX}{subject}"
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30, local_hostname="waverole.com") as s:
             s.starttls()
             s.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
             s.send_message(msg)
@@ -299,11 +304,10 @@ def is_replaced_status(status) -> bool:
 
 
 def sheet_client():
-    creds = env("GOOGLE_CREDENTIALS_JSON")
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        f.write(creds)
-        path = f.name
-    return gspread.service_account(filename=path)
+    # From memory, never through a file: until 2026-11-14 every call left a
+    # readable copy of the Google key in the temp folder (and the orders duty
+    # opens the sheet every few minutes, on a home computer).
+    return gspread.service_account_from_dict(json.loads(env("GOOGLE_CREDENTIALS_JSON")))
 
 
 def _row_time(s: str):

@@ -63,6 +63,8 @@ class Site:
             import requests
             raise requests.ConnectionError("site unreachable")
         self.posts.append(dict(json))
+        if json.get("release"):
+            return Resp(200, {"ok": True, "released": True})
         if "claim" in json:
             # The site's SET NX: the holder's own name is "yours already",
             # any other name is 409 (with a reason when the order is closed).
@@ -664,6 +666,24 @@ for code in (401, 403):
           not site.reports("failed") and len(ws19c.rows) == 1 and len(f19c.creates) == 1)
     check(f"{code}: the alert points at the key, not the order",
           alerts and "key" in alerts[0][0], str(alerts))
+    rel = [p for p in site.posts if p.get("release")]
+    check(f"{code}: our claim is let go at once, so the other buyer is not told 'not yours' for an hour",
+          len(rel) == 1 and rel[0].get("claim") == sb.WORKER and rel[0].get("order_id") == "WR-TEST01", str(site.posts))
+    check(f"{code}: the run says its key was refused (the orders duty stops claiming)", sb.TROUBLE["key"] is True)
+site, _, _, _ = scenario([order()], StellarFake(create=503))
+check("a 'busy' answer keeps the claim: only the same buyer's replay is sure to find the order",
+      not [p for p in site.posts if p.get("release")] and sb.TROUBLE["key"] is False, str(site.posts))
+check("the alert names where THIS buyer's key lives", "Actions secrets" in sb.key_place())
+site, wsU, _, _ = scenario([order()], (fU := StellarFake(create=["timeout", 401])))
+check("a request that was sent and never answered, then a refused replay: the claim is KEPT "
+      "(the first try may have created the order - only this buyer's key is sure to find it)",
+      not [p for p in site.posts if p.get("release")] and len(fU.creates) == 2, str(site.posts))
+check("...and the row goes to review, as for every unknown outcome", wsU.col(2, sb.H_STATUS) == sb.ST_REVIEW,
+      wsU.col(2, sb.H_STATUS) if len(wsU.rows) > 1 else "no row")
+site, _, boughtK, _ = scenario([order("WR-TEST01"), order("WR-TEST02")], (fK := StellarFake(create=401)))
+check("a refused key ends the run at the first order: the second is not claimed, refused and released too",
+      len(fK.creates) == 1 and [p["order_id"] for p in site.posts if "claim" in p and not p.get("release")] == ["WR-TEST01"],
+      str(site.posts))
 
 # ── 20. a row that names no Stellar order is never re-bought ─────────────────
 # order_rows() reads the link cell as the sheet RENDERS it. A reformatted link,

@@ -58,6 +58,33 @@ jobs:
           FORCE_RUN: ${{ github.event.inputs.force || 'false' }}
         run: bash net_gate.sh
 
+      # In THIS job since 2026-11-14, so it runs on every tick - also while
+      # the network is alive and the mail bot below is skipped: an order that
+      # GitHub's buyer claimed and left "processing" is finished only by
+      # GitHub's buyer, and nothing else wakes it between payments.
+      # Backstop for a lost order-paid dispatch (token missing, GitHub
+      # answered 404, the run cancelled behind another): if a Stellar order
+      # is still pending, wake stellar-buy.yml. Only a COUNT is printed —
+      # the orders JSON carries customer addresses and this repo is public.
+      - name: Wake the Stellar buyer if an order waits
+        continue-on-error: true
+        env:
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          DISPATCH_URL: https://api.github.com/repos/${{ github.repository }}/actions/workflows/stellar-buy.yml/dispatches
+        run: |
+          n=$(curl -sf -m 20 -H "Authorization: Bearer $ORDERS_TOKEN" \
+                "https://www.waverole.com/api/orders?status=pending&supplier=stellar" \
+              | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("orders") or []))' 2>/dev/null || echo 0)
+          echo "pending Stellar orders: $n"
+          if [ "${n:-0}" -gt 0 ]; then
+            curl -sf -m 20 -o /dev/null -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$DISPATCH_URL" -d '{"ref":"main"}' && echo "stellar-buy.yml dispatched"
+          fi
+
+
   fulfill:
     needs: gate
     if: needs.gate.outputs.skip != 'true'
@@ -84,28 +111,6 @@ jobs:
       # day, 5-10 s each and up to 4 minutes on a slow PyPI (2026-10-01).
       - name: Install dependencies
         run: pip install -q gspread requests google-auth
-
-      # Backstop for a lost order-paid dispatch (token missing, GitHub
-      # answered 404, the run cancelled behind another): if a Stellar order
-      # is still pending, wake stellar-buy.yml. Only a COUNT is printed —
-      # the orders JSON carries customer addresses and this repo is public.
-      - name: Wake the Stellar buyer if an order waits
-        continue-on-error: true
-        env:
-          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
-          GH_TOKEN: ${{ github.token }}
-          DISPATCH_URL: https://api.github.com/repos/${{ github.repository }}/actions/workflows/stellar-buy.yml/dispatches
-        run: |
-          n=$(curl -sf -m 20 -H "Authorization: Bearer $ORDERS_TOKEN" \
-                "https://www.waverole.com/api/orders?status=pending&supplier=stellar" \
-              | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("orders") or []))' 2>/dev/null || echo 0)
-          echo "pending Stellar orders: $n"
-          if [ "${n:-0}" -gt 0 ]; then
-            curl -sf -m 20 -o /dev/null -X POST \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "$DISPATCH_URL" -d '{"ref":"main"}' && echo "stellar-buy.yml dispatched"
-          fi
 
       # A normal run is 3-7 s of bot time; the slowest seen in 7 days was
       # 125 s (a slow Gmail SEARCH). The bot's own IMAP_TIMEOUT is the hang

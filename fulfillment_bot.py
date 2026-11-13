@@ -1508,7 +1508,7 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
     msg["From"] = f"Waverole <{GMAIL_USER}>"
     msg["To"] = to
     msg["Subject"] = L["subject"]
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as s:
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30, local_hostname="waverole.com") as s:
         s.starttls()
         s.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
         s.send_message(msg)

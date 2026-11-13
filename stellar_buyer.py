@@ -289,6 +289,36 @@ def claim(order_id: str) -> bool:
     return bool(r.json().get("claimed"))
 
 
+def release(order_id: str) -> bool:
+    """Let go of our claim, so the other buyer may take the order now and not
+    in an hour. Only ever called when the supplier REFUSED OUR KEY on the
+    order (401/403: it read the request and created nothing), never after a
+    "busy" answer - there the order may exist on the supplier's side, and
+    only the SAME buyer's replay of the same idempotency key is certain to
+    find it. Never raises."""
+    try:
+        r = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": WORKER, "release": True},
+                          headers=_site_headers(), timeout=20)
+        ok = r.status_code == 200 and r.json().get("released") is True
+    except Exception:                                       # noqa: BLE001
+        ok = False
+    log.info(f"{order_id}: claim {'released' if ok else 'NOT released (it expires by itself)'}")
+    return ok
+
+
+def key_place() -> str:
+    """Where a person fixes STELLAR_API_KEY for THIS buyer."""
+    return ("this computer's vault (on the Mac: mac/wrnet-cli keys orders)" if WORKER.startswith("net:")
+            else "the repo's Actions secrets")
+
+
+# What the last run() did (orders_duty reads it): "key" = the supplier
+# refused our key on an order; "placed" = how many orders were really placed
+# with the supplier (run()'s own count also holds the ones that could not be -
+# a short wallet, a busy supplier - which still wait in the queue).
+TROUBLE = {"key": False, "placed": 0}
+
+
 def report_fulfilled(order_id: str, esim: dict, supplier_ref: str = "") -> dict:
     """The site's answer ({} when it is not JSON). It matters since 2026-10-20:
     an order the owner settled and REPLACED while this purchase was running
@@ -798,6 +828,7 @@ class Run:
         self._created: Optional[dict] = None   # the body the purchase answered with
         self._rails: dict = {}                  # order id -> its Purchase cell (rail())
         self.bought = 0
+        self._let_go = False                   # the last buy() ended for a reason of OURS (handle)
         self.parked = 0                         # packages the site kept as extras (deliver())
 
     def hdr(self) -> list:
@@ -937,9 +968,16 @@ class Run:
         if self.bought >= MAX_ORDERS_PER_RUN:
             log.warning(f"{oid}: per-run cap of {MAX_ORDERS_PER_RUN} reached -- next run")
             return
+        self._let_go = False
         n, sid = self.buy(o, attempt=len(attempts))
+        if self._let_go and not sid:
+            # Our key was refused: the order is not held hostage for the
+            # claim's hour - the other buyer's key may be fine.
+            release(oid)
+            return
         self.bought += 1
         if sid:
+            TROUBLE["placed"] += 1
             # The answer to the purchase itself is the first poll: it carries
             # the order, and often the credentials with it.
             self.settle(o, n, sid, wait=True, first=self._created)
@@ -1031,15 +1069,22 @@ class Run:
             return n, ""
         msg = f"HTTP {code} {err.get('code', '')} {err.get('message', '')}".strip()
 
-        if code in AUTH_CODES:
+        if code in AUTH_CODES and not unsure:
+            # (After an exchange whose first answer never came - `unsure` -
+            # a refusal of the REPLAY says nothing about what the first try
+            # did: that falls through to the review row below, and the claim
+            # is kept.)
             # Says nothing about this order, so the order is told nothing. It
             # keeps its place in the queue and the next run asks again.
             log.error(f"{oid}: Stellar refused the KEY ({msg}) -- not the order's fault")
             alert_hourly("Stellar refused the key",
                          f"Stellar answered {msg}. That is our key or an edge in front of it, not "
                          f"{oid} ({sku}) -- so nothing was reported against the order and every "
-                         f"queued Stellar order is simply waiting. Check STELLAR_API_KEY in the "
-                         f"repo secrets and the account at wholesale.stellarsecurity.com.", self.now)
+                         f"queued Stellar order is simply waiting. Check STELLAR_API_KEY in "
+                         f"{key_place()} (it needs orders:create) and the account at "
+                         f"wholesale.stellarsecurity.com.", self.now)
+            TROUBLE["key"] = True
+            self._let_go = True
             return 0, ""
 
         if code in BUSY_CODES:
@@ -1403,7 +1448,7 @@ def preflight(st: Optional[Stellar] = None, loud: bool = False,
     except Exception as ex:
         alert_hourly("no Stellar key in this run",
                      f"{ex}\n\nNothing can be bought from Stellar until STELLAR_API_KEY is "
-                     f"set in the repo's Actions secrets and reaches this step.", now)
+                     f"set in {key_place()} and reaches this step.", now)
         log.error("STELLAR_API_KEY is not set")
         return False
 
@@ -1414,8 +1459,8 @@ def preflight(st: Optional[Stellar] = None, loud: bool = False,
         if code in AUTH_CODES:
             alert_hourly("Stellar refuses our key",
                          f"GET /wallet answered {code}. Nothing can be bought from Stellar "
-                         f"until this is fixed: check STELLAR_API_KEY in the repo's Actions "
-                         f"secrets against the one in the portal.", now)
+                         f"until this is fixed: check STELLAR_API_KEY in {key_place()} "
+                         f"against the one in the portal.", now)
             log.error(f"Stellar refuses our key ({code})")
         else:
             log.warning(f"wallet read answered {code} -- not the key; asking again next run")
@@ -1445,6 +1490,7 @@ def preflight(st: Optional[Stellar] = None, loud: bool = False,
 
 
 def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -> int:
+    TROUBLE["key"], TROUBLE["placed"] = False, 0
     orders = pending_orders()
     if not orders:
         log.info("no Stellar orders pending")
@@ -1479,6 +1525,11 @@ def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -
             done.add(oid)
             try:
                 r.handle(o)
+                if TROUBLE["key"]:
+                    # Our key is refused: the next order would be claimed,
+                    # refused and released the same way. Stop here.
+                    stop = True
+                    break
             except Blocked as ex:
                 log.error(f"nothing is bought this run: {ex}")
                 alert_hourly("the Stellar catalogue read is not trustworthy",

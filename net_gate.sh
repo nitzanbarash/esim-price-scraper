@@ -15,10 +15,21 @@
 # the two minutes between reports). The site answers jobs.<name>.age_s; an
 # answer without it (an older site) is "not known", and the backup runs.
 #
-# Writes skip=true|false to $GITHUB_OUTPUT. Never fails the job.
+# takeover (with NEED_JOB only): may this backup take over the network's own
+# CLAIMS? Only on positive proof that the network's job is dead: the site
+# answered, and it names a last success older than TAKEOVER_AGE_S (default
+# 1500 - a run cut at its 720 s limit, the 60 s rest, the next run of 240 s
+# and the 2 minutes between reports all fit inside). "Cannot tell" - an older
+# site, an error, no answer in time - is NOT proof: then the backup works on
+# what nobody has claimed and leaves the network's claims alone (two buyers
+# under one claim was the review's finding of 2026-11-14).
+#
+# Writes skip=true|false and takeover=true|false to $GITHUB_OUTPUT. Never
+# fails the job. The three tries fit inside a 2-minute step.
 set -u
 out="${GITHUB_OUTPUT:-/dev/stdout}"
 skip=false
+takeover=false
 if [ "${FORCE_RUN:-false}" = "true" ]; then
   echo "Run by hand with force: the network is not asked."
 elif [ -z "${ORDERS_TOKEN:-}" ]; then
@@ -26,12 +37,12 @@ elif [ -z "${ORDERS_TOKEN:-}" ]; then
 else
   code=0
   for i in 1 2 3; do
-    code=$(curl -sS -o net_gate.json -w '%{http_code}' --max-time 40 \
+    code=$(curl -sS -o net_gate.json -w '%{http_code}' --max-time 20 \
       -X POST 'https://www.waverole.com/api/admin?fn=net_watch' \
       -H "Authorization: Bearer ${ORDERS_TOKEN}" \
       -H 'Content-Type: application/json' --data '{}') || code=0
     [ "$code" = "200" ] && break
-    sleep 15
+    sleep 5
   done
   state=$(python3 -c "import json;d=json.load(open('net_gate.json'));x=d.get('data') or d;print(x.get('state') or '')" 2>/dev/null || echo "")
   age=$(python3 -c "import json;d=json.load(open('net_gate.json'));x=d.get('data') or d;print(x.get('age_s') if x.get('age_s') is not None else '')" 2>/dev/null || echo "")
@@ -59,6 +70,11 @@ print(int(a) if isinstance(a, (int, float)) and not isinstance(a, bool) and a >=
   else
     echo "The network is not reporting - this GitHub backup runs."
   fi
+  if [ "$code" = "200" ] && [ -n "$job" ] && [ -n "$jage" ] && [ "$jage" -gt "${TAKEOVER_AGE_S:-1500}" ]; then
+    takeover=true
+    echo "The network's '${job}' job has had no success for ${jage}s - its claims may be taken over."
+  fi
 fi
 echo "skip=${skip}" >> "$out"
+echo "takeover=${takeover}" >> "$out"
 exit 0

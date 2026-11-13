@@ -83,11 +83,17 @@ jobs:
           ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
           STELLAR_API_KEY: ${{ secrets.STELLAR_API_KEY }}
           NET_ALIVE: ${{ steps.net.outputs.skip }}
+          NET_DEAD: ${{ steps.net.outputs.takeover }}
         run: |
           if [ "$NET_ALIVE" = "true" ]; then
             echo "The network is buying: ${HEAD_START_S}s head start, then whatever is unclaimed is bought here."
             sleep "$HEAD_START_S"
-          else
+          elif [ "$NET_DEAD" = "true" ]; then
+            # Positive proof only (net_gate.sh): the network's orders job has
+            # had no success for 25 minutes, so an order it claimed is stuck.
+            echo "The network's buyer is dead: its claims are taken over."
             export STELLAR_TAKEOVER="net:stellar"
+          else
+            echo "The network's state is not known: only unclaimed orders are bought here."
           fi
           python stellar_buyer.py

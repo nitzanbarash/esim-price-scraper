@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 import tempfile
@@ -68,6 +69,22 @@ HOT_FOR_S = float(os.getenv("ORDERS_HOT_FOR_S", "600"))
 # bell is rung beside the queue write, not after it, and may win the race.
 RING_RELOOK_S = (3.0, 8.0)
 RING_MIN_GAP_S = 5.0          # rings closer than this are one ring (a forged storm buys nothing)
+# What a stranger who learned the bell's address can cost (review 2026-11-14):
+# a run answers at most RING_BUDGET rings - after that only the POLL_S look
+# reads the queue - and rings may quicken the mail bot HOT_RINGS_A_DAY times a
+# day at most (a look that really bought always may).
+RING_BUDGET = 8
+HOT_RINGS_A_DAY = 60
+BELL_LINE_MAX = 8192          # a longer line is not a ring: the connection is dropped
+# After a look failed this many times in a row, or the mail bot twice, the run
+# ends as FAILED: the network then tries the other computer, and GitHub's
+# backup sees a duty without a success and does the work.
+LOOK_FAILS_MAX = 3
+MAIL_FAILS_MAX = 2
+MAIL_RETRY_S = 30.0
+QUICK_LOOKS_MAX = 5           # looks in a row "because the last one bought", then the usual rhythm
+NO_BUY_S = 900.0              # after the supplier refused OUR key on an order
+KEY_REFUSED, LOOK_FAILED = -2, -1     # buyer_tick's answers that are not a count
 BELL_URL = (os.getenv("ORDERS_BELL_URL") or "").strip()
 S2 = "s2"                     # the ring's word for an order this duty buys itself
 STATE = os.path.join(tempfile.gettempdir(), "wr_orders_duty.json")
@@ -88,15 +105,16 @@ def save_state(d: dict, path: str = STATE):
     try:
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="ascii") as f:
-            json.dump(d, f)
+            json.dump(d, f, allow_nan=False)
         os.replace(tmp, path)
-    except OSError:
+    except (OSError, ValueError):
         pass                  # a lost state file is one early look, never an error
 
 
 def _num(d: dict, k: str) -> float:
     v = d.get(k)
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 0.0
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    return float(v) if ok else 0.0
 
 
 # -- the bell --------------------------------------------------------------
@@ -129,7 +147,7 @@ class Bell:
                 with self.get(self.url + "/json", params=params, stream=True, timeout=(10, 120)) as r:
                     if r.status_code != 200:
                         raise OSError(f"bell answered {r.status_code}")
-                    for line in r.iter_lines():
+                    for line in self._lines(r):
                         if self.stop.is_set():
                             return
                         self.feed(line)
@@ -138,10 +156,29 @@ class Bell:
                 log.info(f"bell connection ended ({type(ex).__name__}) -- reconnecting")
             self.stop.wait(5)
 
+    @staticmethod
+    def _lines(r):
+        """The stream's lines; one longer than BELL_LINE_MAX is skipped (a
+        sender that never ends its line would otherwise grow this process
+        for ever)."""
+        buf, skipping = b"", False
+        for chunk in r.iter_content(chunk_size=1024):
+            buf += chunk or b""
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if skipping:
+                    skipping = False      # the tail of the over-long line
+                else:
+                    yield line
+            if len(buf) > BELL_LINE_MAX:
+                # Skipped, not a reason to reconnect: the topic would replay
+                # the same line and the bell would stay deaf.
+                buf, skipping = b"", True
+
     def feed(self, line):
         """One line of the topic's stream. Anything that is not a message
         (open, keepalive, garbage) is nothing."""
-        if not line:
+        if not line or len(line) > BELL_LINE_MAX:
             return False
         try:
             ev = json.loads(line if isinstance(line, str) else line.decode("utf-8", "replace"))
@@ -150,7 +187,10 @@ class Bell:
         if not isinstance(ev, dict) or ev.get("event") != "message":
             return False
         t = ev.get("time")
-        if isinstance(t, (int, float)) and not isinstance(t, bool) and t >= self.since:
+        # A time from the future (or one that is no number at all) would be
+        # remembered as "replay from then" and silence the bell for good.
+        if (isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t)
+                and self.since <= t <= time.time() + 60):
             self.since = float(t) + 1      # replay from after this one, not from it
         word = str(ev.get("message") or "").strip().lower()[:8]
         with self.lock:
@@ -174,17 +214,24 @@ class Bell:
 # -- the two jobs ----------------------------------------------------------
 
 def buyer_tick() -> int:
-    """One look at the s2 queue; buys what is there. Never raises."""
+    """One look at the s2 queue; buys what is there. Never raises. Returns
+    how many were bought, or LOOK_FAILED (the queue could not be read, the
+    buyer crashed) or KEY_REFUSED (the supplier refused our key on an order:
+    the claim was released, and this computer must stop claiming)."""
     import stellar_buyer as sb
     try:
-        return int(sb.run() or 0)
+        n = int(sb.run() or 0)
     except Exception as ex:                                  # noqa: BLE001
         log.error(f"buyer tick failed: {type(ex).__name__}")
         try:
-            sb.alert_hourly("buyer crashed (network)", f"{type(ex).__name__}: {ex}")
+            sb.alert_hourly("buyer crashed (network)", f"{type(ex).__name__}")
         except Exception:                                    # noqa: BLE001
             pass
-        return 0
+        return LOOK_FAILED
+    if sb.TROUBLE.get("key"):
+        return KEY_REFUSED
+    placed = sb.TROUBLE.get("placed")       # really placed; n also counts the ones that could not be
+    return n if placed is None else int(placed)
 
 
 def ready_to_buy() -> bool:
@@ -203,23 +250,49 @@ def ready_to_buy() -> bool:
         if not sb.preflight():
             return False
         sb.fb.sheet_client().open_by_key(sb.fb.RECEIPTS_SHEET_ID)
+        sb.pending_orders()      # the site accepts this computer's token (a refusal raises)
         return True
     except Exception as ex:                                  # noqa: BLE001
         log.error(f"not ready to buy: {type(ex).__name__}")
         return False
 
 
-def fulfil_tick():
-    """One run of the delivery-mail bot. Never raises: its own SystemExit(1)
-    (a mailbox that needs a person - it has mailed the owner) ends the tick,
-    not the duty."""
+def ready_to_mail() -> bool:
+    """Can THIS computer read the mailbox and send a mail right now? Asked
+    at the start of every run, beside ready_to_buy, for the other half of
+    the rule: A DUTY THAT REPORTS SUCCESS SILENCES THE BACKUP. Before
+    2026-11-14 a wrong Gmail password in one vault (or a line that blocks
+    mail) left the run green, GitHub's mail bot stood back, and no customer
+    got an eSIM from anywhere."""
+    import smtplib
+    import fulfillment_bot as fb
+    try:
+        fb._open_inbox(attempts=2).close()
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20, local_hostname="waverole.com") as s:
+            s.starttls()
+            s.login(fb.GMAIL_USER, fb.env("GMAIL_APP_PASSWORD").replace(" ", ""))
+        return True
+    except Exception as ex:                                  # noqa: BLE001
+        log.error(f"not ready to mail: {type(ex).__name__}")    # the type only: no address, no password
+        return False
+
+
+def fulfil_tick() -> bool:
+    """One run of the delivery-mail bot. Never raises. False when it could
+    not do its work for a reason that will still be there next time (its
+    own SystemExit(1): a mailbox that needs a person - it has mailed the
+    owner; or a crash); a passing hiccup it rode out itself is True."""
     import fulfillment_bot as fb
     try:
         fb.main()
-    except SystemExit:
+        return True
+    except SystemExit as ex:
+        if not ex.code:
+            return True
         log.error("mail bot: the mailbox needs a person (it has said so by mail)")
     except Exception as ex:                                  # noqa: BLE001
         log.error(f"mail bot tick failed: {type(ex).__name__}")
+    return False
 
 
 # -- the loop --------------------------------------------------------------
@@ -232,12 +305,16 @@ def duty(bell, state: dict, *, buyer=buyer_tick, fulfil=fulfil_tick, clock=time.
     t0 = mono()
     last_poll, last_fulfil = _num(state, "last_poll"), _num(state, "last_fulfil")
     hot_until, last_ring = _num(state, "hot_until"), 0.0
+    hot_day, hot_n = int(_num(state, "hot_day")), int(_num(state, "hot_n"))
     relook: list = []            # wall times of the looks a ring still owes
-    stats = {"polls": 0, "bought": 0, "rings": 0, "mail_runs": 0}
+    stats = {"polls": 0, "bought": 0, "rings": 0, "mail_runs": 0, "failed": ""}
+    look_fails = mail_fails = quick = 0
+    no_buy_until = _num(state, "no_buy_until")
 
     def remember():
         save({"last_poll": last_poll, "last_fulfil": last_fulfil, "hot_until": hot_until,
-              "bell_since": getattr(bell, "since", 0.0)})
+              "bell_since": getattr(bell, "since", 0.0), "hot_day": hot_day, "hot_n": hot_n,
+              "no_buy_until": no_buy_until, "failed": bool(stats["failed"])})
 
     while mono() - t0 < run_s:
         now = clock()
@@ -248,10 +325,16 @@ def duty(bell, state: dict, *, buyer=buyer_tick, fulfil=fulfil_tick, clock=time.
             last_fulfil = 0.0
         codes = bell.rings()
         look = False
-        if codes and now - last_ring >= RING_MIN_GAP_S:
+        if codes and now - last_ring >= RING_MIN_GAP_S and stats["rings"] < RING_BUDGET:
             last_ring = now
             stats["rings"] += 1
-            hot_until = now + HOT_FOR_S          # an order is on its way: the mail bot keeps close
+            # An order is on its way: the mail bot keeps close - for a ring
+            # that names a supplier, and a bounded number of times a day.
+            if int(now // 86400) != hot_day:
+                hot_day, hot_n = int(now // 86400), 0
+            if any(c for c in codes) and hot_n < HOT_RINGS_A_DAY:
+                hot_n += 1
+                hot_until = max(hot_until, now + HOT_FOR_S)
             if any(c in (S2, "") for c in codes):
                 look = True
                 relook = [now + d for d in RING_RELOOK_S]
@@ -260,49 +343,99 @@ def duty(bell, state: dict, *, buyer=buyer_tick, fulfil=fulfil_tick, clock=time.
             look = True
         if now - last_poll >= POLL_S:
             look = True
+        if look and mail_fails:
+            look = False                          # nothing is claimed while the mail half is in doubt
         if look:
             last_poll = now
             remember()                            # before the work: a run killed mid-purchase still looked
             got = buyer()
             stats["polls"] += 1
+            if got == KEY_REFUSED:
+                no_buy_until = clock() + NO_BUY_S
+                stats["failed"] = "key"
+                break
+            if got < 0:
+                look_fails += 1
+                if look_fails >= LOOK_FAILS_MAX:
+                    stats["failed"] = "look"
+                    break
+                continue
+            look_fails = 0
             stats["bought"] += got
             if got:
-                relook = []                       # the ring was answered
+                # The queue may hold more than one look buys (the buyer hands
+                # the rest back after its own budget): look again at once -
+                # a bounded number of times in a row.
+                quick += 1
+                relook = [clock()] if quick <= QUICK_LOOKS_MAX else []
                 hot_until = max(hot_until, clock() + HOT_FOR_S)
+            else:
+                quick = 0
             continue                              # the clock moved: read it again before the mail bot
-        every = HOT_FULFIL_S if now < hot_until else FULFIL_S
+        # 3. a mail bot that just failed is tried once more soon, whatever the rhythm
+        every = MAIL_RETRY_S if mail_fails else (HOT_FULFIL_S if now < hot_until else FULFIL_S)
         if now - last_fulfil >= every:
             last_fulfil = now
             remember()
-            fulfil()
             stats["mail_runs"] += 1
+            if fulfil() is False:
+                mail_fails += 1
+                if mail_fails >= MAIL_FAILS_MAX:
+                    stats["failed"] = "mail"
+                    break
+            else:
+                mail_fails = 0
             continue
         due = [last_poll + POLL_S, last_fulfil + every] + relook[:1]
         left = run_s - (mono() - t0)
         bell.wait(max(0.2, min(min(due) - now, left)))
+    if mail_fails and not stats["failed"]:
+        stats["failed"] = "mail"                  # the run ended before the retry: the next one proves it first
     remember()
     return stats
 
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-    if not ready_to_buy():
-        # The mail bot needs neither the supplier's key nor its wallet: one
-        # run of it before handing the duty back, so the eSIM mails keep
-        # going out at the network's retry rhythm while this is sorted out.
-        log.error("this computer cannot buy right now -- the duty is handed back (nothing was claimed)")
-        fulfil_tick()
-        return 1
+    began = time.monotonic()                    # the job's time limit counts from here, checks included
     state = load_state()
+    mail_ok = ready_to_mail()
+    held = time.time() < _num(state, "no_buy_until")
+    if held:
+        log.error("the supplier refused this computer's key on an order a short while ago -- it does not "
+                  "claim again yet (fix STELLAR_API_KEY: on the Mac, mac/wrnet-cli keys orders)")
+    if held or not mail_ok or not ready_to_buy():
+        # A run that cannot do the WHOLE duty claims nothing and ends as
+        # failed: the network tries the other computer, and GitHub's backup
+        # - which stands back only while this job succeeds - does the work.
+        # The mail bot needs neither the supplier's key nor its wallet: one
+        # run of it, so the eSIM mails keep going out meanwhile.
+        log.error("this computer cannot do the whole duty right now -- handed back (nothing was claimed)")
+        if mail_ok:
+            fulfil_tick()
+        state["failed"] = True
+        save_state(state)
+        return 1
+    if state.get("failed"):
+        # The last run ended badly: prove the mail half works before a
+        # single order is claimed (a computer that keeps buying while it
+        # keeps failing would share its claims with the backup).
+        if not fulfil_tick():
+            log.error("the mail bot still cannot do its work -- handed back (nothing was claimed)")
+            return 1
+        state["last_fulfil"] = time.time()
     bell = Bell(BELL_URL, since=_num(state, "bell_since")).start()
     if not BELL_URL:
         log.warning(f"no bell address in the vault (ORDERS_BELL_URL) -- the queue is read every {POLL_S:.0f}s only")
     try:
-        stats = duty(bell, state)
+        stats = duty(bell, state, run_s=max(0.0, RUN_S - (time.monotonic() - began)))
     finally:
         bell.close()
     log.info(f"duty done: {stats['polls']} look(s) at the queue, {stats['bought']} bought, "
              f"{stats['rings']} ring(s), {stats['mail_runs']} mail-bot run(s)")
+    if stats["failed"]:
+        log.error(f"the duty is handed back as FAILED ({stats['failed']})")
+        return 1
     return 0
 
 
