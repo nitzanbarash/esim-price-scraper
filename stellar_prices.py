@@ -107,6 +107,28 @@ API_PER_PAGE = 100            # the API's maximum
 # every country after Singapore read as GONE. See fetch_plans.
 API_MAX_PAGES = 300
 API_CALLS_PER_MINUTE = 55     # Stellar allows 60 a minute per IP (X-RateLimit-Limit)
+
+
+def calls_per_minute() -> int:
+    """This run's share of Stellar's 60 a minute per IP. STELLAR_RATE_LIMIT
+    lowers it (2026-11-13: on the home PCs this read shares one IP with usage
+    25 + usage_live 30, so the network runs it at 20); never above 55."""
+    try:
+        v = int(os.environ.get("STELLAR_RATE_LIMIT", "") or API_CALLS_PER_MINUTE)
+    except ValueError:
+        v = API_CALLS_PER_MINUTE
+    return max(1, min(v, API_CALLS_PER_MINUTE))
+
+
+def read_key() -> str:
+    """STELLAR_READ_KEY (plans:read only) first. On the home PCs the vault may
+    hold only the buying key STELLAR_API_KEY (orders duty, 2026-11-12), which
+    reads the same catalogue -- stellar_buyer already does exactly that."""
+    for name in ("STELLAR_READ_KEY", "STELLAR_API_KEY"):
+        v = os.environ.get(name, "").strip()
+        if v:
+            return v
+    return ""
 API_RETRY_WAIT = 61.0         # a 429 that names no better time
 FX_URL = "https://api.frankfurter.app/latest"
 # Measured 2026-09-09: 58 rows, median 1.2192, stdev 0.0041. Re-measure the
@@ -379,6 +401,7 @@ def fetch_plans(key: str, session=None, sleep=time.sleep, clock=time.monotonic) 
     s = session or requests.Session()
     s.headers.update({"Authorization": f"Bearer {key}", "Accept": "application/json"})
     sent: list[float] = []
+    limit = calls_per_minute()
 
     def get(page):
         # Wait for the OLDEST call to leave the minute, not for the whole
@@ -388,7 +411,7 @@ def fetch_plans(key: str, session=None, sleep=time.sleep, clock=time.monotonic) 
             now = clock()
             while sent and now - sent[0] >= 60.0:
                 sent.pop(0)
-            if len(sent) < API_CALLS_PER_MINUTE:
+            if len(sent) < limit:
                 break
             sleep(60.0 - (now - sent[0]) + 0.05)
         sent.append(clock())
@@ -881,7 +904,7 @@ def main(argv=None) -> int:
                                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")))
     a = ap.parse_args(argv)
 
-    key = os.environ.get("STELLAR_READ_KEY", "").strip()
+    key = read_key()
 
     # The retail feed does not hold our cost: it holds the shop price, divided
     # by a ratio MEASURED once over 58 rows. That is fine to LOOK at and wrong

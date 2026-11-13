@@ -698,6 +698,46 @@ check("--inspect without the API refuses instead of guessing from the retail fee
 _c, _o = _run(["--inspect", "TH"], key="k")
 check("--inspect with the key prints and exits before the sheet", _c, 0)
 os.unlink(_FEED_FILE)
+# 2026-11-13: the home PCs run this hourly; their vault may hold only the
+# buying key, which reads the same catalogue.
+os.environ["STELLAR_API_KEY"] = "buyer"
+check("the buying key alone counts as the wholesale read (PCs)",
+      _run(["--apply"])[0], "past the guard")
+os.environ.pop("STELLAR_API_KEY", None)
+os.environ["STELLAR_READ_KEY"], os.environ["STELLAR_API_KEY"] = "read", "buy"
+check("the read-only key is preferred over the buying key", stellar_prices.read_key(), "read")
+os.environ.pop("STELLAR_READ_KEY"); os.environ.pop("STELLAR_API_KEY")
+
+print("-- the per-minute share is lowered by STELLAR_RATE_LIMIT, never raised --")
+for _v, _want in (("", 55), ("20", 20), ("90", 55), ("0", 1), ("x", 55)):
+    os.environ["STELLAR_RATE_LIMIT"] = _v
+    check(f"STELLAR_RATE_LIMIT={_v!r} -> {_want}", stellar_prices.calls_per_minute(), _want)
+os.environ.pop("STELLAR_RATE_LIMIT", None)
+
+
+class _Resp:
+    status_code = 200
+    def __init__(self, page): self.page = page
+    def raise_for_status(self): pass
+    def json(self): return {"data": [{"id": self.page}], "meta": {"last_page": 30, "total": 30}}
+
+
+class _Sess:
+    headers = {}
+    def get(self, url, params=None, timeout=None): return _Resp(params["page"])
+
+
+_t = [0.0]
+_waits = []
+def _sleep(s):
+    if s > 1: _waits.append(s)
+    _t[0] += s
+os.environ["STELLAR_RATE_LIMIT"] = "20"
+_got = stellar_prices.fetch_plans("k", session=_Sess(), sleep=_sleep, clock=lambda: _t[0])
+os.environ.pop("STELLAR_RATE_LIMIT", None)
+check("a paced read still reads every page", len(_got), 30)
+check("...and at 20 a minute it waited for the window", len(_waits) >= 1, True)
+
 
 print()
 if _fails:
