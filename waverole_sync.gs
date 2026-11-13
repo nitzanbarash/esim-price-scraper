@@ -288,6 +288,12 @@ const CHEAP_20GB_PRICE      = 8.99;
 // ... and a 30GB by a ladder of [bought under $, never above] (price_ranges.CHEAP_30GB_LADDER).
 const CHEAP_30GB_GB         = 30;
 const CHEAP_30GB_LADDER     = [[7.00, 10.99], [8.00, 11.99], [9.00, 12.99], [10.00, 14.49], [11.00, 15.99]];
+// ... and a 3GB by a ladder (price_ranges.CHEAP_3GB_LADDER, the owner, 2026-11-14).
+const CHEAP_3GB_GB          = 3;
+const CHEAP_3GB_LADDER      = [[0.90, 1.47], [1.30, 1.97]];
+// ... and a 5GB (price_ranges.CHEAP_5GB_LADDER, the owner, 2026-11-14).
+const CHEAP_5GB_GB          = 5;
+const CHEAP_5GB_LADDER      = [[1.20, 2.47], [1.80, 2.97]];
 const OVER_RANGE   = '\u05dc\u05d0 \u05e8\u05d5\u05d5\u05d7\u05d9 \u2014 \u05de\u05e2\u05dc \u05d8\u05d5\u05d5\u05d7';
 // The scraper's proportion rule (2026-09-17): from 30GB up, a package bought
 // above its size's ceiling is not for sale, whatever it sells for. Judged
@@ -333,6 +339,8 @@ function ladder_(steps, cost) {
 }
 function cheapCap_(gb, cost) {
   if (gb === null || gb === undefined || !(cost > 0)) return null;
+  if (Math.abs(gb - CHEAP_3GB_GB) < RANGE_EPS) return ladder_(CHEAP_3GB_LADDER, cost);
+  if (Math.abs(gb - CHEAP_5GB_GB) < RANGE_EPS) return ladder_(CHEAP_5GB_LADDER, cost);
   if (Math.abs(gb - CHEAP_10GB_GB) < RANGE_EPS) return ladder_(CHEAP_10GB_LADDER, cost);
   if (isCheap20gb_(gb, cost)) return CHEAP_20GB_PRICE;
   if (Math.abs(gb - CHEAP_30GB_GB) < RANGE_EPS) return ladder_(CHEAP_30GB_LADDER, cost);
@@ -635,7 +643,7 @@ function applyFee_(sheet, map, e) {
       if (want !== null && (price === null || Math.abs(want - price) >= 0.005)) {
         const cap = cheapCap_(gb, cost);
         const why = cap !== null && want === cap
-          ? (isCheap20gb_(gb, cost) ? ' (20GB < $' + CHEAP_20GB_COST + ')' : isCheap10gb_(gb, cost) ? ' (10GB ladder)' : ' (30GB ladder)') : '';
+          ? (isCheap20gb_(gb, cost) ? ' (20GB < $' + CHEAP_20GB_COST + ')' : isCheap10gb_(gb, cost) ? ' (10GB ladder)' : Math.abs(gb - CHEAP_3GB_GB) < RANGE_EPS ? ' (3GB ladder)' : Math.abs(gb - CHEAP_5GB_GB) < RANGE_EPS ? ' (5GB ladder)' : ' (30GB ladder)') : '';
         moves.push(key + ' ' + (price === null ? '-' : price.toFixed(2)) + ' \u2192 ' + want.toFixed(2) + why);
         priceCell = want;
         price = want;

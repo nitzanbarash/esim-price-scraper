@@ -48,7 +48,9 @@ copies to the same answers:
     lower stays lower, and one nothing in the range pays stays off sale.
     The steps sit off the .49/.99 grid on purpose (the owner's prices). At
     the top edge of each step the margin is 29% / 26% / 23% — under the 30%
-    rule; the owner's call. From $4 up the range rule alone decides again.
+    rule; the owner's call. (A 3GB follows a ladder too, 2026-11-14: under
+    $0.90 → 1.47, under $1.30 → 1.97, CHEAP_3GB_LADDER; and a 5GB: under $1.20 → 2.47, under $1.80 → 2.97,
+    CHEAP_5GB_LADDER.) From $4 up the range rule alone decides again.
 
 The margin is judged on 'מחיר שלי' (S) — U less the processor's real cut of
 4% + $0.35 (memory: fee-ladder-vs-real-fee) — exactly as 'רווח' (P) reads
@@ -117,6 +119,16 @@ CHEAP_20GB_PRICE = 8.99
 # $11 for 30GB the same day) takes it off the site.
 CHEAP_30GB_GB = 30
 CHEAP_30GB_LADDER = ((7.00, 10.99), (8.00, 11.99), (9.00, 12.99), (10.00, 14.49), (11.00, 15.99))
+
+# A ladder for 3GB (the owner, 2026-11-14): bought under $0.90 → 1.47, under
+# $1.30 → 1.97. Ceilings the same way (never a lift) over the range.
+CHEAP_3GB_GB = 3
+CHEAP_3GB_LADDER = ((0.90, 1.47), (1.30, 1.97))
+
+# A ladder for 5GB (the owner, 2026-11-14): bought under $1.20 → 2.47, under
+# $1.80 → 2.97. Ceilings the same way (never a lift) over the range.
+CHEAP_5GB_GB = 5
+CHEAP_5GB_LADDER = ((1.20, 2.47), (1.80, 2.97))
 
 # The least a sale may earn in dollars, net of the real fee, by size: (size
 # from, and up, dollars). Below 20GB there is none — the 30% is enough there.
@@ -191,6 +203,10 @@ def cheap_cap(gb: Optional[float], cost: Optional[float]) -> Optional[float]:
     """The price a cheap package may not exceed, or None when it is not one."""
     if gb is None or cost is None or cost <= 0:
         return None
+    if abs(gb - CHEAP_3GB_GB) < _EPS:
+        return _ladder(CHEAP_3GB_LADDER, cost)
+    if abs(gb - CHEAP_5GB_GB) < _EPS:
+        return _ladder(CHEAP_5GB_LADDER, cost)
     if abs(gb - CHEAP_10GB_GB) < _EPS:
         return _ladder(CHEAP_10GB_LADDER, cost)
     if is_cheap_20gb(gb, cost):
