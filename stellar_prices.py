@@ -106,18 +106,21 @@ API_PER_PAGE = 100            # the API's maximum
 # read stopped at 6,000 without a word, and since the API sorts by destination,
 # every country after Singapore read as GONE. See fetch_plans.
 API_MAX_PAGES = 300
-API_CALLS_PER_MINUTE = 55     # Stellar allows 60 a minute per IP (X-RateLimit-Limit)
+# 2026-11-16: Stellar raised the limit to 300 a minute (owner); until then 60.
+API_CALLS_PER_MINUTE = 150    # this run's share when nothing says otherwise
+API_CALLS_CEILING = 280       # never above this, a margin under Stellar's 300
 
 
 def calls_per_minute() -> int:
-    """This run's share of Stellar's 60 a minute per IP. STELLAR_RATE_LIMIT
-    lowers it (2026-11-13: on the home PCs this read shares one IP with usage
-    25 + usage_live 30, so the network runs it at 20); never above 55."""
+    """This run's share of Stellar's 300 a minute (60 until 2026-11-16).
+    STELLAR_RATE_LIMIT sets it (on the home PCs this read shares one IP with
+    usage and usage_live, so the network names its share); never above
+    API_CALLS_CEILING."""
     try:
         v = int(os.environ.get("STELLAR_RATE_LIMIT", "") or API_CALLS_PER_MINUTE)
     except ValueError:
         v = API_CALLS_PER_MINUTE
-    return max(1, min(v, API_CALLS_PER_MINUTE))
+    return max(1, min(v, API_CALLS_CEILING))
 
 
 def read_key() -> str:

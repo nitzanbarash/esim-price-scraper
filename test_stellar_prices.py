@@ -388,6 +388,9 @@ class _Clock:
         return self.t
 
 
+# The pacing is checked at a share of 55 (the old limit): what matters is
+# that no minute exceeds the share, whatever it is.
+os.environ["STELLAR_RATE_LIMIT"] = "55"
 _c = _Clock()
 _p = _Pages(6042)
 _p.when = []
@@ -408,6 +411,7 @@ _p.get = lambda url, params=None, timeout=None: (_p.when.append(_c.t), _orig_get
 fetch_plans("k", session=_p, sleep=_c.sleep, clock=_c.now)
 check("200 pages -- several windows deep -- still never more than 55 in any minute",
       max(sum(1 for w in _p.when if a <= w < a + 60) for a in _p.when) <= 55, True)
+os.environ.pop("STELLAR_RATE_LIMIT", None)
 _c = _Clock()
 fetch_plans("k", session=_Pages(3400), sleep=_c.sleep, clock=_c.now)
 check("a 34-page catalogue never waits for the window (as fast as before)",
@@ -708,8 +712,8 @@ os.environ["STELLAR_READ_KEY"], os.environ["STELLAR_API_KEY"] = "read", "buy"
 check("the read-only key is preferred over the buying key", stellar_prices.read_key(), "read")
 os.environ.pop("STELLAR_READ_KEY"); os.environ.pop("STELLAR_API_KEY")
 
-print("-- the per-minute share is lowered by STELLAR_RATE_LIMIT, never raised --")
-for _v, _want in (("", 55), ("20", 20), ("90", 55), ("0", 1), ("x", 55)):
+print("-- STELLAR_RATE_LIMIT sets the per-minute share, never past the ceiling --")
+for _v, _want in (("", 150), ("20", 20), ("90", 90), ("900", 280), ("0", 1), ("x", 150)):
     os.environ["STELLAR_RATE_LIMIT"] = _v
     check(f"STELLAR_RATE_LIMIT={_v!r} -> {_want}", stellar_prices.calls_per_minute(), _want)
 os.environ.pop("STELLAR_RATE_LIMIT", None)

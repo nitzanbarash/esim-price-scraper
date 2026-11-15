@@ -26,8 +26,9 @@ Suppliers (codes, not names: this file is public):
   s2  by the order link on the row, two calls per package, paced
       (stellar_usage.fetch_usage). Needs STELLAR_USAGE_KEY: a key with read
       rights only (orders:read + esims:read). Without it s2 rows are skipped
-      and s1 still runs. STELLAR_RATE_LIMIT (default 30 a minute here) keeps
-      room under the supplier's 60 a minute for the cloud jobs that share it.
+      and s1 still runs. STELLAR_RATE_LIMIT (default 100 a minute here) keeps
+      room under the supplier's 300 a minute (60 until 2026-11-16) for the
+      other jobs that share it.
 
 Cost on the site: only a reading that MOVED is sent, plus every package once
 an hour (so the page's "updated" time never goes stale by more than that).
@@ -59,7 +60,7 @@ CACHE = "usage_live_cache.json"
 REFRESH_S = 3600          # every package is sent at least this often
 SITE_CHUNK = 100
 S1_CHUNK = 50             # fetch_usage splits further into the supplier's own batch size
-DEFAULT_S2_RATE = 30
+DEFAULT_S2_RATE = 100
 # s2 reads stop after this many seconds of the run (2026-11-09, before many
 # more packages): the network ends the job at 580 s (lease), and a run that is
 # cut there sends nothing at all. Packages not reached are read FIRST next run
@@ -148,7 +149,7 @@ def readings(todo: list[dict], s2_key: str, cache: dict | None = None,
             rate = int(os.getenv("STELLAR_RATE_LIMIT", str(DEFAULT_S2_RATE)))
         except ValueError:
             rate = DEFAULT_S2_RATE
-        stellar_usage.RATE_LIMIT = max(1, min(rate, 55))
+        stellar_usage.RATE_LIMIT = max(1, min(rate, stellar_usage.RATE_CEILING))
         s2 = s2_order(s2, cache or {})
         try:
             budget = float(os.getenv("USAGE_LIVE_S2_BUDGET_S", str(S2_BUDGET_S)))

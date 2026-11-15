@@ -77,13 +77,15 @@ TIMEOUT = 30
 # untouched" on every run -- always the NEWEST rows, since the sweep walks the
 # sheet top-down. Their meters simply stopped. So calls are paced to a window
 # under the limit, and a 429 that slips through waits and asks once more.
-RATE_LIMIT = 55          # calls allowed per window, a little under Stellar's 60
+# 2026-11-16: Stellar raised the limit to 300 a minute (owner); until then 60.
+RATE_CEILING = 280       # never above this, a margin under Stellar's 300
+RATE_LIMIT = 150         # calls allowed per window when nothing says otherwise
 # The limit is per IP, and the update network's computers share one (the same
 # office line): two jobs reading at once on two PCs must split the 60 between
 # them. STELLAR_RATE_LIMIT lowers this run's share (2026-11-09: usage 25 +
-# usage_live 30 on the network). Never above 55.
+# usage_live 30 on the network; 100 + 100 since the 300 limit). Never above RATE_CEILING.
 try:
-    RATE_LIMIT = max(1, min(int(os.getenv("STELLAR_RATE_LIMIT", "") or RATE_LIMIT), 55))
+    RATE_LIMIT = max(1, min(int(os.getenv("STELLAR_RATE_LIMIT", "") or RATE_LIMIT), RATE_CEILING))
 except ValueError:
     pass
 RATE_WINDOW = 60.0       # seconds

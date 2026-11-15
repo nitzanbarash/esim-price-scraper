@@ -84,7 +84,8 @@ ul.fetch_usage = fake_s1
 r = ul.readings(todo, "")
 check("no s2 key: s1 only", sorted(r), ["WR-A"])
 fake_st = types.ModuleType("stellar_usage")
-fake_st.RATE_LIMIT = 55
+fake_st.RATE_LIMIT = 150
+fake_st.RATE_CEILING = 280
 
 
 class Unknown(dict):
@@ -102,11 +103,11 @@ fake_st.saved = []
 fake_st.load_sim_ids = lambda: {}
 fake_st.save_sim_ids = lambda found, keep: fake_st.saved.append((dict(found), list(keep)))
 sys.modules["stellar_usage"] = fake_st
-os.environ["STELLAR_RATE_LIMIT"] = "90"
+os.environ["STELLAR_RATE_LIMIT"] = "900"
 r = ul.readings(todo, "k-test")
 check("with a key: s2 read too", sorted(r), ["WR-A", "WR-D"])
 check("key handed to the s2 reader", calls["s2"][-1][1], "k-test")
-check("rate capped under the supplier's 60", fake_st.RATE_LIMIT, 55)
+check("rate capped under the supplier's 300", fake_st.RATE_LIMIT, 280)
 fake_st.fetch_usage = lambda urls, key=None, **kw: {u: None for u in urls}
 check("s2 'could not ask' is never sent", sorted(ul.readings(todo, "k")), ["WR-A"])
 fake_st.fetch_usage = lambda urls, key=None, **kw: {u: Unknown() for u in urls}

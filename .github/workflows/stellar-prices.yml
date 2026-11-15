@@ -11,7 +11,16 @@ name: Stellar prices (every 4h)
 on:
   schedule:
     - cron: "0 */4 * * *"
+  # Since 2026-11-16 a BACKUP for the update network, like scrape.yml and
+  # usage.yml: the PCs run stellar_prices every hour, and this run used to
+  # land after them and stamp all the s2 rows "git" - the owner read that as
+  # "the servers do not update the sheet". 'force' runs it anyway.
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Run even though the network is up"
+        type: boolean
+        default: false
 
 # The sheet has one set of price columns and two writers. Sharing a group with
 # scrape.yml means a 4-hourly run that lands mid-scrape QUEUES behind it rather
@@ -23,7 +32,26 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    outputs:
+      skip: ${{ steps.net.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: net_gate.sh
+          sparse-checkout-cone-mode: false
+      - name: Is the update network up?
+        id: net
+        env:
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          FORCE_RUN: ${{ github.event.inputs.force || 'false' }}
+        run: bash net_gate.sh
+
   prices:
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
     runs-on: ubuntu-latest
     # Backstop only — the two steps below cap themselves at 5 + 5, and the
     # checkout/python/pip setup is another couple of minutes.
