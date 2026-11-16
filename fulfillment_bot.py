@@ -38,7 +38,9 @@ import logging
 import os
 import re
 import smtplib
+import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from urllib.parse import unquote
@@ -72,6 +74,13 @@ except ImportError:              # GitHub Actions, or by hand
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("fulfillment")
+
+# The site calls a long-lived caller wants on one kept-alive connection (the
+# orders duty on the PCs, 2026-11-16) go through _http: the requests module
+# itself by default - the tests patch requests.get / requests.post - or the
+# caller's requests.Session. Used by the mail lease, the ledger report and the
+# order read; the sweeps keep plain requests.
+_http = requests
 
 # What the last main() did with customer mails, for orders_duty (2026-11-16):
 #   due          mails this run had to write (send_once got past the site's
@@ -1166,8 +1175,8 @@ def report_email_sent(order_id: str, ok: bool, error: str = "", address: str = "
     last = None
     for attempt in range(1, LEDGER_CONFIRM_ATTEMPTS + 1):
         try:
-            r = requests.post(ORDERS_URL, json=payload, timeout=20,
-                              headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+            r = _http.post(ORDERS_URL, json=payload, timeout=20,
+                           headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
             r.raise_for_status()
             return True
         except Exception as e:
@@ -1225,9 +1234,9 @@ def claim_mail(order_id: str, by: str, ttl_s: int = MAIL_LEASE_TTL_S) -> dict:
 def _claim_mail_once(order_id: str, by: str, ttl_s: int) -> dict:
     unreachable = {"claim": None, "reason": "unreachable"}
     try:
-        r = requests.post(ORDERS_URL, json={"action": "mail_claim", "order_id": order_id,
-                                            "by": by, "ttl_s": int(ttl_s)},
-                          timeout=20, headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+        r = _http.post(ORDERS_URL, json={"action": "mail_claim", "order_id": order_id,
+                                         "by": by, "ttl_s": int(ttl_s)},
+                       timeout=20, headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
         if r.status_code == 400:
             return {"claim": None, "reason": "old_site"}
         r.raise_for_status()
@@ -1253,6 +1262,73 @@ class MailMaybeSent(Exception):
     mailbox. Raised by _smtp_send; send_once keeps the lease for it."""
 
 
+def smtp_open():
+    """A logged-in Gmail SMTP connection, opened AHEAD of a send the caller
+    knows is coming - the Stellar buyer opens it while Stellar provisions
+    (2026-11-16), so the eSIM mail is one DATA away when the site holds the
+    eSIM. Hand it to warm_smtp(). Raises like any login; nothing is sent."""
+    password = env("GMAIL_APP_PASSWORD").replace(" ", "")     # no secret, no connection at all
+    s = smtplib.SMTP("smtp.gmail.com", 587, timeout=30, local_hostname="waverole.com")
+    try:
+        s.starttls()
+        s.login(GMAIL_USER, password)
+        return s
+    except Exception:
+        try:
+            s.close()
+        except Exception:                                  # noqa: BLE001
+            pass
+        raise
+
+
+_WARM = threading.local()
+
+
+@contextmanager
+def warm_smtp(conn):
+    """Inside this block, the next _smtp_send of THIS thread hands its message
+    to `conn` (from smtp_open) instead of opening a connection. One message
+    per connection; one left unused is closed on the way out. None = as ever."""
+    _WARM.conn = conn
+    try:
+        yield
+    finally:
+        left, _WARM.conn = getattr(_WARM, "conn", None), None
+        if left is not None:
+            try:
+                left.close()
+            except Exception:                              # noqa: BLE001
+                pass
+
+
+def _smtp_hand(s, msg):
+    """send_message on an open, logged-in connection, saying which side of the
+    handover a failure fell (see _smtp_send). Returns True once Gmail took it;
+    raises _NotHanded for a failure before DATA."""
+    handed = []
+    data = getattr(s, "data", None)
+    if callable(data):
+        def watched(*a, **k):
+            handed.append(1)
+            return data(*a, **k)
+        s.data = watched            # send_message -> sendmail -> self.data
+    try:
+        s.send_message(msg)
+    except smtplib.SMTPDataError:
+        raise
+    except Exception as e:
+        if handed:
+            raise MailMaybeSent(f"{type(e).__name__} after the message was handed over") from e
+        raise _NotHanded(e) from e
+    return True
+
+
+class _NotHanded(Exception):
+    """A prepared connection failed BEFORE the message was handed over (it
+    went idle and Gmail closed it, a refused sender): nothing went, so the
+    send is simply made again on a new connection."""
+
+
 def _smtp_send(msg):
     """Hand `msg` to Gmail, and say which side of the handover a failure fell.
 
@@ -1261,7 +1337,37 @@ def _smtp_send(msg):
     timeout waiting for the final answer may mean Gmail took the mail:
     MailMaybeSent. The server's own "no" to the message (SMTPDataError) is
     clear and raised as it is. A failure after the 250 (the QUIT) is a sent
-    mail and is not raised at all."""
+    mail and is not raised at all.
+
+    Inside warm_smtp() the message goes over the connection opened ahead of
+    it; a failure there before DATA falls through to a new connection (a
+    refused RECIPIENT does not: a new connection would hear the same)."""
+    pre = getattr(_WARM, "conn", None)
+    if pre is not None:
+        _WARM.conn = None                   # one message per prepared connection
+        try:
+            _smtp_hand(pre, msg)
+            try:
+                pre.quit()
+            except Exception:                              # noqa: BLE001
+                pass                        # sent: a failed goodbye is not a failed mail
+            return
+        except _NotHanded as e:
+            try:
+                pre.close()
+            except Exception:                              # noqa: BLE001
+                pass
+            cause = e.__cause__
+            if isinstance(cause, smtplib.SMTPRecipientsRefused):
+                raise cause
+            log.info(f"the prepared mail connection failed before the handover "
+                     f"({type(cause).__name__}) -- sending on a new one")
+        except BaseException:
+            try:
+                pre.close()
+            except Exception:                              # noqa: BLE001
+                pass
+            raise
     handed, accepted = [], False
     try:
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=30, local_hostname="waverole.com") as s:
@@ -1632,8 +1738,8 @@ def order_facts(order_id: str) -> dict:
     does not say whether its order replaced another. A failed read costs one
     line of the mail, never the mail."""
     try:
-        r = requests.get(ORDERS_URL, params={"order_id": order_id, "probe": "1"}, timeout=20,
-                         headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+        r = _http.get(ORDERS_URL, params={"order_id": order_id, "probe": "1"}, timeout=20,
+                      headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
         r.raise_for_status()
         out = r.json()
         return out if isinstance(out, dict) else {}

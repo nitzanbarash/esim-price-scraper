@@ -387,6 +387,92 @@ finally:
     od.RUN_S, od.LATE_LOOK_S = _rs, _late
 check("main ends failed without a look", rc == 1 and MEM.get("failed") is True, f"{rc} {MEM}")
 
+print("\n23. the keeper keeps an order's things warm while the duty waits - reads only (2026-11-16)")
+kb = types.ModuleType("stellar_buyer")
+touched = []
+
+
+class _KWs:
+    def row_values(self, i):
+        touched.append("sheet")
+        return []
+
+
+class _KSt:
+    def wallet_cents(self):
+        touched.append("stellar")
+        return 1
+
+
+class _KSite:
+    def get(self, url, timeout=None):
+        touched.append(("site", url))
+
+
+kb.WARM = {"ws": _KWs(), "st": _KSt()}
+kb.refresh_rows = lambda: touched.append("rows")
+sys.modules["stellar_buyer"] = kb
+k = od.Keeper()
+k.site = _KSite()
+k.last = {"rows": 0.0, "site": 0.0, "sheet": 0.0, "stellar": 0.0}
+done = k.tick(now=1000.0)
+check("everything due is touched once", sorted(done) == ["rows", "sheet", "site", "stellar"], str(done))
+check("the site is kept with a static file (the edge answers, no function runs)",
+      ("site", od.SITE_PING_URL) in touched and od.SITE_PING_URL.endswith("/robots.txt"), str(touched))
+check("5 s later nothing is due", k.tick(now=1005.0) == [])
+check("Stellar's connection (it drops an idle one within 30 s) every 12 s", k.tick(now=1013.0) == ["stellar"])
+k.busy.set()
+touched.clear()
+check("nothing at all while an order is in hand", k.tick(now=5000.0) == [] and touched == [], str(touched))
+k.busy.clear()
+kb.refresh_rows = lambda: (_ for _ in ()).throw(RuntimeError("sheets down"))
+check("a failure is quiet, the rest still kept", "rows" not in k.tick(now=9000.0))
+k2 = od.Keeper().start(None)
+first = k2.thread
+k2.start(None)
+check("a keeper started again replaces its thread (never two)", first is not k2.thread and k2.stop is not None)
+k2.close()
+
+print("\n24. ready_to_buy keeps what it opened, for the run's first order")
+wb = types.ModuleType("stellar_buyer")
+wb.WARM = {"st": None, "ws": None, "rows": None, "rows_at": 0.0}
+
+
+class _FakeStellar:
+    def __init__(self, key):
+        self.key = key
+
+
+wb.Stellar = _FakeStellar
+wb.fb = types.SimpleNamespace(RECEIPTS_SHEET_ID="x", env=lambda n: "k",
+                              sheet_client=lambda: types.SimpleNamespace(
+                                  open_by_key=lambda k: types.SimpleNamespace(sheet1="WS")))
+seen_st = []
+wb.preflight = lambda st=None: seen_st.append(st) or True
+wb.pending_orders = lambda: []
+wb.refresh_rows = lambda: None
+sys.modules["stellar_buyer"] = wb
+check("ready: key, sheet, queue", od.ready_to_buy() is True)
+check("the key was proven on the very client that is kept",
+      seen_st and isinstance(seen_st[0], _FakeStellar) and wb.WARM["st"] is seen_st[0], str(seen_st))
+check("the receipts sheet is kept", wb.WARM["ws"] == "WS", str(wb.WARM["ws"]))
+wb.refresh_rows = lambda: (_ for _ in ()).throw(RuntimeError("x"))
+check("a price sheet that will not read ahead is no reason to stop (the buyer reads it at the order)",
+      od.ready_to_buy() is True)
+wb.preflight = lambda st=None: False
+check("a refused key is still 'not ready'", od.ready_to_buy() is False)
+
+print("\n25. warm_up: one kept-alive site connection for the buyer and the mail lease")
+hb = types.ModuleType("stellar_buyer")
+hb._http = "requests"
+hf = types.ModuleType("fulfillment_bot")
+hf._http = "requests"
+sys.modules["stellar_buyer"], sys.modules["fulfillment_bot"] = hb, hf
+site = od.warm_up()
+check("both modules' site calls go through the same session",
+      site is not None and hb._http is site and hf._http is site, f"{hb._http} {hf._http}")
+sys.modules["stellar_buyer"] = ok
+
 print()
 if fails:
     print(f"FAILED: {len(fails)} check(s)")

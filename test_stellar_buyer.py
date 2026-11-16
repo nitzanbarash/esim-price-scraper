@@ -27,6 +27,10 @@ import stellar_buyer as sb            # noqa: E402
 # NOW_MID is held). bot_common.throttle_ok, where present, remembers subjects
 # in a file across scenarios, so it is switched off here and tested on its own
 # (section 46).
+# Offline: the mail prepared during provisioning (MailPrep, 2026-11-16) must
+# never open a real Gmail connection from a test. A prepared connection that
+# is not there is what the buyer copes with anyway; section 48 hands one in.
+sb.fb.smtp_open = lambda: None
 _REAL_THROTTLE_OK = sb._throttle_ok
 sb._throttle_ok = lambda: None
 
@@ -305,10 +309,16 @@ class FakeMailbox:
         self.sent = {(o, a.lower()) for o, a in sent}
         self.closed = False
         self.asked = []
+        self._mailed = {}
 
     def already_mailed_to(self, order_id, to):
-        self.asked.append(order_id)
-        return (order_id, to.lower()) in self.sent
+        # Remembered per (order, address), as the real Inbox does (_mailed):
+        # `asked` holds the searches the mailbox really made.
+        key = (order_id, to.lower())
+        if key not in self._mailed:
+            self.asked.append(order_id)
+            self._mailed[key] = key in self.sent
+        return self._mailed[key]
 
     def note_sent(self, order_id, to):
         self.sent.add((order_id, to.lower()))
@@ -544,8 +554,11 @@ check("row says בבדיקה ידנית", ws8.col(2, "סטטוס - Status") == "
 check("one alert", len(alerts) == 1 and "manual review" in alerts[0][0], str(alerts))
 check("order left pending on the site", not site.reports("failed") and not site.reports("fulfilled"))
 site, ws8, _, _ = scenario([order()], (f8b := StellarFake(statuses=("manual_review",))), ws=ws8)
-check("second run: no purchase, no second alert, no Stellar call at all",
-      len(f8b.creates) == 0 and not alerts and not f8b.gets)
+# (Since 2026-11-16 the listing and the wallet are read AHEAD, beside the claim
+# and the receipts read - reads only. The order itself is never asked about.)
+check("second run: no purchase, no second alert, the Stellar order is not even asked about",
+      len(f8b.creates) == 0 and not alerts
+      and not [g for g in f8b.gets if "/orders/" in g or "/esims/" in g], str(f8b.gets))
 check("...and it does not keep the claim: the review row keeps buyers away, the claim would "
       "block the owner's reassign for good (2026-11-16)",
       len([p for p in site.posts if p.get("release")]) == 1, str(site.posts))
@@ -645,7 +658,8 @@ check("the alert names the key and does NOT claim the wallet is untouched",
       and "debited" not in alerts[0][1].lower(), str(alerts))
 print("\n   ...and that row stops the next run cold")
 site, ws16b, _, _ = scenario([order()], (f16c := StellarFake()), ws=ws16b)
-check("nothing bought, Stellar not even asked", len(f16c.creates) == 0 and not f16c.gets)
+check("nothing bought, the Stellar order not even asked about (the listing and wallet are read ahead)",
+      len(f16c.creates) == 0 and not [g for g in f16c.gets if "/orders/" in g or "/esims/" in g], str(f16c.gets))
 
 print("\n   a read timeout is not a refusal")
 site, ws16d, _, _ = scenario([order()], (f16d := StellarFake(create=["timeout", 202])))
@@ -1103,16 +1117,20 @@ check("...and the customer has the eSIM anyway",
       site.reports("fulfilled") and site.reports("fulfilled")[0]["esim"]["activation_code"] == LPA)
 check("...with nothing waited for", sleeps == [], str(sleeps))
 
-print("\n   the poll ramp: fast while it is probably ready, slow when it is not")
+print("\n   the poll: once a second, all the way (2026-11-16)")
 from itertools import islice                                       # noqa: E402
 _ramp8 = list(islice(sb.poll_delays(), 8))
-check("1, 2, 3, 5, 8, then 10 for ever", _ramp8 == [1, 2, 3, 5, 8, 10, 10, 10], str(_ramp8))
+check("one second, then one second for ever (the old ramp reached 10 s and hid a ready eSIM)",
+      _ramp8 == [1.0] * 8, str(_ramp8))
 check("a bad STELLAR_POLL_RAMP keeps the default rather than spinning",
       sb._ramp("nonsense") == sb.POLL_RAMP_DEFAULT and sb._ramp("-1") == sb.POLL_RAMP_DEFAULT
       and sb._ramp("2,4") == (2.0, 4.0))
 site, ws30b, _, _ = scenario([order()], (f30b := StellarFake(statuses=("processing", "processing", "fulfilled"))),
                              settle_wait=60)
-check("a slow order is asked at 1s and 2s, not at 10s and 10s", sleeps == [1.0, 2.0], str(sleeps))
+# (The fake's processing units carry a sim_id, so each ask also reads the eSIM:
+# two calls, a gap and a half.)
+check("a slow order is asked every second and a half when each ask costs two calls",
+      sleeps == [1.5, 1.5], str(sleeps))
 check("...and is delivered inside the same run", len(site.reports("fulfilled")) == 1)
 
 
@@ -1412,7 +1430,8 @@ check("another sender holding the lease: no mail from here, no ledger report",
 
 site, _, _, _ = scenario([order()], StellarFake(),
                          site=LeaseSite([order()], {"ok": True, "claim": False, "reason": "sent", "sent_ts": "x"}))
-check("the site says the mail already went: no mail", mails == [] and not mailboxes, str(mails))
+check("the site says the mail already went: no mail, and the mailbox opened ahead is closed unused",
+      mails == [] and all(b.closed for b in mailboxes), f"{mails} {[b.closed for b in mailboxes]}")
 
 mailbox_sent.append(("WR-TEST01", "buyer@example.com"))
 try:
@@ -1450,6 +1469,8 @@ site, wsT, bought, _ = scenario([order()], (fT := StellarFake()), claim_by="net:
 check("held by the network's buyer: nothing bought, nothing reported",
       bought == 0 and not fT.creates and not site.reports("failed") and not site.reports("fulfilled"), str(site.posts))
 sb.TAKEOVER = ("net:stellar",)
+_still = sb.STILL_OURS_AFTER_S
+sb.STILL_OURS_AFTER_S = -1.0          # the re-check on, however fresh the claim (section 43b)
 try:
     site, wsT, bought, logT = scenario([order()], (fT := StellarFake()), claim_by="net:stellar")
     claims = [(p["claim"], p.get("takeover_from")) for p in site.posts if "claim" in p]
@@ -1477,6 +1498,7 @@ try:
           bought == 0 and not fT.creates and len([p for p in site.posts if "claim" in p]) == 1, str(site.posts))
 finally:
     sb.TAKEOVER = ()
+    sb.STILL_OURS_AFTER_S = _still
 
 
 # ── 39. an error after the claim (review 2026-11-16) ─────────────────────────
@@ -1600,6 +1622,8 @@ class Snatched(Site):
 
 
 sb.WORKER = "net:stellar"
+_still = sb.STILL_OURS_AFTER_S
+sb.STILL_OURS_AFTER_S = -1.0          # a claim old enough to be re-checked (the catalogue path)
 try:
     site, ws43, bought, log43 = scenario([order()], (f43 := StellarFake()), site=Snatched([order()]))
 finally:
@@ -1626,6 +1650,17 @@ class RecheckDown(Site):
 site, ws43b, _, _ = scenario([order()], (f43b := StellarFake()), site=RecheckDown([order()]))
 check("a re-check that cannot be asked buys nothing and counts as an error",
       not f43b.creates and len(ws43b.rows) == 1 and sb.TROUBLE["errors"] == 1, f"{site.posts} {sb.TROUBLE}")
+sb.STILL_OURS_AFTER_S = _still
+
+print("\n43b. a claim seconds old is not re-checked (2026-11-16)")
+# Nobody can take a claim over seconds after it was taken (the network never
+# takes over; GitHub only from a network proven dead for 25 minutes), so the
+# round trip is saved on the fast path. The slow path (a catalogue read) is
+# older than STILL_OURS_AFTER_S and keeps its re-check (section 43).
+site, ws43c, bought, _ = scenario([order()], (f43c := StellarFake()))
+check("one claim, no re-check, bought once",
+      len([p for p in site.posts if "claim" in p and not p.get("release")]) == 1
+      and len(f43c.creates) == 1 and bought == 1, str(site.posts))
 
 
 # ── 45. which connection errors can have spent money (Windows too) ───────────
@@ -1748,6 +1783,237 @@ finally:
     sb.time.monotonic = _mono
 check("a queue read that spent the budget leaves the order for the next run, unclaimed",
       bought == 0 and not f47.creates and not [p for p in site.posts if "claim" in p], str(site.posts))
+
+
+# ── 48. our side, shortened (owner, 2026-11-16) ─────────────────────────────
+print("\n48. the fast path: reads beside reads, warm sheets, the row beside the wait, the mail ready")
+
+site, ws48, bought, log48 = scenario([order()], (f48 := StellarFake(statuses=("processing", "fulfilled"))),
+                                     rows=[sheet_row(plan_id="p-30d")])
+check("the listing and the wallet are each read ONCE (read ahead, used, not read again)",
+      f48.gets.count(sb.BASE + "/plans/p-30d") == 1 and f48.gets.count(sb.BASE + "/wallet") == 1
+      and bought == 1, str(f48.gets))
+check("the header comes with the receipts read: no row_values(1) of its own",
+      ws48.col(2, sb.H_STATUS) == sb.ST_ACTIVE, ws48.col(2, sb.H_STATUS))
+check("one line says where the order's seconds went", "timing -- reads" in log48 and "total" in log48,
+      log48[-400:])
+
+# The warm price sheet: used while fresh, read again when old.
+_reads = []
+_real_rows = sb.stellar_rows
+sb.WARM.update(rows={"1.62.10": sheet_row(plan_id="p-30d")}, rows_at=sb.time.monotonic())
+try:
+    def _counting_rows():
+        _reads.append(1)
+        return {"1.62.10": sheet_row(plan_id="p-30d")}
+    site, _, bought, _ = scenario([order()], (f48b := StellarFake()))
+    sb.stellar_rows = _counting_rows          # (scenario patched it; this is what a read would cost)
+    r48 = sb.Run(sb.Stellar("k", session=StellarFake()), Ws())
+    got_rows = r48.rows()
+    check("a fresh warm price sheet is used as it is: no read at the order",
+          not _reads and got_rows is sb.WARM["rows"] and r48._rows_cached)
+    sb.WARM["rows_at"] = sb.time.monotonic() - sb.ROWS_FRESH_S - 1
+    r48 = sb.Run(sb.Stellar("k", session=StellarFake()), Ws())
+    r48.rows()
+    check("...an old one is read again", len(_reads) == 1 and not r48._rows_cached, str(_reads))
+finally:
+    sb.WARM.update(rows=None, rows_at=0.0)
+    sb.stellar_rows = _real_rows
+
+# A warm row whose listing is gone: the sheet is read again BEFORE the catalogue,
+# and the fresh row's new listing is bought without the catalogue at all.
+_fresh_reads = []
+sb.WARM.update(rows={"1.62.10": sheet_row(plan_id="p-gone")}, rows_at=sb.time.monotonic())
+try:
+    st48 = StellarFake()
+    stub = sb.Run(sb.Stellar("k", session=st48), Ws())
+    def _fresh():
+        _fresh_reads.append(1)
+        return {"1.62.10": sheet_row(plan_id="p-30d")}
+    sb.stellar_rows = _fresh
+    row0 = stub.row_for("1.62.10")
+    row1, v1 = stub.pick(row0, order())
+    check("a cached row whose listing is gone: the price sheet is read again first",
+          _fresh_reads == [1] and getattr(row1, "plan_id", "") == "p-30d", str(_fresh_reads))
+    check("...and the fresh row's listing is bought straight, no catalogue",
+          v1.plan_id == "p-30d" and not downloads, f"{v1.plan_id} {downloads}")
+    check("...the warm cache now holds the fresh read", sb.WARM["rows"]["1.62.10"].plan_id == "p-30d")
+finally:
+    sb.WARM.update(rows=None, rows_at=0.0)
+    sb.stellar_rows = _real_rows
+
+
+class RowFails(Ws):
+    """The receipts sheet refuses the purchase row (it is written beside the wait)."""
+    def update(self, a1, values, value_input_option=None):
+        raise RuntimeError("Sheets said no")
+
+
+site, ws48c, _, log48c = scenario([order()], (f48c := StellarFake()), ws=RowFails())
+check("a purchase row that could not be written: nothing delivered, nothing mailed",
+      len(f48c.creates) == 1 and not site.reports("fulfilled") and mails == [], str(site.posts))
+check("...counted as an error beside a real purchase, and the claim is KEPT (the same key finds it)",
+      sb.TROUBLE["errors"] == 1 and sb.TROUBLE["placed"] == 1 and not _released(site), str(sb.TROUBLE))
+
+
+class BusyOnce(StellarFake):
+    """Stellar's limit answers one ask of the wait with 429."""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.busy_left = 1
+
+    def get(self, url, timeout=None, **kw):
+        if "/orders/" in url and self.busy_left:
+            self.busy_left -= 1
+            self.gets.append(url)
+            return Resp(429, {"error": {"code": "rate_limited", "message": "slow down"}})
+        return super().get(url, timeout=timeout, **kw)
+
+
+site, _, bought, _ = scenario([order()], (f48d := BusyOnce(statuses=("fulfilled",))), settle_wait=60)
+check("a 'busy' answer while provisioning is asked again, and the eSIM delivered in the same run",
+      bought == 1 and len(site.reports("fulfilled")) == 1 and sb.TROUBLE["errors"] == 0, str(sb.TROUBLE))
+
+# The mail is prepared while Stellar provisions: the mailbox opened and searched
+# ONCE, ahead, and the send goes over the prepared SMTP connection.
+_smtp_given = []
+_real_open, _real_warm = sb.fb.smtp_open, sb.fb.warm_smtp
+from contextlib import contextmanager as _cm                       # noqa: E402
+
+
+@_cm
+def _warm(conn):
+    _smtp_given.append(conn)
+    yield
+
+
+sb.fb.smtp_open = lambda: "SMTP-READY"
+sb.fb.warm_smtp = _warm
+try:
+    site, _, _, _ = scenario([order()], StellarFake(statuses=("processing", "fulfilled")))
+finally:
+    sb.fb.smtp_open, sb.fb.warm_smtp = _real_open, _real_warm
+check("the mail's SMTP connection was opened during the wait and handed to the send",
+      _smtp_given == ["SMTP-READY"] and len(mails) == 1, f"{_smtp_given} {len(mails)}")
+check("...one mailbox, searched once, closed", len(mailboxes) == 1 and mailboxes[0].asked == ["WR-TEST01"]
+      and mailboxes[0].closed, f"{len(mailboxes)} {[b.asked for b in mailboxes]}")
+
+sb.fb.smtp_open = lambda: (_ for _ in ()).throw(OSError("no line"))
+try:
+    site, _, _, _ = scenario([order()], StellarFake())
+finally:
+    sb.fb.smtp_open = _real_open
+check("a preparation that failed costs nothing: the mail goes the old way", len(mails) == 1, str(mails))
+
+_prev = sb.PREPARE_MAIL
+sb.PREPARE_MAIL = False
+try:
+    site, _, _, _ = scenario([order()], StellarFake())
+finally:
+    sb.PREPARE_MAIL = _prev
+check("STELLAR_PREPARE_MAIL=0: as before, one mailbox opened at the mail", len(mails) == 1 and len(mailboxes) == 1)
+
+
+# ── 49. the prepared SMTP connection (fulfillment_bot._smtp_send) ────────────
+print("\n49. a prepared SMTP connection carries one mail; a dead one falls back, a broken DATA is 'maybe'")
+import smtplib as _smtplib                                         # noqa: E402
+from email.mime.text import MIMEText as _MT                        # noqa: E402
+
+
+class FakeConn:
+    def __init__(self, fail_before=None, fail_in_data=None):
+        self.fail_before, self.fail_in_data = fail_before, fail_in_data
+        self.sent, self.quit_called, self.closed = [], False, False
+
+    def data(self, *a, **k):
+        if self.fail_in_data:
+            raise self.fail_in_data
+        return (250, b"ok")
+
+    def send_message(self, msg):
+        if self.fail_before:
+            raise self.fail_before
+        self.data()
+        self.sent.append(msg["Subject"])
+
+    def quit(self):
+        self.quit_called = True
+
+    def close(self):
+        self.closed = True
+
+
+fresh = []
+
+
+class FreshSMTP(FakeConn):
+    def __init__(self, *a, **k):
+        super().__init__()
+        fresh.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def starttls(self):
+        pass
+
+    def login(self, *a):
+        pass
+
+
+_real_SMTP, _real_env = _smtplib.SMTP, sb.fb.env
+_smtplib.SMTP = FreshSMTP
+sb.fb.env = lambda name: "x"
+try:
+    def _msg():
+        m = _MT("hi")
+        m["Subject"] = "s"
+        return m
+    warm = FakeConn()
+    with sb.fb.warm_smtp(warm):
+        sb.fb._smtp_send(_msg())
+    check("the prepared connection sends, and says goodbye", warm.sent == ["s"] and warm.quit_called and not fresh)
+
+    dead = FakeConn(fail_before=_smtplib.SMTPServerDisconnected("idle"))
+    with sb.fb.warm_smtp(dead):
+        sb.fb._smtp_send(_msg())
+    check("one Gmail closed while idle: nothing went, so a new connection sends it",
+          dead.closed and len(fresh) == 1 and fresh[0].sent == ["s"], f"{dead.closed} {len(fresh)}")
+
+    fresh.clear()
+    broke = FakeConn(fail_in_data=_smtplib.SMTPServerDisconnected("mid-data"))
+    try:
+        with sb.fb.warm_smtp(broke):
+            sb.fb._smtp_send(_msg())
+        got = "no error"
+    except sb.fb.MailMaybeSent:
+        got = "maybe"
+    check("a line that broke DURING the handover is 'maybe sent' - never sent again here",
+          got == "maybe" and not fresh, f"{got} {len(fresh)}")
+
+    refused = FakeConn(fail_before=_smtplib.SMTPRecipientsRefused({"x@y": (550, b"no such user")}))
+    try:
+        with sb.fb.warm_smtp(refused):
+            sb.fb._smtp_send(_msg())
+        got = "no error"
+    except _smtplib.SMTPRecipientsRefused:
+        got = "refused"
+    check("a refused recipient is said as it is (a new connection would hear the same)",
+          got == "refused" and not fresh, f"{got} {len(fresh)}")
+
+    unused = FakeConn()
+    with sb.fb.warm_smtp(unused):
+        pass
+    check("a prepared connection nobody used is closed on the way out", unused.closed and not unused.sent)
+
+    with sb.fb.warm_smtp(None):
+        sb.fb._smtp_send(_msg())
+    check("no prepared connection: a new one, as ever", len(fresh) == 1 and fresh[0].sent == ["s"])
+finally:
+    _smtplib.SMTP, sb.fb.env = _real_SMTP, _real_env
 
 
 # ── summary (last, so it gates the exit code) ────────────────────────────────

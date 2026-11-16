@@ -49,6 +49,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     import net_fence
@@ -90,6 +91,18 @@ LATE_LOOK_S = 30.0            # past RUN_S + this, main() skips the forced look 
 BELL_URL = (os.getenv("ORDERS_BELL_URL") or "").strip()
 S2 = "s2"                     # the ring's word for an order this duty buys itself
 STATE = os.path.join(tempfile.gettempdir(), "wr_orders_duty.json")
+# What the keeper does while the duty waits for an order (Keeper, 2026-11-16),
+# each "every so many seconds": read the price sheet into memory, and keep the
+# three connections a paid order needs open. Measured 2026-11-16: the site and
+# Sheets keep an idle connection past 100 s, Stellar drops one between 15 and
+# 30 s - hence its shorter step (one wallet read: ~5 a minute, beside the 60
+# of the orders share that nothing else uses while no order is in hand).
+KEEP_ROWS_S = 120.0
+KEEP_SITE_S = 60.0
+KEEP_SHEET_S = 75.0
+KEEP_STELLAR_S = 12.0
+KEEP_TICK_S = 3.0
+SITE_PING_URL = "https://www.waverole.com/robots.txt"     # a static file: the edge answers, no function runs
 
 
 # -- state between runs ----------------------------------------------------
@@ -213,6 +226,112 @@ class Bell:
         self.stop.set()
 
 
+# -- warm between orders (2026-11-16) ---------------------------------------
+
+class Keeper:
+    """Keeps what a paid order needs open while the duty waits for one.
+
+    Owner, 2026-11-16: "keep the Stellar buyer and the price sheet always
+    open - the computers can take it". The first live orders on the PCs spent
+    10-23 s between "an order is pending" and the purchase, nearly all of it
+    opening things (a TLS connection per call, the receipts sheet, the whole
+    price sheet for one row) on a 2015 laptop CPU shared with Chromium. So,
+    every few seconds while no order is in hand:
+      * the price sheet is read into memory (stellar_buyer.WARM rows) every
+        KEEP_ROWS_S - the buyer takes the order's row from there;
+      * the site, Sheets and Stellar connections are used once in a while,
+        so none of them has gone cold when the bell rings (KEEP_*_S).
+    It reads only: no claim, no write, no purchase. It stands still while a
+    look runs (busy) and stops with the run. Every failure is quiet - the
+    buyer opens whatever it finds closed, as it always did."""
+
+    def __init__(self):
+        self.busy = threading.Event()
+        self.stop = threading.Event()
+        self.thread = None
+        self.site = None
+        self.last: dict = {}
+
+    def start(self, site=None):
+        self.close()                  # never two: a new run's keeper replaces the last one's
+        self.site = site
+        self.stop = stop = threading.Event()
+        self.thread = threading.Thread(target=self._loop, args=(stop,), daemon=True, name="orders-keeper")
+        self.thread.start()
+        return self
+
+    def close(self):
+        self.stop.set()
+
+    def _due(self, what: str, every: float, now: float) -> bool:
+        if now - self.last.get(what, 0.0) < every:
+            return False
+        self.last[what] = now
+        return True
+
+    def tick(self, now: float = None):
+        """One round. Returns what it touched, for the tests."""
+        import stellar_buyer as sb
+        now = time.monotonic() if now is None else now
+        warm = getattr(sb, "WARM", None) or {}
+        done = []
+        jobs = (("rows", KEEP_ROWS_S, lambda: sb.refresh_rows()),
+                ("site", KEEP_SITE_S, lambda: self.site.get(SITE_PING_URL, timeout=10)
+                 if self.site is not None else None),
+                ("sheet", KEEP_SHEET_S, lambda: warm["ws"].row_values(1) if warm.get("ws") is not None else None),
+                ("stellar", KEEP_STELLAR_S, lambda: warm["st"].wallet_cents() if warm.get("st") is not None else None))
+        for what, every, fn in jobs:
+            if self.busy.is_set() or self.stop.is_set():
+                break
+            if not self._due(what, every, now):
+                continue
+            try:
+                fn()
+                done.append(what)
+            except Exception as ex:                          # noqa: BLE001
+                log.debug(f"keeper: {what} ({type(ex).__name__})")
+        return done
+
+    def _loop(self, stop):
+        # The rows were read by ready_to_buy a moment ago; the clocks start now.
+        t = time.monotonic()
+        self.last = {"rows": t, "site": t, "sheet": t, "stellar": t}
+        while not stop.wait(KEEP_TICK_S):
+            try:
+                self.tick()
+            except Exception:                                # noqa: BLE001
+                pass
+
+
+KEEPER = Keeper()
+
+
+def warm_up():
+    """One kept-alive connection to the site for every call of the run - the
+    buyer's and the mail lease's (stellar_buyer._http, fulfillment_bot._http)
+    - and, on Windows, a priority above the price sweeps' Chromium, so a paid
+    order is not queued behind a page render on a two-core laptop. Returns
+    the site session (None when it could not be set up: as before)."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00008000)   # ABOVE_NORMAL_PRIORITY_CLASS
+        except Exception:                                    # noqa: BLE001
+            pass
+    try:
+        import stellar_buyer as sb
+        import fulfillment_bot as fb
+        site = requests.Session()
+        if hasattr(sb, "_http"):
+            sb._http = site
+        if hasattr(fb, "_http"):
+            fb._http = site
+        return site
+    except Exception:                                        # noqa: BLE001
+        return None
+
+
 # -- the two jobs ----------------------------------------------------------
 
 def buyer_tick() -> int:
@@ -222,6 +341,7 @@ def buyer_tick() -> int:
     KEY_REFUSED (the supplier refused our key on an order: the claim was
     released, and this computer must stop claiming)."""
     import stellar_buyer as sb
+    KEEPER.busy.set()             # the keeper stands still while an order is in hand
     try:
         n = int(sb.run() or 0)
     except Exception as ex:                                  # noqa: BLE001
@@ -231,6 +351,8 @@ def buyer_tick() -> int:
         except Exception:                                    # noqa: BLE001
             pass
         return LOOK_FAILED
+    finally:
+        KEEPER.busy.clear()
     if sb.TROUBLE.get("key"):
         return KEY_REFUSED
     placed = sb.TROUBLE.get("placed")       # really placed; n also counts the ones that could not be
@@ -242,7 +364,7 @@ def buyer_tick() -> int:
     return n if placed is None else int(placed)
 
 
-def ready_to_buy() -> bool:
+def ready_to_buy(gate=None) -> bool:
     """Can THIS computer buy right now: a key the supplier accepts, a wallet
     with money in it, a receipts sheet it can open?
 
@@ -252,13 +374,57 @@ def ready_to_buy() -> bool:
     computer that is not ready ends its run as FAILED instead; the network
     gives the duty to the other computer first, and an order nobody claims is
     bought by GitHub twenty seconds later. (stellar_buyer.preflight mails the
-    owner about a missing or refused key, at most hourly.)"""
+    owner about a missing or refused key, at most hourly.)
+
+    Since 2026-11-16 the checks run side by side, and what they open is KEPT
+    for the run (stellar_buyer.WARM): the Stellar client the key was proven
+    on, the receipts sheet, and the price sheet read into memory - so the
+    first order of the run meets warm connections. A price sheet that will
+    not read is no reason to stop, nor to wait: it is read in the background
+    and the buyer reads it at the order if it is not there.
+
+    gate: asked before the queue is read (main: "did the mail check pass?").
+    The queue read stamps the site's "a buyer is polling" mark, so a computer
+    that is about to hand the run back must not make it - the key and the
+    sheet are checked meanwhile, the queue only after both and the gate."""
     import stellar_buyer as sb
+    warm = getattr(sb, "WARM", None)
+    st = None
+    if isinstance(warm, dict) and hasattr(sb, "Stellar"):
+        try:
+            st = warm.get("st") or sb.Stellar(sb.fb.env("STELLAR_API_KEY"))
+        except Exception:                                    # noqa: BLE001
+            st = None                     # preflight says what is wrong, and mails it
+
+    def key():
+        return sb.preflight(st) if st is not None else sb.preflight()
+
+    def sheet():
+        book = sb.fb.sheet_client().open_by_key(sb.fb.RECEIPTS_SHEET_ID)
+        return getattr(book, "sheet1", None)
+
+    if hasattr(sb, "refresh_rows"):
+        def rows():
+            try:
+                sb.refresh_rows()
+            except Exception as ex2:                         # noqa: BLE001
+                log.warning(f"the price sheet did not read ahead ({type(ex2).__name__}) -- "
+                            f"the buyer reads it at the order")
+        threading.Thread(target=rows, daemon=True, name="orders-rows").start()
     try:
-        if not sb.preflight():
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_key, f_sheet = ex.submit(key), ex.submit(sheet)
+            ok_key = f_key.result()
+            ws = f_sheet.result()
+        if not ok_key:
             return False
-        sb.fb.sheet_client().open_by_key(sb.fb.RECEIPTS_SHEET_ID)
-        sb.pending_orders()      # the site accepts this computer's token (a refusal raises)
+        if gate is not None and not gate():
+            return False
+        sb.pending_orders()        # the site accepts this computer's token (a refusal raises)
+        if isinstance(warm, dict):
+            warm["st"] = st or warm.get("st")
+            if ws is not None:
+                warm["ws"] = ws
         return True
     except Exception as ex:                                  # noqa: BLE001
         log.error(f"not ready to buy: {type(ex).__name__}")
@@ -455,14 +621,26 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     began = time.monotonic()                    # the job's time limit counts from here, checks included
     state = load_state()
-    mail_ok = ready_to_mail()
+    site = warm_up()
+    # The bell connects WHILE the checks run (it only collects rings: nothing
+    # is looked at before they pass), and the two checks run side by side:
+    # a new run used to spend 10-18 s on them, one after the other, with
+    # nobody listening (2026-11-16).
+    bell = Bell(BELL_URL, since=_num(state, "bell_since")).start()
     now = time.time()
     state["no_buy_until"] = hold_until(state, now)      # saved clamped, or the hold never ends
     held = now < state["no_buy_until"]
     if held:
         log.error("the supplier refused this computer's key on an order a short while ago -- it does not "
                   "claim again yet (fix STELLAR_API_KEY: on the Mac, mac/wrnet-cli keys orders)")
-    if held or not mail_ok or not ready_to_buy():
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_mail = ex.submit(ready_to_mail)
+        # The buy half waits for the mail half only before the queue read.
+        f_buy = None if held else ex.submit(ready_to_buy, f_mail.result)
+        mail_ok = f_mail.result()
+        buy_ok = f_buy.result() if f_buy is not None else False
+    if held or not mail_ok or not buy_ok:
+        bell.close()
         # A run that cannot do the WHOLE duty claims nothing and ends as
         # failed: the network tries the other computer, and GitHub's backup
         # - which stands back only while this job succeeds - does the work.
@@ -480,6 +658,7 @@ def main() -> int:
         # keeps failing would share its claims with the backup).
         if not fulfil_tick():
             log.error("the mail bot still cannot do its work -- handed back (nothing was claimed)")
+            bell.close()
             return 1
         state["last_fulfil"] = time.time()
     spent = time.monotonic() - began
@@ -487,15 +666,17 @@ def main() -> int:
         # The checks ate the run: a purchase started now could outrun the
         # job's time limit and be cut by the fence mid-way. No look; failed.
         log.error(f"the checks took {spent:.0f}s -- no look this run, handed back")
+        bell.close()
         state["failed"] = True
         save_state(state)
         return 1
-    bell = Bell(BELL_URL, since=_num(state, "bell_since")).start()
     if not BELL_URL:
         log.warning(f"no bell address in the vault (ORDERS_BELL_URL) -- the queue is read every {POLL_S:.0f}s only")
+    KEEPER.start(site)
     try:
         stats = duty(bell, state, run_s=max(0.0, RUN_S - (time.monotonic() - began)), min_looks=1)
     finally:
+        KEEPER.close()
         bell.close()
     log.info(f"duty done: {stats['polls']} look(s) at the queue, {stats['bought']} bought, "
              f"{stats['rings']} ring(s), {stats['mail_runs']} mail-bot run(s)")

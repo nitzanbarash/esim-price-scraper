@@ -55,7 +55,9 @@ import os
 import re
 import ssl
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
@@ -115,12 +117,18 @@ SETTLE_WAIT_S = int(os.getenv("STELLAR_SETTLE_WAIT_S", "90"))   # one run's pati
 REPLAY_WAIT_S = float(os.getenv("STELLAR_REPLAY_WAIT_S", "3"))  # before re-asking the same key
 
 # The gaps between asks while Stellar provisions, in seconds, then the last one
-# forever. It used to be a flat ten, which is the wrong shape: provisioning is
-# normally a second or two, so the common order sat finished for nine seconds
-# with a customer watching the order page, while a slow one gained nothing from
-# being asked six times a minute. SETTLE_WAIT_S is still the only thing that
-# ends the wait -- the ramp only decides when the asks fall.
-POLL_RAMP_DEFAULT = (1.0, 2.0, 3.0, 5.0, 8.0, 10.0)
+# forever. SETTLE_WAIT_S is still the only thing that ends the wait -- the ramp
+# only decides when the asks fall.
+#
+# A flat second since 2026-11-16 (owner: "shorten our side as far as it goes").
+# The old ramp 1, 2, 3, 5, 8, 10 was built for "provisioning is a second or
+# two", and the first live orders said otherwise: 15-35 s. Past the first few
+# asks the ramp had stretched to 8-10 s, so an eSIM that was ready sat unseen
+# for up to ten seconds (go-live test WR-ZZSNV3 lost ~8 s that way). One ask a
+# second is at most 60 a minute -- the orders duty's own share of Stellar's
+# limit (waverole-net STELLAR_BUDGET 'orders'), which nothing else of the duty
+# uses while it waits.
+POLL_RAMP_DEFAULT = (1.0,)
 
 
 def _ramp(spec: str) -> tuple:
@@ -142,7 +150,7 @@ POLL_RAMP = _ramp(os.getenv("STELLAR_POLL_RAMP", ""))
 
 
 def poll_delays():
-    """1, 2, 3, 5, 8, 10, 10, 10 ... -- the ramp, then its last step forever."""
+    """The ramp, then its last step forever (1, 1, 1 ... by default)."""
     for d in POLL_RAMP:
         yield d
     while True:
@@ -313,6 +321,67 @@ class Refused(Exception):
     retryable) with this text as the reason, and the owner is told."""
 
 
+# ── kept warm between looks (2026-11-16) ─────────────────────────────────────
+# Owner, 2026-11-16: "keep the Stellar buyer and the price sheet always open,
+# the computers can take it" - the first live orders on the PCs spent 10-23 s
+# between "an order is pending" and the purchase, nearly all of it opening
+# things: a TLS connection per call, the receipts sheet opened anew, the whole
+# price sheet read for one row, on a 2015 laptop CPU shared with Chromium.
+#
+# A long-lived caller (orders_duty on the PCs) fills these once per run and
+# keeps them alive; GitHub Actions and the tests leave them empty, and run()
+# opens everything itself exactly as before.
+#   _http   what the SITE calls go through: the requests module itself (the
+#           tests patch requests.get / requests.post), or a kept-alive
+#           requests.Session the caller puts here.
+#   WARM    st       a Stellar client whose session stays connected
+#           ws       the receipts worksheet, opened once
+#           rows     {sku: StellarRow} off the price sheet, read in the
+#                    background, and rows_at (time.monotonic) when
+_http = requests
+WARM: dict = {"st": None, "ws": None, "rows": None, "rows_at": 0.0}
+# A cached price sheet older than this is read again at the order instead. The
+# keeper refreshes it every two minutes, so an order sees the sheet as it was
+# at most ~3 minutes ago: an edit made inside that window (a new plan id, a
+# price limit, a deleted row) is not seen by that order. A row whose listing
+# will not do is read again before the catalogue (Run.pick), so the slow path
+# never decides on a stale row.
+ROWS_FRESH_S = float(os.getenv("STELLAR_ROWS_FRESH_S", "180"))
+# The pre-purchase re-check of the claim (still_ours) is skipped when the claim
+# itself is younger than this. It exists for the slow path - a backup that took
+# the order over while this run read the whole catalogue - and nobody can take
+# a claim over seconds after it was taken: the network never takes over, and
+# GitHub only from a network proven dead for 25 minutes (net_gate.sh).
+STILL_OURS_AFTER_S = float(os.getenv("STELLAR_STILL_OURS_AFTER_S", "10"))
+# Open the mailbox and a Gmail SMTP connection while Stellar provisions, so the
+# mail goes out the moment the site holds the eSIM (MailPrep). "0" turns it off.
+PREPARE_MAIL = os.getenv("STELLAR_PREPARE_MAIL", "1").strip() != "0"
+PREP_WAIT_S = 10.0       # how long mail() waits for a preparation still under way
+SETTLE_BUSY_MAX = 10     # "busy" answers in a row while provisioning before the look gives up
+# Reads beside reads (the listing and the wallet beside the receipts read) and
+# the mail's connections beside the provisioning wait. Every call it runs has
+# its own timeout.
+_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="buyer")
+# The receipts row beside the provisioning wait has a worker of its own: a
+# delivery waits for it, so it must never queue behind a slow mail login.
+_ROWS = ThreadPoolExecutor(max_workers=1, thread_name_prefix="buyer-row")
+
+
+def cached_rows() -> tuple:
+    """(rows, from_cache): the warm price sheet when it is fresh, else a read."""
+    rows, at = WARM.get("rows"), float(WARM.get("rows_at") or 0.0)
+    if rows and time.monotonic() - at <= ROWS_FRESH_S:
+        return rows, True
+    return stellar_rows(), False
+
+
+def refresh_rows() -> dict:
+    """Read the price sheet into WARM (the orders duty's keeper, and its start)."""
+    rows = stellar_rows()
+    WARM["rows"], WARM["rows_at"] = rows, time.monotonic()
+    return rows
+
+
 # ── the site ─────────────────────────────────────────────────────────────────
 
 def _site_headers() -> dict:
@@ -322,8 +391,8 @@ def _site_headers() -> dict:
 def pending_orders() -> list[dict]:
     """A BUYER poll: names its supplier, so the site hands over Stellar orders
     only and stamps orders:bot_last_poll:stellar for the no-bot alert."""
-    r = requests.get(fb.ORDERS_URL, params={"status": "pending", "supplier": SUPPLIER},
-                     headers=_site_headers(), timeout=20)
+    r = _http.get(fb.ORDERS_URL, params={"status": "pending", "supplier": SUPPLIER},
+                  headers=_site_headers(), timeout=20)
     r.raise_for_status()
     return list(r.json().get("orders") or [])
 
@@ -340,8 +409,8 @@ def claim(order_id: str, takeover: bool = True) -> bool:
     """True = ours (or already ours). False = another buyer holds it.
     Raises when the site cannot be asked -- and then nothing is bought.
     takeover=False is the plain re-check (still_ours): never moves a claim."""
-    r = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": WORKER},
-                      headers=_site_headers(), timeout=20)
+    r = _http.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": WORKER},
+                   headers=_site_headers(), timeout=20)
     if r.status_code == 409:
         ans = _json(r)
         by = str(ans.get("by") or "")
@@ -351,9 +420,9 @@ def claim(order_id: str, takeover: bool = True) -> bool:
         if takeover and by and by in TAKEOVER and not ans.get("reason"):
             # Moved to OUR name, and only if `by` still holds it. A site that
             # predates takeover_from answers 409 here: nothing is taken.
-            r2 = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": WORKER,
-                                                    "takeover_from": by},
-                               headers=_site_headers(), timeout=20)
+            r2 = _http.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": WORKER,
+                                                 "takeover_from": by},
+                            headers=_site_headers(), timeout=20)
             ans2 = _json(r2)
             if (r2.status_code == 200 and ans2.get("claimed") is True
                     and str(ans2.get("by") or WORKER) == WORKER):
@@ -382,8 +451,8 @@ def release(order_id: str) -> bool:
     buyer's replay of the same idempotency key is certain to find it. Never
     raises."""
     try:
-        r = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": WORKER, "release": True},
-                          headers=_site_headers(), timeout=20)
+        r = _http.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": WORKER, "release": True},
+                       headers=_site_headers(), timeout=20)
         ok = r.status_code == 200 and r.json().get("released") is True
     except Exception:                                       # noqa: BLE001
         ok = False
@@ -426,7 +495,7 @@ def report_fulfilled(order_id: str, esim: dict, supplier_ref: str = "") -> dict:
     m = re.search(r"(\d+)\s*days?", str(esim.get("plan") or ""))
     if m:
         body["days_bought"] = int(m.group(1))
-    r = requests.post(fb.ORDERS_URL, json=body, headers=_site_headers(), timeout=20)
+    r = _http.post(fb.ORDERS_URL, json=body, headers=_site_headers(), timeout=20)
     r.raise_for_status()
     try:
         answer = r.json()
@@ -436,9 +505,9 @@ def report_fulfilled(order_id: str, esim: dict, supplier_ref: str = "") -> dict:
 
 
 def report_failed(order_id: str, reason: str):
-    r = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "status": "failed",
-                                           "reason": f"stellar: {reason}"[:500]},
-                      headers=_site_headers(), timeout=20)
+    r = _http.post(fb.ORDERS_URL, json={"order_id": order_id, "status": "failed",
+                                        "reason": f"stellar: {reason}"[:500]},
+                   headers=_site_headers(), timeout=20)
     r.raise_for_status()
 
 
@@ -938,6 +1007,17 @@ def credentials(st: Stellar, data: dict) -> Optional[dict]:
     return None
 
 
+def needs_esim_lookup(data: dict) -> bool:
+    """Will credentials() have to ask /esims/{id} for this order (a unit with a
+    sim_id and no installation block on the order itself)?"""
+    for e in data.get("esims") or []:
+        if (e.get("installation") or {}).get("activation_code"):
+            return False
+        if e.get("sim_id"):
+            return True
+    return False
+
+
 def site_payload(cred: dict, region: str, networks: str, gb: float, days: int) -> dict:
     """What /api/orders stores under esim.* (ESIM_FIELDS). No ICCID: Stellar
     never returns one, by design. The plan string parses with the fulfillment
@@ -981,6 +1061,11 @@ class Run:
         self._held = ""
         self._posted = False
         self._lost = False
+        self._rows_cached = False               # self._rows came from WARM (rows())
+        self._rows_lock = threading.Lock()      # the prefetch and the purchase share ONE read
+        self._pre: dict = {}                    # prefetched reads for the order in hand (prefetch)
+        self._claimed_at = 0.0                  # time.monotonic() of this order's claim
+        self._t: dict = {}                      # this order's timings, for one log line (_timing)
 
     def hdr(self) -> list:
         """The receipts header, read once. The owner reorders these columns
@@ -1011,9 +1096,22 @@ class Run:
         return append_row(self.ws, values, self.hdr())
 
     def rows(self) -> dict:
-        if self._rows is None:
-            self._rows = stellar_rows()
-        return self._rows
+        with self._rows_lock:
+            if self._rows is None:
+                self._rows, self._rows_cached = cached_rows()
+            return self._rows
+
+    def fresh_rows(self) -> bool:
+        """Swap a price sheet that came from the warm cache for a read made
+        now. True when there was one to swap (the caller may look again);
+        False when the rows in hand are already fresh."""
+        with self._rows_lock:
+            if not self._rows_cached:
+                return False
+            self._rows, self._rows_cached = stellar_rows(), False
+        if WARM.get("rows") is not None:
+            WARM["rows"], WARM["rows_at"] = self._rows, time.monotonic()
+        return True
 
     def catalogue(self) -> sp.Catalogue:
         if self._cat is None:
@@ -1050,9 +1148,10 @@ class Run:
                 return self.rows()[s]
         raise Refused(f"no Stellar row in the price sheet for SKU {sku}")
 
-    def pick(self, row: sp.StellarRow, o: dict) -> sp.Variant:
+    def pick(self, row: sp.StellarRow, o: dict, pre=None) -> tuple:
         """What to buy for this order -- the sheet's own listing if it names
         one and that listing still passes every rule, else the catalogue.
+        Returns (row, variant): the row may have been read again on the way.
 
         The fallback is deliberately blind to WHY the shortcut failed: a plan
         that 404s, one Stellar has withdrawn, one whose price rose, one whose
@@ -1060,29 +1159,85 @@ class Run:
         look at the whole catalogue, where another listing of the same package
         code may well be the right buy. Only the slow path may refuse an order,
         because only it has seen everything there is to choose from.
+
+        `pre` is prefetch()'s future of (plan_id, listing): the same GET, made
+        beside the claim. Used only for the plan id it was made for.
+
+        A price sheet from the warm cache (2026-11-16) is minutes old at most;
+        when its row's listing will not do, the sheet is read again and the
+        shortcut tried once more with the fresh row BEFORE the catalogue - the
+        pricing run may have moved the row to a new listing meanwhile, and the
+        slow path must never decide on a stale row.
         """
-        pid = str(getattr(row, "plan_id", "") or "").strip()
-        if pid:
-            try:
-                raw = self.st.plan(pid)
-                if str((raw or {}).get("id") or "") != pid:
-                    raise Refused(f"{row.sku}: /plans/{pid} answered with another listing")
-                v = one_listing(raw, row, o)
-                if v.plan_id != pid:
-                    raise Refused(f"{row.sku}: listing {pid} reads back under another id")
-                self._raw[pid] = raw
-                log.info(f"{row.sku}: bought straight off the sheet's listing "
-                         f"({v.gb:g}GB/{v.days}d) -- no catalogue read")
-                return v
-            except Refused as ex:
-                log.info(f"{row.sku}: the sheet's listing will not do ({ex}) -- reading the catalogue")
-            except requests.HTTPError as ex:
-                code = getattr(ex.response, "status_code", 0)
-                log.info(f"{row.sku}: /plans/{pid} answered HTTP {code} -- reading the catalogue")
-            except Exception as ex:                          # noqa: BLE001
-                log.info(f"{row.sku}: /plans/{pid} could not be read ({type(ex).__name__}) "
-                         f"-- reading the catalogue")
-        return choose(self.catalogue(), row, o)
+        sku = str(o.get("sku") or "")
+        for again in (False, True):
+            pid = str(getattr(row, "plan_id", "") or "").strip()
+            if pid:
+                try:
+                    raw = None
+                    if pre is not None and not again:
+                        pre_pid, pre_raw = pre.result()
+                        if pre_pid == pid:
+                            raw = pre_raw
+                    if raw is None:
+                        raw = self.st.plan(pid)
+                    if str((raw or {}).get("id") or "") != pid:
+                        raise Refused(f"{row.sku}: /plans/{pid} answered with another listing")
+                    v = one_listing(raw, row, o)
+                    if v.plan_id != pid:
+                        raise Refused(f"{row.sku}: listing {pid} reads back under another id")
+                    self._raw[pid] = raw
+                    log.info(f"{row.sku}: bought straight off the sheet's listing "
+                             f"({v.gb:g}GB/{v.days}d) -- no catalogue read")
+                    return row, v
+                except Refused as ex:
+                    log.info(f"{row.sku}: the sheet's listing will not do ({ex})")
+                except requests.HTTPError as ex:
+                    code = getattr(ex.response, "status_code", 0)
+                    log.info(f"{row.sku}: /plans/{pid} answered HTTP {code}")
+                except Exception as ex:                          # noqa: BLE001
+                    log.info(f"{row.sku}: /plans/{pid} could not be read ({type(ex).__name__})")
+            if not again and self.fresh_rows():
+                log.info(f"{row.sku}: reading the price sheet again before the catalogue")
+                row = self.row_for(sku)
+                continue
+            break
+        log.info(f"{row.sku}: reading the catalogue")
+        return row, choose(self.catalogue(), row, o)
+
+    def prefetch(self, o: dict) -> dict:
+        """Start the reads a purchase needs that do not depend on the receipts
+        sheet - the order's listing at Stellar (through its price-sheet row)
+        and the wallet - so they run BESIDE the duplicate guard's read instead
+        of after it (2026-11-16). Started once the claim is ours. buy() picks the
+        answers up; an error comes out there, where the call used to be.
+        Nothing here writes, claims or spends."""
+        sku = str(o.get("sku") or "")
+
+        def listing():
+            row = self.row_for(sku)
+            pid = str(getattr(row, "plan_id", "") or "").strip()
+            return pid, (self.st.plan(pid) if pid else None)
+        try:
+            return {"plan": _POOL.submit(listing), "wallet": _POOL.submit(self.st.wallet_cents)}
+        except RuntimeError:                  # the pool is shutting down (interpreter exit)
+            return {}
+
+    def _stamp(self, what: str):
+        self._t[what] = time.monotonic()
+
+    def _timing(self, oid: str):
+        """One line per delivered order: where its seconds went (no secrets)."""
+        t = self._t
+        steps = [("reads", "seen", "read"), ("purchase", "read", "created"),
+                 ("provisioning", "created", "ready"), ("site", "ready", "told"),
+                 ("mail", "told", "mailed")]
+        parts = [f"{name} {t[b] - t[a]:.1f}s" for name, a, b in steps if a in t and b in t]
+        end = t.get("mailed") or t.get("told")
+        if "seen" in t and end:
+            parts.append(f"total {end - t['seen']:.1f}s")
+        if parts:
+            log.info(f"{oid}: timing -- " + ", ".join(parts))
 
     def let_go(self, oid: str) -> bool:
         """After an order ended in an error: hand the claim back when nothing
@@ -1098,6 +1253,7 @@ class Run:
     def handle(self, o: dict):
         oid = str(o.get("order_id") or "").strip()
         self._held, self._posted, self._lost = "", False, False
+        self._pre, self._t = {}, {}
         if not oid:
             return
         # Before the claim: a claim this run will not act on holds the order
@@ -1105,12 +1261,23 @@ class Run:
         if self.bought >= MAX_ORDERS_PER_RUN:
             log.warning(f"{oid}: per-run cap of {MAX_ORDERS_PER_RUN} reached -- next run")
             return
+        self._stamp("seen")
         if not claim(oid):
             return
+        self._claimed_at = time.monotonic()
+        # The listing and the wallet are read beside the receipts read: an
+        # order this run does not hold costs Stellar nothing.
+        self._pre = self.prefetch(o)
         self._held = oid
         # One read of the sheet, answering both questions asked of it: has this
-        # order been bought already, and where does a new row go.
+        # order been bought already, and where does a new row go. Its first
+        # row IS the header, so the header costs no read of its own.
         self._values = self.ws.get_all_values()
+        if self._values:
+            head = [str(h).strip() for h in self._values[0]]
+            while head and not head[-1]:
+                head.pop()                  # row_values(1) never carries the empty tail
+            self._header = head
         attempts = order_rows(self.ws, oid, self.hdr(), self._values)
         # Only a row that explicitly says FAILED authorises another purchase.
         # Anything else -- processing, active, in review, a word a person
@@ -1160,17 +1327,35 @@ class Run:
         self.bought += 1
         if sid:
             TROUBLE["placed"] += 1
-            # The answer to the purchase itself is the first poll: it carries
-            # the order, and often the credentials with it.
-            self.settle(o, n, sid, wait=True, first=self._created)
+            # The mail's connections open while Stellar provisions (MailPrep).
+            prep = MailPrep(o) if PREPARE_MAIL else None
+            try:
+                # The answer to the purchase itself is the first poll: it
+                # carries the order, and often the credentials with it.
+                self.settle(o, n, sid, wait=True, first=self._created, prep=prep)
+            except BaseException as first:
+                # Whatever ended the wait, the receipts row (still being
+                # written beside it) is in before this order is let go - the
+                # error that ended the wait is the one raised.
+                try:
+                    self._row_no(n)
+                except Exception as ex:                      # noqa: BLE001
+                    if ex is not first:
+                        log.error(f"{oid}: the receipts row was not written either ({type(ex).__name__})")
+                raise
+            finally:
+                if prep is not None:
+                    prep.close()
+            self._row_no(n)     # every way out of settle() waited for it already; a failed write raises
 
     def buy(self, o: dict, attempt: int) -> tuple[int, str]:
         oid = str(o["order_id"])
         self._created = None
         sku = str(o.get("sku") or "")
+        pre = self._pre or {}
         try:
             row = self.row_for(sku)
-            v = self.pick(row, o)
+            row, v = self.pick(row, o, pre.get("plan"))
         except Refused as ex:
             log.warning(f"{oid}: refused -- {ex}")
             report_failed(oid, str(ex))
@@ -1178,7 +1363,7 @@ class Run:
             return 0, ""
 
         cents = int(round(v.wholesale_eur * 100))
-        have = self.st.wallet_cents()
+        have = pre["wallet"].result() if pre.get("wallet") is not None else self.st.wallet_cents()
         if have < cents:
             alert_hourly(f"wallet too low for {oid}",
                          f"Stellar wallet EUR {have/100:.2f}, order needs EUR {cents/100:.2f} "
@@ -1198,10 +1383,14 @@ class Run:
         # moves: a backup may have taken it over while this run read the
         # catalogue. Not ours any more = nothing bought, nothing written,
         # nothing reported -- the new holder carries the order.
-        if not still_ours(oid):
+        # (Not when the claim is seconds old - STILL_OURS_AFTER_S: nobody can
+        # have taken it over yet, and the re-check is a round trip a waiting
+        # customer pays for.)
+        if time.monotonic() - self._claimed_at > STILL_OURS_AFTER_S and not still_ours(oid):
             log.warning(f"{oid}: the claim is no longer ours -- not buying")
             self._lost = True
             return 0, ""
+        self._stamp("read")
         self._posted = True             # from here the order may exist at Stellar
         try:
             code, body = self.st.create_order(v.plan_id, idem)
@@ -1251,11 +1440,27 @@ class Run:
 
         if code in (200, 201, 202) and data.get("id"):
             sid = str(data["id"])
-            n = self.append({**base, H_LINK_SUP: PORTAL_ORDER.format(id=sid),
-                             H_STATUS: ST_PROCESSING})
+            self._stamp("created")
             self._created = data
-            log.info(f"{oid}: Stellar order {sid} placed ({v.gb:g}GB/{v.days}d), row {n}")
-            return n, sid
+            log.info(f"{oid}: Stellar order {sid} placed ({v.gb:g}GB/{v.days}d)")
+            # The receipts row is written WHILE Stellar provisions (2026-11-16)
+            # - three Sheets calls that used to stand between the purchase and
+            # the first ask. Nothing is delivered before it is in: settle()
+            # waits for its row number (_row_no) before it writes or reports a
+            # thing, and a row that could not be written raises there exactly
+            # as it raised here. A run killed before the row landed is the
+            # case the idempotency key always covered: the next run finds no
+            # row, buys under the SAME key and is handed this order back.
+            vals = {**base, H_LINK_SUP: PORTAL_ORDER.format(id=sid), H_STATUS: ST_PROCESSING}
+
+            def write_row():
+                n = self.append(vals)
+                log.info(f"{oid}: receipts row {n} written for Stellar order {sid}")
+                return n
+            try:
+                return _ROWS.submit(write_row), sid
+            except RuntimeError:              # the pool is shutting down: write it here
+                return write_row(), sid
         # 402 and "busy" (below) are about THIS request only. After an unknown
         # first answer (`unsure`) they fall through to the review row: the
         # first POST may hold an order that a later run must not report failed.
@@ -1346,7 +1551,15 @@ class Run:
                   f"under a new key.")
         return n, ""
 
-    def settle(self, o: dict, n: int, sid: str, wait: bool, first: Optional[dict] = None):
+    @staticmethod
+    def _row_no(n) -> int:
+        """A receipts row number, or the future of one (buy() writes the row
+        beside the provisioning wait): waits for it, and raises what the
+        write raised."""
+        return int(n.result()) if hasattr(n, "result") else int(n)
+
+    def settle(self, o: dict, n, sid: str, wait: bool, first: Optional[dict] = None,
+               prep: Optional["MailPrep"] = None):
         """Ask Stellar what became of the order until it can be delivered.
 
         `first` is the body the purchase itself came back with. Stellar often
@@ -1362,17 +1575,39 @@ class Run:
         data = first if isinstance(first, dict) and first else None
         gaps = poll_delays()
         asked = False          # has Stellar been asked about the order ITSELF yet
+        busy = 0               # asks answered "busy" / 5xx / no answer, in a row
         while True:
+            looked_up = False      # did this ask cost a second call (/esims/{id})
             if data is None:
-                data = self.st.order(sid)
-                asked = True
+                try:
+                    data = self.st.order(sid)
+                    looked_up = needs_esim_lookup(data)
+                    cred = credentials(self.st, data)
+                except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as ex:
+                    # A GET is safe to ask again. "Busy", a 5xx or a dropped
+                    # line mid-wait is a reason to ask again in a moment, not
+                    # to end this order's run (2026-11-16: one ask a second
+                    # can meet Stellar's limit when every job reads at once).
+                    code = getattr(getattr(ex, "response", None), "status_code", 0) or 0
+                    busy += 1
+                    if ((code and code not in BUSY_CODES and code < 500) or busy > SETTLE_BUSY_MAX
+                            or time.monotonic() >= deadline):
+                        raise
+                    log.info(f"{oid}: Stellar answered {code or type(ex).__name__} while provisioning "
+                             f"-- asking again")
+                    time.sleep(2.0)
+                    continue
+                asked, busy = True, 0
+            else:
+                cred = credentials(self.st, data)
             status = str(data.get("status") or data.get("order_status") or "").lower()
-            cred = credentials(self.st, data)
             if cred:
-                self.deliver(o, n, sid, cred, data)
+                self._stamp("ready")
+                self.deliver(o, n, sid, cred, data, prep=prep)
                 return
             if status in TERMINAL_BAD:
                 log.warning(f"{oid}: Stellar order {sid} {status}")
+                n = self._row_no(n)
                 report_failed(oid, f"order {status} (auto-refunded by Stellar)")
                 update_row(self.ws, n, {H_STATUS: f"{ST_FAILED} ({status})"}, self.hdr())
                 alert_now(f"{oid}: Stellar order {status}",
@@ -1380,6 +1615,7 @@ class Run:
                           f"The site parked the order for retry -- the next attempt buys under a new key.")
                 return
             if status == "manual_review":
+                n = self._row_no(n)
                 rows = order_rows(self.ws, oid, self.hdr())
                 already = any(r["stellar_id"] == sid and r["status"] == ST_REVIEW for r in rows)
                 update_row(self.ws, n, {H_STATUS: ST_REVIEW}, self.hdr())
@@ -1389,6 +1625,7 @@ class Run:
                               f"Nothing more is bought for {oid} until row {n} of the receipts sheet is cleared.")
                 return
             if asked and time.monotonic() >= deadline:
+                n = self._row_no(n)     # the row is in before this run lets the order go
                 # The purchase's own answer never ends the wait: it is a second
                 # old and says 'processing' about everything, so a run that
                 # stopped there would report a fresh order as stuck without
@@ -1409,11 +1646,18 @@ class Run:
                                  f"portal -- the customer has paid and has nothing.", self.now)
                 return
             if asked:
-                time.sleep(next(gaps))
+                # Two calls this ask (the order and its eSIM): a longer gap,
+                # so the wait stays near the orders share (~80 a minute at
+                # most, for the seconds it lasts; a 429 is asked again).
+                gap = next(gaps)
+                time.sleep(gap * 1.5 if looked_up else gap)
             data = None
 
-    def deliver(self, o: dict, n: int, sid: str, cred: dict, data: dict):
+    def deliver(self, o: dict, n, sid: str, cred: dict, data: dict,
+                prep: Optional["MailPrep"] = None):
         oid = str(o["order_id"])
+        # The receipts row first, as ever: buy() may still be writing it.
+        n = self._row_no(n)
         row = None
         try:
             row = self.row_for(str(o.get("sku") or ""))
@@ -1457,6 +1701,7 @@ class Run:
                       f"The eSIM is being handed to the customer now; the sheet row is missing "
                       f"its credentials and its status: {ex}")
         answer = report_fulfilled(oid, payload, supplier_ref=sid)
+        self._stamp("told")
         if fb.site_parked(answer):
             self.parked += 1
             # The owner settled and REPLACED this order while the package was
@@ -1494,7 +1739,8 @@ class Run:
         # Everything past this line is AFTER the customer can install: the mail
         # only because the site now holds the eSIM, the colour because it is a
         # convenience and nobody waits for it.
-        self.mail(o, payload)
+        self.mail(o, payload, prep=prep)
+        self._timing(oid)
         paint_paid(self.ws, n, self.rail(o), self.hdr())
         self.retire_placeholders(o, n)
 
@@ -1541,7 +1787,7 @@ class Run:
                   "zero it if it was not. A late esim.dog delivery for it is checked against "
                   "the site and never reaches the customer.")
 
-    def mail(self, o: dict, payload: dict):
+    def mail(self, o: dict, payload: dict, prep: Optional["MailPrep"] = None):
         """The buyer's 'your eSIM is ready' email, sent from THIS step.
 
         It used to wait for the fulfillment bot, the next step of the same
@@ -1559,9 +1805,10 @@ class Run:
           * NEVER before report_fulfilled. The credentials exist by
             construction here -- settle() only calls deliver() once it has
             them -- and the site holds them before anything is promised.
-          * The mailbox is opened only when a mail is actually due, and only
-            once (one IMAP connection is a second or two; most deliveries are
-            the first mail of their order and find nothing in Sent).
+          * The mailbox is opened once per order, and closed whatever happens.
+            Since 2026-11-16 it is opened WHILE Stellar provisions (MailPrep,
+            with a Gmail SMTP connection beside it), so the mail leaves the
+            moment the site holds the eSIM instead of after two logins.
           * A send that fails is NOT retried here. The order stays on
             `awaiting_email`, and the fulfillment bot's sweep is the retry.
         """
@@ -1571,13 +1818,24 @@ class Run:
 
         def inbox():
             if "box" not in opened:
-                try:
-                    opened["box"] = fb._open_inbox(attempts=1)
-                except Exception as ex:                       # noqa: BLE001
-                    log.warning(f"{oid}: cannot open the mailbox to check for an earlier send "
-                                f"({type(ex).__name__}) -- the site's stamp and lease still guard it")
-                    opened["box"] = None
+                box = prep.inbox() if prep is not None else None
+                if box is None:
+                    try:
+                        box = fb._open_inbox(attempts=1)
+                    except Exception as ex:                   # noqa: BLE001
+                        log.warning(f"{oid}: cannot open the mailbox to check for an earlier send "
+                                    f"({type(ex).__name__}) -- the site's stamp and lease still guard it")
+                        box = None
+                opened["box"] = box
             return opened["box"]
+
+        def send():
+            fb.send_customer_email(to, oid, str(o.get("order_url") or ""),
+                                   fb._delivery_from_record({**o, "esim": payload}),
+                                   esim=payload, lang=str(o.get("lang") or ""),
+                                   total=o.get("paid_usd"), free=fb.is_free(o),
+                                   replaces=str(o.get("replaces") or ""))
+            self._stamp("mailed")
         try:
             if not to:
                 raise ValueError("the site has no address for this order")
@@ -1585,14 +1843,10 @@ class Run:
             # mail says "Free", a replacement's says it replaces the old order.
             # The queue row stands in for the facts read: a pending order has
             # no sent stamp, and the lease covers the minutes since.
-            got = fb.send_once(
-                inbox, oid, to,
-                lambda: fb.send_customer_email(to, oid, str(o.get("order_url") or ""),
-                                               fb._delivery_from_record({**o, "esim": payload}),
-                                               esim=payload, lang=str(o.get("lang") or ""),
-                                               total=o.get("paid_usd"), free=fb.is_free(o),
-                                               replaces=str(o.get("replaces") or "")),
-                by="cloud:stellar", facts=o)
+            # A prepared SMTP connection carries the one mail of this order;
+            # without one (or one that died) the send opens its own as ever.
+            with fb.warm_smtp(prep.smtp() if prep is not None else None):
+                got = fb.send_once(inbox, oid, to, send, by="cloud:stellar", facts=o)
         except Exception as ex:                              # noqa: BLE001
             got = "failed"
             log.warning(f"{oid}: the eSIM email did not go out here ({type(ex).__name__})")
@@ -1628,6 +1882,84 @@ class Run:
                          self.now)
         else:
             log.info(f"{oid}: no eSIM email from here ({got})")
+
+
+class MailPrep:
+    """The delivery mail, made ready while Stellar provisions (owner,
+    2026-11-16: "prepare the mail while we wait for Stellar").
+
+    The mail itself may not leave before the site holds the eSIM (mail(): never
+    before report_fulfilled), but everything around it can happen during the
+    10-30 s Stellar takes: the mailbox opened and searched for an earlier send
+    of this order - the Inbox remembers the answer, so send_once's own Sent
+    check costs nothing later - and a Gmail SMTP connection opened and logged
+    in. Nobody else can mail this order meanwhile: the site grants the mail
+    lease only once the order holds its eSIM, and that is after this.
+
+    Both are conveniences only. Whatever is not ready, or failed, mail() does
+    the old way; whatever was opened and not used is closed by close()."""
+
+    def __init__(self, o: dict):
+        self.oid = str(o.get("order_id") or "")
+        self.to = str(o.get("customer_email") or "").strip()
+        self._box = self._smtp = None
+        self._box_taken = self._smtp_taken = False
+        try:
+            if self.to:
+                self._box = _POOL.submit(self._open_box)
+            self._smtp = _POOL.submit(fb.smtp_open)
+        except RuntimeError:          # the pool is shutting down: mail() opens its own
+            pass
+
+    def _open_box(self):
+        box = fb._open_inbox(attempts=1)
+        try:
+            box.already_mailed_to(self.oid, self.to)      # remembered by the Inbox
+        except Exception:                                  # noqa: BLE001
+            pass                                          # send_once asks again itself
+        return box
+
+    @staticmethod
+    def _take(f, wait: float):
+        if f is None:
+            return None
+        try:
+            return f.result(timeout=wait)
+        except Exception:                                  # noqa: BLE001
+            return None     # failed, or still not ready: close() deals with a late one
+
+    def inbox(self, wait: float = PREP_WAIT_S):
+        """The prepared mailbox (the caller closes it), or None."""
+        box = self._take(self._box, wait)
+        self._box_taken = box is not None
+        return box
+
+    def smtp(self, wait: float = PREP_WAIT_S):
+        """The prepared, logged-in SMTP connection (fb.warm_smtp consumes or
+        closes it), or None."""
+        conn = self._take(self._smtp, wait)
+        self._smtp_taken = conn is not None
+        return conn
+
+    def close(self):
+        """Close what was opened and never handed over - now, or when a
+        preparation still under way finishes."""
+        for f, taken in ((self._box, self._box_taken), (self._smtp, self._smtp_taken)):
+            if f is not None and not taken:
+                f.add_done_callback(_close_result)     # at once when it is already done
+
+
+def _close_result(f):
+    try:
+        obj = f.result()
+    except Exception:                                      # noqa: BLE001
+        return
+    for name in ("close", "quit"):
+        try:
+            getattr(obj, name)()
+            return
+        except Exception:                                  # noqa: BLE001
+            continue
 
 
 # -- readiness ---------------------------------------------------------------
@@ -1716,8 +2048,10 @@ def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -
                 log.exception("readiness check failed")
         return 0
     log.info(f"{len(orders)} Stellar order(s) pending")
-    st = st or Stellar(fb.env("STELLAR_API_KEY"))
-    ws = ws if ws is not None else fb.sheet_client().open_by_key(fb.RECEIPTS_SHEET_ID).sheet1
+    # Warm ones when a long-lived caller keeps them (WARM), else opened now.
+    st = st or WARM.get("st") or Stellar(fb.env("STELLAR_API_KEY"))
+    if ws is None:
+        ws = WARM.get("ws") or fb.sheet_client().open_by_key(fb.RECEIPTS_SHEET_ID).sheet1
     r = Run(st, ws, now)
     # Orders this run has already taken a decision about. The site hands back
     # an order that is still pending -- one waiting on a review row, one whose
