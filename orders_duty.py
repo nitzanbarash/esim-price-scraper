@@ -85,6 +85,8 @@ MAIL_RETRY_S = 30.0
 QUICK_LOOKS_MAX = 5           # looks in a row "because the last one bought", then the usual rhythm
 NO_BUY_S = 900.0              # after the supplier refused OUR key on an order
 KEY_REFUSED, LOOK_FAILED = -2, -1     # buyer_tick's answers that are not a count
+ORDER_FAILED = -3            # an order ended in an error and nothing was placed: the run fails at once
+LATE_LOOK_S = 30.0            # past RUN_S + this, main() skips the forced look and hands the run back
 BELL_URL = (os.getenv("ORDERS_BELL_URL") or "").strip()
 S2 = "s2"                     # the ring's word for an order this duty buys itself
 STATE = os.path.join(tempfile.gettempdir(), "wr_orders_duty.json")
@@ -216,8 +218,9 @@ class Bell:
 def buyer_tick() -> int:
     """One look at the s2 queue; buys what is there. Never raises. Returns
     how many were bought, or LOOK_FAILED (the queue could not be read, the
-    buyer crashed) or KEY_REFUSED (the supplier refused our key on an order:
-    the claim was released, and this computer must stop claiming)."""
+    buyer crashed, or an order ended in an error and nothing was placed) or
+    KEY_REFUSED (the supplier refused our key on an order: the claim was
+    released, and this computer must stop claiming)."""
     import stellar_buyer as sb
     try:
         n = int(sb.run() or 0)
@@ -231,6 +234,11 @@ def buyer_tick() -> int:
     if sb.TROUBLE.get("key"):
         return KEY_REFUSED
     placed = sb.TROUBLE.get("placed")       # really placed; n also counts the ones that could not be
+    # An order that ended in an exception, in a look that placed nothing, is
+    # a failed look: reported as success it would keep GitHub's backup out.
+    if (sb.TROUBLE.get("errors") or 0) > 0 and not placed:
+        log.error("buyer tick: an order ended in an error and nothing was placed")
+        return ORDER_FAILED
     return n if placed is None else int(placed)
 
 
@@ -277,30 +285,55 @@ def ready_to_mail() -> bool:
         return False
 
 
+def _no_mail_went_out(fb) -> bool:
+    """fb.LAST_RUN {due, sent, failed, hard_failed} (2026-11-16): True when a
+    mail failed for a reason that is not one recipient's (connection, login,
+    timeout) and none went out. Missing or unreadable = no verdict."""
+    last = getattr(fb, "LAST_RUN", None)
+    if not isinstance(last, dict):
+        return False
+    try:
+        return int(last.get("hard_failed") or 0) > 0 and int(last.get("sent") or 0) == 0
+    except (TypeError, ValueError):
+        return False
+
+
 def fulfil_tick() -> bool:
     """One run of the delivery-mail bot. Never raises. False when it could
     not do its work for a reason that will still be there next time (its
     own SystemExit(1): a mailbox that needs a person - it has mailed the
-    owner; or a crash); a passing hiccup it rode out itself is True."""
+    owner; a crash; or a run whose due mails all failed to send for a reason
+    of the line, not of one address); a passing hiccup it rode out itself is
+    True."""
     import fulfillment_bot as fb
     try:
         fb.main()
-        return True
     except SystemExit as ex:
-        if not ex.code:
-            return True
-        log.error("mail bot: the mailbox needs a person (it has said so by mail)")
+        if ex.code:
+            log.error("mail bot: the mailbox needs a person (it has said so by mail)")
+            return False
     except Exception as ex:                                  # noqa: BLE001
         log.error(f"mail bot tick failed: {type(ex).__name__}")
-    return False
+        return False
+    if _no_mail_went_out(fb):
+        log.error("mail bot: no due mail went out (connection, login or timeout)")
+        return False
+    return True
 
 
 # -- the loop --------------------------------------------------------------
 
+def hold_until(state: dict, now: float) -> float:
+    """The saved no_buy_until, never more than NO_BUY_S ahead: a clock set
+    back must not stretch the hold (the same care as last_poll)."""
+    return min(_num(state, "no_buy_until"), now + NO_BUY_S)
+
+
 def duty(bell, state: dict, *, buyer=buyer_tick, fulfil=fulfil_tick, clock=time.time,
-         mono=time.monotonic, save=save_state, run_s: float = None) -> dict:
+         mono=time.monotonic, save=save_state, run_s: float = None, min_looks: int = 0) -> dict:
     """Run for run_s, then return the state for the next run. `bell` needs
-    wait(seconds) -> bool and rings() -> [codes]."""
+    wait(seconds) -> bool and rings() -> [codes]. min_looks: looks owed even
+    when run_s is spent (main: 1, so a run never ends well without one)."""
     run_s = RUN_S if run_s is None else run_s
     t0 = mono()
     last_poll, last_fulfil = _num(state, "last_poll"), _num(state, "last_fulfil")
@@ -309,7 +342,7 @@ def duty(bell, state: dict, *, buyer=buyer_tick, fulfil=fulfil_tick, clock=time.
     relook: list = []            # wall times of the looks a ring still owes
     stats = {"polls": 0, "bought": 0, "rings": 0, "mail_runs": 0, "failed": ""}
     look_fails = mail_fails = quick = 0
-    no_buy_until = _num(state, "no_buy_until")
+    no_buy_until = hold_until(state, clock())
 
     def remember():
         save({"last_poll": last_poll, "last_fulfil": last_fulfil, "hot_until": hot_until,
@@ -354,6 +387,12 @@ def duty(bell, state: dict, *, buyer=buyer_tick, fulfil=fulfil_tick, clock=time.
                 no_buy_until = clock() + NO_BUY_S
                 stats["failed"] = "key"
                 break
+            if got == ORDER_FAILED:
+                # Not three strikes: a run has room for two periodic looks,
+                # so a fault that fails every look would never fail the run
+                # and GitHub would never be asked (2026-11-16 review).
+                stats["failed"] = "order"
+                break
             if got < 0:
                 look_fails += 1
                 if look_fails >= LOOK_FAILS_MAX:
@@ -391,6 +430,23 @@ def duty(bell, state: dict, *, buyer=buyer_tick, fulfil=fulfil_tick, clock=time.
         bell.wait(max(0.2, min(min(due) - now, left)))
     if mail_fails and not stats["failed"]:
         stats["failed"] = "mail"                  # the run ended before the retry: the next one proves it first
+    if stats["polls"] < min_looks and not stats["failed"]:
+        # The run's time went before the loop (main's checks): one look all
+        # the same. A run that never looked must not end as a success, and a
+        # single look that failed here is a failed run.
+        last_poll = clock()
+        remember()
+        got = buyer()
+        stats["polls"] += 1
+        if got == KEY_REFUSED:
+            no_buy_until = clock() + NO_BUY_S
+            stats["failed"] = "key"
+        elif got == ORDER_FAILED:
+            stats["failed"] = "order"
+        elif got < 0:
+            stats["failed"] = "look"
+        else:
+            stats["bought"] += got
     remember()
     return stats
 
@@ -400,7 +456,9 @@ def main() -> int:
     began = time.monotonic()                    # the job's time limit counts from here, checks included
     state = load_state()
     mail_ok = ready_to_mail()
-    held = time.time() < _num(state, "no_buy_until")
+    now = time.time()
+    state["no_buy_until"] = hold_until(state, now)      # saved clamped, or the hold never ends
+    held = now < state["no_buy_until"]
     if held:
         log.error("the supplier refused this computer's key on an order a short while ago -- it does not "
                   "claim again yet (fix STELLAR_API_KEY: on the Mac, mac/wrnet-cli keys orders)")
@@ -424,11 +482,19 @@ def main() -> int:
             log.error("the mail bot still cannot do its work -- handed back (nothing was claimed)")
             return 1
         state["last_fulfil"] = time.time()
+    spent = time.monotonic() - began
+    if spent > RUN_S + LATE_LOOK_S:
+        # The checks ate the run: a purchase started now could outrun the
+        # job's time limit and be cut by the fence mid-way. No look; failed.
+        log.error(f"the checks took {spent:.0f}s -- no look this run, handed back")
+        state["failed"] = True
+        save_state(state)
+        return 1
     bell = Bell(BELL_URL, since=_num(state, "bell_since")).start()
     if not BELL_URL:
         log.warning(f"no bell address in the vault (ORDERS_BELL_URL) -- the queue is read every {POLL_S:.0f}s only")
     try:
-        stats = duty(bell, state, run_s=max(0.0, RUN_S - (time.monotonic() - began)))
+        stats = duty(bell, state, run_s=max(0.0, RUN_S - (time.monotonic() - began)), min_looks=1)
     finally:
         bell.close()
     log.info(f"duty done: {stats['polls']} look(s) at the queue, {stats['bought']} bought, "

@@ -109,17 +109,24 @@ API_MAX_PAGES = 300
 # 2026-11-16: Stellar raised the limit to 300 a minute (owner); until then 60.
 API_CALLS_PER_MINUTE = 150    # this run's share when nothing says otherwise
 API_CALLS_CEILING = 280       # never above this, a margin under Stellar's 300
+# A STELLAR_RATE_LIMIT that is SET but unreadable ('60.0', '60/min') was
+# meant as a share, and every share the network hands out is below the
+# default: falling back to 150 would read above the others on the one IP the
+# PCs share. So a value nobody can read means the old, safe limit.
+API_CALLS_UNREADABLE = 60
 
 
 def calls_per_minute() -> int:
     """This run's share of Stellar's 300 a minute (60 until 2026-11-16).
     STELLAR_RATE_LIMIT sets it (on the home PCs this read shares one IP with
     usage and usage_live, so the network names its share); never above
-    API_CALLS_CEILING."""
+    API_CALLS_CEILING. Unset or blank: API_CALLS_PER_MINUTE; set to
+    something that is not a whole number: API_CALLS_UNREADABLE."""
+    raw = os.environ.get("STELLAR_RATE_LIMIT", "").strip()
     try:
-        v = int(os.environ.get("STELLAR_RATE_LIMIT", "") or API_CALLS_PER_MINUTE)
+        v = int(raw) if raw else API_CALLS_PER_MINUTE
     except ValueError:
-        v = API_CALLS_PER_MINUTE
+        v = API_CALLS_UNREADABLE
     return max(1, min(v, API_CALLS_CEILING))
 
 
@@ -396,10 +403,11 @@ def fetch_plans(key: str, session=None, sleep=time.sleep, clock=time.monotonic) 
     now the API's own last_page, and a read that ends short of meta.total is
     an error, not a catalogue.
 
-    Pages are paced to API_CALLS_PER_MINUTE in any rolling minute (Stellar
-    allows 60): the first ~55 go out a quarter-second apart as before, and only
-    a catalogue past that waits for the window. A 429 that slips through waits
-    for the time Stellar names and asks once more.
+    Pages are paced to calls_per_minute() in any rolling minute (Stellar
+    allows 300 since 2026-11-16, 60 before): the first ones go out a
+    quarter-second apart as before, and only a catalogue past the share waits
+    for the window. A 429 that slips through waits for the time Stellar names
+    and asks once more.
     """
     s = session or requests.Session()
     s.headers.update({"Authorization": f"Bearer {key}", "Accept": "application/json"})
@@ -408,8 +416,8 @@ def fetch_plans(key: str, session=None, sleep=time.sleep, clock=time.monotonic) 
 
     def get(page):
         # Wait for the OLDEST call to leave the minute, not for the whole
-        # window to empty: the other 54 are still inside it, and forgetting
-        # them sends 55 more at once.
+        # window to empty: the others are still inside it, and forgetting
+        # them sends a whole share more at once.
         while True:
             now = clock()
             while sent and now - sent[0] >= 60.0:
@@ -811,8 +819,14 @@ def stamp_price_direction(svc, col: dict[str, int]) -> int:
     two-currency string is copied verbatim into 'מחיר קודם', so a column that
     was never stamped shows yesterday's price backwards while today's reads
     correctly. It runs over the whole of each column so rows added later are
-    covered, and it runs BEFORE the values are written, because a value that
-    lands in an unstamped cell is a wrong number until the second call returns.
+    covered.
+
+    It runs AFTER the values are written (main), and it is cosmetic: the format
+    changes how a cell LOOKS, never what it holds, and every reader parses the
+    text itself - the dollar figure outside the parentheses (choose_supplier.
+    usd_outside_parens) - so an unstamped cell is a backwards-looking cell for
+    a second, not a wrong price. main() therefore never lets it fail a run
+    whose prices are already in the sheet. Its reads retry like the writes do.
     """
     targets = [col[k] for k in ("price", "prev") if k in col]
     sheet_id, rows = _grid(svc)
@@ -834,7 +848,7 @@ def _grid(svc) -> tuple[int, int]:
     sheet = svc.spreadsheets().get(
         spreadsheetId=SHEET_ID,
         fields="sheets(properties(sheetId,gridProperties(rowCount)))",
-    ).execute()["sheets"][0]["properties"]
+    ).execute(num_retries=3)["sheets"][0]["properties"]
     return sheet["sheetId"], sheet["gridProperties"]["rowCount"]
 
 
@@ -845,7 +859,7 @@ def _unstamped(svc, g: int, rows: int) -> int:
         ranges=[f"{col_letter(g)}2:{col_letter(g)}{rows}"],
         fields="sheets(data(rowData(values(userEnteredValue,"
                "userEnteredFormat/textDirection))))",
-    ).execute()["sheets"][0]["data"][0].get("rowData", [])
+    ).execute(num_retries=3)["sheets"][0]["data"][0].get("rowData", [])
     n = 0
     for rd in data:
         v = (rd.get("values") or [{}])[0]
@@ -1008,11 +1022,36 @@ def main(argv=None) -> int:
         print("\n(dry run — nothing written; add --apply to write)")
         return 0
     n = write_updates(svc, col, updates)
-    fixed = stamp_price_direction(svc, col)
+    # The prices are in. What follows is how two money columns LOOK, and an
+    # error in it used to fail this whole run after the write - the network
+    # then reported stellar_prices as failed, and GitHub's backup took over
+    # a job that had done its work.
+    try:
+        fixed = stamp_price_direction(svc, col)
+    except Exception as e:               # noqa: BLE001 -- cosmetic, logged
+        fixed = 0
+        print(f"⚠️  the money columns' text direction was not checked "
+              f"({type(e).__name__}) - display only, the prices above are written")
     print(f"\n✅ wrote {n} cells"
           + (f"; corrected the text direction of {fixed} money cells" if fixed else ""))
     return 0
 
 
 if __name__ == "__main__":
+    # The update network (waverole-net) runs this script inside a fence: a
+    # deadline on referee time that it moves forward while this computer is
+    # entitled to the task. net_fence.install() checks that fence before
+    # EVERY HTTP request this process makes (Sheets, the site, anything on
+    # requests / httplib2 / urllib) and exits 124 before a write that would
+    # come too late - or right after the computer slept without its
+    # monotonic clock counting it. WHY in the script and not only in runjob:
+    # runjob looks once a second; a job that wakes from a sleep can send a
+    # write in that second, after another computer already took the task
+    # over. net_fence.py is copied next to the scripts by the installer only;
+    # under GitHub Actions or by hand it is absent and nothing changes.
+    try:
+        import net_fence
+        net_fence.install()
+    except ImportError:
+        pass
     sys.exit(main())

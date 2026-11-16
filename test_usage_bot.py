@@ -18,9 +18,25 @@ Run:  python test_usage_bot.py
 
 import imaplib
 import os
+import smtplib
 import sys
 from datetime import datetime, timedelta, timezone
 from unittest import mock
+
+
+class _NoMailServer:
+    """Every check here is offline - and the password below is a fake one, so
+    a real SMTP login from a test is a FAILED LOGIN on the owner's real mail
+    account (2026-11-16: an alert added to fulfillment_bot.Inbox reached
+    smtp.gmail.com from this file). Any alert a test triggers fails here,
+    before the network, and bot_common.alert logs it as it would any outage."""
+
+    def __init__(self, *a, **k):
+        raise OSError("tests never reach a mail server")
+
+
+smtplib.SMTP = _NoMailServer
+smtplib.SMTP_SSL = _NoMailServer
 
 import usage_bot
 from usage_bot import (ACTIVE, EXPIRED, USED_UP, _parse_expiry, _parse_usage_cell,
@@ -1033,6 +1049,90 @@ check("unmetered: 05:00 run stays quiet", _due(3, True, datetime(2026, 9, 30, 5,
 check("unmetered: no key (PC) never mails", _due(3, False, datetime(2026, 9, 30, 9, 5, tzinfo=_TZ)), False)
 check("unmetered: nothing unmetered, no mail", _due(0, True, datetime(2026, 9, 30, 9, 5, tzinfo=_TZ)), False)
 check("unmetered: UTC clock read in Israel time", _due(1, True, datetime(2026, 9, 30, 6, 5, tzinfo=timezone.utc)), True)
+
+
+print("\n-- the Stellar phase: its own key, its own deadline (2026-11-16) --")
+# The network's usage job holds STELLAR_USAGE_KEY and never STELLAR_API_KEY,
+# so the unmetered mail - keyed off STELLAR_API_KEY until today - could never
+# fire there. And with no deadline a slow Stellar ran the job into its 1200 s
+# lease, killed before its one sheet write.
+_KEYS = {"STELLAR_USAGE_KEY": "", "STELLAR_API_KEY": "", "STELLAR_READ_KEY": "",
+         "USAGE_STELLAR_BUDGET_S": ""}
+
+
+def _stellar_phase(env):
+    """main() over U_ROWS; -> (fetch_usage kwargs, unmetered_mail_due have_key)."""
+    got, due = {}, []
+    import time as _time
+    with mock.patch.dict(os.environ, dict(_KEYS, **env)), \
+         mock.patch.object(usage_bot, "sheet_client", lambda: _WS(U_ROWS)), \
+         mock.patch.object(usage_bot, "ensure_status_colours", lambda *a: None), \
+         mock.patch.object(usage_bot, "list_prices", dict), \
+         mock.patch.object(usage_bot, "push_to_site", lambda items: 0), \
+         mock.patch.object(usage_bot, "alert", lambda su, bo: None), \
+         mock.patch.object(usage_bot, "fetch_usage", lambda ic: {}), \
+         mock.patch.object(usage_bot, "unmetered_mail_due",
+                           lambda n, have_key, now=None: due.append(have_key) or False), \
+         mock.patch.object(usage_bot.stellar_usage, "save_sim_ids", lambda *a, **k: None), \
+         mock.patch.object(usage_bot.stellar_usage, "fetch_usage",
+                           lambda urls, **kw: got.update(kw, left=kw["deadline"] - _time.monotonic()) or {}):
+        usage_bot.main()
+    return got, due[0] if due else None
+
+
+_kw, _have = _stellar_phase({"STELLAR_USAGE_KEY": "ro"})
+check("the network's read-only key is the key the reads use", _kw.get("key"), "ro")
+check("...and the unmetered mail counts it as a key", _have, True)
+_kw, _have = _stellar_phase({"STELLAR_API_KEY": "buy"})
+check("GitHub's buying key still counts", (_kw.get("key"), _have), ("buy", True))
+_kw, _have = _stellar_phase({"STELLAR_USAGE_KEY": "ro", "STELLAR_API_KEY": "buy"})
+check("with both, the read-only one is used", _kw.get("key"), "ro")
+_kw, _have = _stellar_phase({})
+check("no key at all: no mail (a computer blind to s2 by design)", _have, False)
+_kw, _ = _stellar_phase({"STELLAR_USAGE_KEY": "ro"})
+check("the Stellar reads get a deadline, 600 s by default",
+      590 < _kw.get("left", 0) <= usage_bot.STELLAR_BUDGET_S, True)
+_kw, _ = _stellar_phase({"STELLAR_USAGE_KEY": "ro", "USAGE_STELLAR_BUDGET_S": "120"})
+check("USAGE_STELLAR_BUDGET_S sets it", 110 < _kw.get("left", 0) <= 120, True)
+_kw, _ = _stellar_phase({"STELLAR_USAGE_KEY": "ro", "USAGE_STELLAR_BUDGET_S": "ten"})
+check("...and an unreadable one is the default, not 'no deadline'",
+      590 < _kw.get("left", 0) <= usage_bot.STELLAR_BUDGET_S, True)
+
+
+print("\n-- alerts: quiet without a mail password, not every run on the network --")
+import tempfile as _tf
+_mem = os.path.join(_tf.mkdtemp(), "alerts.json")
+_mailed = []
+with mock.patch.object(usage_bot, "_mail_alert", lambda su, bo: _mailed.append(su)):
+    with mock.patch.dict(os.environ, {"GMAIL_APP_PASSWORD": "", "NET_FENCE_FILE": ""}), \
+         mock.patch.object(usage_bot, "log") as _spy:
+        usage_bot.alert("Stellar usage not updating", "body", memory=_mem)
+    check("no mail password: nothing is sent", _mailed, [])
+    check("...and it is ONE warning line, not a traceback",
+          (_spy.warning.call_count, _spy.exception.call_count), (1, 0))
+    check("...naming what was not mailed", "Stellar usage not updating" in _spy.warning.call_args[0][0], True)
+
+    with mock.patch.dict(os.environ, {"GMAIL_APP_PASSWORD": "pw", "NET_FENCE_FILE": ""}):
+        usage_bot.alert("A", "b", memory=_mem)
+        usage_bot.alert("A", "b", memory=_mem)
+    check("on GitHub / by hand every alert mails, as ever", _mailed, ["A", "A"])
+    check("...and nothing is remembered there", os.path.exists(_mem), False)
+
+    _mailed.clear()
+    with mock.patch.dict(os.environ, {"GMAIL_APP_PASSWORD": "pw", "NET_FENCE_FILE": "fence.json"}):
+        usage_bot.alert("A", "b", memory=_mem)
+        usage_bot.alert("A", "b", memory=_mem)          # the next run, 30 minutes on
+        usage_bot.alert("B", "b", memory=_mem)          # another fault is news
+        check("on the network one subject mails once per 4 hours", _mailed, ["A", "B"])
+        _now = usage_bot.time.time()
+        with mock.patch.object(usage_bot.time, "time", lambda: _now + usage_bot.ALERT_EVERY_S + 1):
+            usage_bot.alert("A", "b", memory=_mem)
+        check("...and again after them", _mailed, ["A", "B", "A"])
+        with open(_mem, "w") as _f:
+            _f.write("not json")
+        usage_bot.alert("C", "b", memory=_mem)
+        check("a broken memory file is a fresh start, not a crash", _mailed[-1], "C")
+
 
 if _fails:
     print(f"{len(_fails)} FAILED: " + ", ".join(_fails))

@@ -22,8 +22,30 @@ from unittest import mock
 
 os.environ.pop("ORDERS_TOKEN", None)       # no fake may ever fall through to the live site
 
+# Never a real mail server (2026-11-16: an Inbox() in a test once logged in
+# to the owner's real Gmail with the fake password). A test that needs SMTP
+# patches in its own fake; anything else that tries fails here, offline.
+import imaplib  # noqa: E402
+import smtplib  # noqa: E402
+
+
+class _NoMailServer:
+    def __init__(self, *a, **k):
+        raise OSError("test: no real SMTP/IMAP connection")
+
+
+smtplib.SMTP = smtplib.SMTP_SSL = _NoMailServer
+imaplib.IMAP4_SSL = _NoMailServer
+
 import fulfillment_bot as fb               # noqa: E402
 import stock_shelf as ss                   # noqa: E402
+
+import tempfile  # noqa: E402
+
+import bot_common  # noqa: E402
+
+# The alert throttle keeps a file in the temp folder; the tests keep their own.
+bot_common.THROTTLE_FILE = os.path.join(tempfile.mkdtemp(prefix="wr-test-"), "throttle.json")
 
 SID_X = "cs_live_x9Y8w7V6u5T4s3R2q1P0oNmLkJiHgFeDcBa9876543210zyxwvuZYXWVUabcd"
 SID_S = "cs_live_s1A2b3C4d5E6f7G8h9I0jKlMnOpQrStUvWxYz0123456789abcdefABCDEFgh"
@@ -161,7 +183,7 @@ class Harness(unittest.TestCase):
         with mock.patch.object(ss.requests, "get", site.get), \
              mock.patch.object(ss.requests, "post", site.post), \
              mock.patch.object(fb, "env", lambda name: "test-token"), \
-             mock.patch.object(fb, "alert", lambda s, b: self.alerts.append((s, b))):
+             mock.patch.object(fb, "alert", lambda s, b, **k: self.alerts.append((s, b))):
             return ss.shelve_extras(book, receipts_ws=receipts_ws, now=NOW)
 
 
@@ -373,6 +395,33 @@ class TestOneWriterAtATime(Harness):
         with mock.patch.object(site, "post", boom):
             self.assertEqual(self.run_shelf(site, book), [])
         self.assertEqual(len(book.tab.rows), 1)
+
+
+
+class TestAlertsAndTheThrottle(unittest.TestCase):
+    """2026-11-16: fb.alert holds a repeated subject for an hour. The one-offs
+    here must never be held (two packages of one order share a subject), and
+    the refusal - repeated every run while the site cannot be told - is held
+    per PACKAGE for a day."""
+
+    def record(self, fn, *a):
+        got = []
+        with mock.patch.object(fb, "alert", lambda s, b, **k: got.append(k)):
+            fn(*a)
+        return got[0]
+
+    def test_a_shelved_package_is_never_held(self):
+        order = extra_order()
+        k = self.record(ss.shelf_alert, order, order["extras"][0], 2, None, 3.86)
+        self.assertEqual(k.get("every_s"), 0)
+
+    def test_a_refusal_is_held_per_package_for_a_day(self):
+        a = extra_order(iccid="8972000000000001111")
+        b = extra_order(iccid="8972000000000002222")
+        ka = self.record(ss.refusal_alert, a, a["extras"][0], "why")
+        kb = self.record(ss.refusal_alert, b, b["extras"][0], "why")
+        self.assertEqual(ka.get("every_s"), 86400)
+        self.assertNotEqual(ka.get("key"), kb.get("key"))
 
 
 if __name__ == "__main__":

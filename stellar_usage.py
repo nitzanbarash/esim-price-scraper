@@ -81,13 +81,27 @@ TIMEOUT = 30
 RATE_CEILING = 280       # never above this, a margin under Stellar's 300
 RATE_LIMIT = 150         # calls allowed per window when nothing says otherwise
 # The limit is per IP, and the update network's computers share one (the same
-# office line): two jobs reading at once on two PCs must split the 60 between
-# them. STELLAR_RATE_LIMIT lowers this run's share (2026-11-09: usage 25 +
-# usage_live 30 on the network; 100 + 100 since the 300 limit). Never above RATE_CEILING.
-try:
-    RATE_LIMIT = max(1, min(int(os.getenv("STELLAR_RATE_LIMIT", "") or RATE_LIMIT), RATE_CEILING))
-except ValueError:
-    pass
+# office line): jobs reading at once on two PCs must split the 300 between
+# them. STELLAR_RATE_LIMIT sets this run's share (2026-11-09: usage 25 +
+# usage_live 30 under the old 60; since the 300 limit usage 100 + usage_live
+# 100 + stellar_prices 60). Never above RATE_CEILING. A value that is SET but
+# unreadable ('60.0', '60/min') was meant as a share, and every share handed
+# out is under the default - so it means the old, safe 60, never 150.
+RATE_UNREADABLE = 60
+
+
+def rate_from_env(default: int) -> int:
+    """STELLAR_RATE_LIMIT as a share: blank = `default`, unreadable =
+    RATE_UNREADABLE, always 1..RATE_CEILING."""
+    raw = os.getenv("STELLAR_RATE_LIMIT", "").strip()
+    try:
+        v = int(raw) if raw else default
+    except ValueError:
+        v = RATE_UNREADABLE
+    return max(1, min(v, RATE_CEILING))
+
+
+RATE_LIMIT = rate_from_env(RATE_LIMIT)
 RATE_WINDOW = 60.0       # seconds
 RETRY_WAIT = 61.0        # when the 429 names no better time
 _recent: deque = deque()  # monotonic times of the calls made in the window
@@ -338,6 +352,26 @@ def _session(key: str, session=None):
     return s
 
 
+class OutOfTime(Exception):
+    """The sweep's deadline came before this call could be made (or before
+    the wait it needed was over). The package is "not asked" -- None -- and
+    goes first next run; never a reading, never a retirement."""
+
+
+# The deadline of the sweep in progress (a time.monotonic() value), set by
+# fetch_usage for its own duration. Checked before EVERY call and every wait,
+# not only between packages: one package is up to four calls of TIMEOUT
+# seconds, and a 429 used to sleep up to 300 s on top, so a deadline checked
+# between packages could be overrun by minutes -- and on the network a run
+# that outlives its lease is killed before its one sheet write (2026-11-16).
+_deadline: Optional[float] = None
+
+
+def _time_left() -> Optional[float]:
+    """Seconds until the sweep's deadline; None when there is none."""
+    return None if _deadline is None else _deadline - time.monotonic()
+
+
 def _throttle():
     """Sleep just long enough to keep this window under RATE_LIMIT calls."""
     now = time.monotonic()
@@ -345,6 +379,9 @@ def _throttle():
         _recent.popleft()
     if len(_recent) >= RATE_LIMIT:
         wait = RATE_WINDOW - (now - _recent[0]) + 0.5
+        left = _time_left()
+        if left is not None and wait >= left:
+            raise OutOfTime("rate window")
         log.info(f"stellar: {RATE_LIMIT} calls in the last minute -- pausing {wait:.0f}s")
         time.sleep(wait)
     _recent.append(time.monotonic())
@@ -369,16 +406,34 @@ def _retry_after(resp) -> float:
     return RETRY_WAIT
 
 
+def _timeout() -> float:
+    """TIMEOUT, or less when the deadline is nearer; OutOfTime when it has
+    (all but) come -- a call cut to a second would only fail as a timeout."""
+    left = _time_left()
+    if left is None:
+        return TIMEOUT
+    if left < 2.0:
+        raise OutOfTime("deadline")
+    return min(TIMEOUT, left)
+
+
 def _get(s, url) -> dict:
     _throttle()
-    r = s.get(url, timeout=TIMEOUT)
+    r = s.get(url, timeout=_timeout())
     if getattr(r, "status_code", 0) == 429:
         wait = _retry_after(r)
+        left = _time_left()
+        if left is not None and wait >= left:
+            # Never sleep past the deadline: the package is "not asked" and
+            # is read first next run, which is what a wait would have bought.
+            log.info(f"stellar: rate limited (429), {wait:.0f}s asked and only "
+                     f"{max(0.0, left):.0f}s left -- left for the next run")
+            raise OutOfTime("429")
         log.info(f"stellar: rate limited (429) -- waiting {wait:.0f}s and asking once more")
         time.sleep(wait)
         _recent.clear()
         _throttle()
-        r = s.get(url, timeout=TIMEOUT)
+        r = s.get(url, timeout=_timeout())
     r.raise_for_status()
     try:
         return _unwrap(r.json())
@@ -458,24 +513,34 @@ def save_sim_ids(found: dict, keep, path: str = SIM_ID_CACHE) -> None:
         log.warning(f"sim id cache not saved ({type(e).__name__}): next run asks for each order again")
 
 
-def _meter_by_sim(s, sim_id) -> Result:
-    """The one-call path for a package whose sim_id is known; None = use the long path."""
+def _meter(s, sim_id, asked: dict) -> Result:
+    """GET /esims/<sim_id>/usage once per package: a reading, Unknown, or
+    the exception it raised. `asked` remembers the answer, so the long path
+    of a package whose known sim_id failed does not send the same failed call
+    again (2026-11-16: it did, a second 30 s timeout per package)."""
+    if sim_id in asked:
+        return asked[sim_id]
     try:
         meter = _get(s, f"{BASE}/esims/{sim_id}/usage")
-    except Exception:
-        return None
+    except OutOfTime:
+        raise
+    except Exception as ex:
+        asked[sim_id] = ex
+        return ex
     got = map_usage(meter)
     if isinstance(got, dict):
         got["sim_id"] = sim_id
         _note_endpoint(EP_USAGE, meter)
-        return got
-    return None
+    asked[sim_id] = got
+    return got
 
 
 def _one(s, url, sim_id: str = "") -> Result:
+    asked: dict = {}         # sim_id -> what its meter answered, this package only
     if sim_id:
-        got = _meter_by_sim(s, sim_id)
-        if got is not None:
+        # The one-call path for a package whose sim_id is known.
+        got = _meter(s, sim_id, asked)
+        if isinstance(got, dict):
             return got
     oid = order_id_from_url(url)
     if not oid:
@@ -483,6 +548,8 @@ def _one(s, url, sim_id: str = "") -> Result:
         return None
     try:
         data = _get(s, f"{BASE}/orders/{oid}")
+    except OutOfTime:
+        raise
     except Exception as e:
         log.warning(f"stellar order {oid}: {_status(e)} -- left untouched")
         return None
@@ -502,23 +569,23 @@ def _one(s, url, sim_id: str = "") -> Result:
             # 'usage endpoint hunt' step of stellar-smoke.yml asked for five
             # and got 200 here and 404 for /data, /consumption and
             # /orders/<id>/usage. /esims/<sim_id> carries no figures at all.
-            try:
-                meter = _get(s, f"{BASE}/esims/{sim_id}/usage")
-            except Exception as ex:
+            # Asked at most once a package: the known-sim_id path above may
+            # already have had its answer.
+            got = _meter(s, sim_id, asked)
+            if isinstance(got, dict):
+                return got
+            if isinstance(got, Unknown):
+                seen.extend(got.keys)
+            else:
                 # Not an outage on its own: an eSIM whose usage_available is
                 # false may simply have no meter yet. The eSIM record below is
                 # tried next, and a real outage fails there too.
                 log.info(f"stellar meter for an esim of order {oid}: "
-                         f"{_status(ex)} -- trying the esim record")
-            else:
-                got = map_usage(meter)
-                if isinstance(got, dict):
-                    got["sim_id"] = sim_id
-                    _note_endpoint(EP_USAGE, meter)
-                    return got
-                seen.extend(got.keys)
+                         f"{_status(got)} -- trying the esim record")
             try:
                 detail = _get(s, f"{BASE}/esims/{sim_id}")
+            except OutOfTime:
+                raise
             except Exception as ex:
                 log.warning(f"stellar esim of order {oid}: {_status(ex)} "
                             "-- left untouched")
@@ -539,6 +606,29 @@ def _one(s, url, sim_id: str = "") -> Result:
     return Unknown(keys=sorted(set(seen)))
 
 
+# Which key reads the meters, the read-only one first (least privilege; the
+# same rule as stellar_prices.read_key and the network's first_of):
+#   STELLAR_USAGE_KEY  orders:read + esims:read - the update network's usage
+#                      and usage_live jobs hold this one;
+#   STELLAR_API_KEY    the buying key - GitHub's usage.yml has only this;
+#   STELLAR_READ_KEY   last: the catalogue key, made without esims:read
+#                      (memory: stellar-key-placement), so it may read no
+#                      meter - but a run holding only it should show up as
+#                      "unmetered" (and mail), not pass as a computer with no
+#                      key at all.
+USAGE_KEYS = ("STELLAR_USAGE_KEY", "STELLAR_API_KEY", "STELLAR_READ_KEY")
+
+
+def usage_key() -> tuple[str, str]:
+    """(env name, value) of the key a sweep reads with; ('', '') when none.
+    The NAME is safe to log; the value never is."""
+    for name in USAGE_KEYS:
+        v = os.getenv(name, "").strip()
+        if v:
+            return name, v
+    return "", ""
+
+
 def fetch_usage(order_urls, session=None, key: Optional[str] = None,
                 sim_ids: Optional[dict] = None, deadline: Optional[float] = None) -> dict:
     """{portal url -> reading | Unknown | None}, one entry per url given.
@@ -551,40 +641,55 @@ def fetch_usage(order_urls, session=None, key: Optional[str] = None,
               call. Every reading carries its sim_id, for the caller to keep.
     deadline  a time.monotonic() value: urls not reached by then come back
               None ("not asked"), never a reading - the caller puts them first
-              next run. Without it every url is read.
+              next run. Checked before every call and every wait, so the
+              sweep ends by it (2026-11-16: it was checked only between
+              packages, and one package's timeouts and a 429 wait overran it
+              by minutes). Without it every url is read.
+    key       the key to read with; default usage_key().
     """
-    global _logged_endpoint, _stale_rows
+    global _logged_endpoint, _stale_rows, _deadline
     _logged_endpoint, _stale_rows = False, 0     # one sweep, one endpoint line
     _recent.clear()
     urls = [u for u in (order_urls or [])]
     if not urls:
         return {}
-    # STELLAR_USAGE_KEY: the read-only key (orders:read + esims:read) the
-    # update network's computers hold; it is all a meter needs.
-    key = (key or os.getenv("STELLAR_API_KEY", "") or os.getenv("STELLAR_USAGE_KEY", "")).strip()
+    key = (key or usage_key()[1]).strip()
     if not key:
-        # Not an outage and not an error: the PC copy of this repo has no
-        # Stellar key by design (memory: stellar-key-placement). Every Stellar
+        # Not an outage and not an error: a computer without a Stellar key is
+        # blind to s2 by design (memory: stellar-key-placement). Every Stellar
         # row is simply left as it was.
-        log.info("STELLAR_API_KEY is not set -- Stellar rows are left untouched")
+        log.info("no Stellar key (" + " / ".join(USAGE_KEYS) + ") -- Stellar rows are left untouched")
         return {u: None for u in urls}
     s = _session(key, session)
     out = {}
     sim_ids = sim_ids or {}
     late = 0
-    for u in urls:
-        if u in out:
-            continue
-        if deadline is not None and time.monotonic() >= deadline:
-            out[u] = None
-            late += 1
-            continue
-        try:
-            out[u] = _one(s, u, sim_ids.get(u, ""))
-        except Exception as e:
-            # Belt and braces. Nothing in this module may raise into the sweep.
-            log.warning(f"stellar usage: {type(e).__name__} -- row left untouched")
-            out[u] = None
+    out_of_time = False
+    _deadline = deadline
+    try:
+        for u in urls:
+            if u in out:
+                continue
+            if out_of_time or (deadline is not None and time.monotonic() >= deadline):
+                out[u] = None
+                late += 1
+                continue
+            try:
+                out[u] = _one(s, u, sim_ids.get(u, ""))
+            except OutOfTime:
+                # Whatever ran out - the clock, a rate window or a 429 longer
+                # than the time left - runs out for every package after this
+                # one too: they are not asked (a 429 is not knocked on again
+                # once per package until the deadline).
+                out[u] = None
+                late += 1
+                out_of_time = True
+            except Exception as e:
+                # Belt and braces. Nothing in this module may raise into the sweep.
+                log.warning(f"stellar usage: {type(e).__name__} -- row left untouched")
+                out[u] = None
+    finally:
+        _deadline = None
     ok = sum(1 for v in out.values() if isinstance(v, dict))
     unknown = sum(1 for v in out.values() if isinstance(v, Unknown))
     log.info(f"stellar: {ok} of {len(out)} package(s) read"

@@ -62,9 +62,9 @@ class World:
         self.t += 2.0
         return self.mail_answers.pop(0) if self.mail_answers else True
 
-    def run(self, state=None, run_s=240):
+    def run(self, state=None, run_s=240, **kw):
         return od.duty(self, dict(state or {}), buyer=self.buyer, fulfil=self.fulfil, clock=self.clock,
-                       mono=self.mono, save=self.saved.append, run_s=run_s)
+                       mono=self.mono, save=self.saved.append, run_s=run_s, **kw)
 
 
 print("\n1. no ring: one look and one mail-bot run at the start, the next look 150 s later")
@@ -257,6 +257,14 @@ w = World(rings=[(5, "s2")], look_answers=[od.LOOK_FAILED, 0])
 st = w.run(state={"last_fulfil": w.t - 10}, run_s=60)
 check("one bad look followed by a good one is nothing", st["failed"] == "", str(st))
 
+print("\n15b. an order that errors fails the run at ONCE - a run has room for two looks only")
+w = World(look_answers=[od.ORDER_FAILED])
+st = w.run(state={"last_fulfil": w.t - 10}, run_s=240)
+check("one look, failed 'order'", len(w.looks) == 1 and st["failed"] == "order", f"{w.looks} {st}")
+w = World(look_answers=[od.ORDER_FAILED])
+st = w.run(state={"last_poll": w.t - 10, "last_fulfil": w.t - 10}, run_s=0, min_looks=1)
+check("...also the forced look", st["failed"] == "order", str(st))
+
 print("\n16. a stranger with the bell's address: bounded work")
 w = World(rings=[(1 + i * 6, "s2") for i in range(39)])
 st = w.run(state={"last_poll": w.t - 10, "last_fulfil": w.t - 10}, run_s=240)
@@ -284,6 +292,100 @@ endless = types.SimpleNamespace(iter_content=lambda chunk_size=0: iter([b"y" * 4
 check("an over-long line is skipped and the next one is read (no reconnect, no replay of it)",
       list(od.Bell._lines(endless)) == [b'{"c":3}'], str(list(od.Bell._lines(endless)))[:80])
 check("a state with a number that is no number reads as 0", od._num({"k": float("inf")}, "k") == 0.0)
+
+print("\n18. a look whose order ended in an error and placed nothing is a FAILED look (review 2026-11-16)")
+errs = types.ModuleType("stellar_buyer")
+errs.run = lambda: 1
+errs.alert_hourly = lambda *a, **k: None
+errs.TROUBLE = {"key": False, "placed": 0, "errors": 1}
+sys.modules["stellar_buyer"] = errs
+check("errors and nothing placed -> ORDER_FAILED (a success would keep GitHub's backup out)",
+      od.buyer_tick() == od.ORDER_FAILED)
+errs.TROUBLE = {"key": False, "placed": 1, "errors": 1}
+check("errors beside a real purchase -> the purchase counts", od.buyer_tick() == 1)
+errs.TROUBLE = {"key": True, "placed": 0, "errors": 1}
+check("a refused key is still said first", od.buyer_tick() == od.KEY_REFUSED)
+errs.TROUBLE = {"key": False, "placed": 0}
+check("a buyer without the count (older copy): as before", od.buyer_tick() == 0)
+sys.modules["stellar_buyer"] = ok
+
+print("\n19. a mail-bot run in which no due mail could be sent (the line, not an address) is a failure")
+fbm.main = lambda: None
+for last, want, label in (({"due": 2, "sent": 0, "failed": 2, "hard_failed": 2}, False, "nothing sent, line failures"),
+                          ({"due": 3, "sent": 1, "failed": 2, "hard_failed": 2}, True, "one went out"),
+                          ({"due": 2, "sent": 0, "failed": 2, "hard_failed": 0}, True, "only one address's failures"),
+                          ({"due": 0, "sent": 0, "failed": 0, "hard_failed": 0}, True, "nothing due"),
+                          ({"hard_failed": "x"}, True, "an unreadable count is no verdict"),
+                          ("garbage", True, "not a dict is no verdict")):
+    fbm.LAST_RUN = last
+    check(f"{label} -> {want}", od.fulfil_tick() is want)
+del fbm.LAST_RUN
+check("no LAST_RUN at all (an older mail bot) -> True", od.fulfil_tick() is True)
+fbm.main = lambda: (_ for _ in ()).throw(SystemExit(0))
+fbm.LAST_RUN = {"due": 1, "sent": 0, "failed": 1, "hard_failed": 1}
+check("a clean SystemExit(0) whose mails all failed on the line -> False", od.fulfil_tick() is False)
+del fbm.LAST_RUN
+fbm.main = lambda: None
+
+print("\n20. a run whose time went to the checks before it still looks once")
+w = World()
+st = w.run(state={"last_poll": w.t - 10, "last_fulfil": w.t - 10}, run_s=0, min_looks=1)
+check("run_s 0: one look all the same, and the run ends well", len(w.looks) == 1 and st["polls"] == 1
+      and st["failed"] == "", f"{w.looks} {st}")
+check("...and the look is saved", w.saved and w.saved[-1]["last_poll"] >= w.t0, str(w.saved[-1:]))
+w = World(look_answers=[od.LOOK_FAILED])
+st = w.run(state={"last_poll": w.t - 10, "last_fulfil": w.t - 10}, run_s=0, min_looks=1)
+check("...that look failing ends the run as failed (it proved nothing)", st["failed"] == "look", str(st))
+w = World(look_answers=[od.KEY_REFUSED])
+st = w.run(state={"last_poll": w.t - 10, "last_fulfil": w.t - 10}, run_s=0, min_looks=1)
+check("...a refused key there holds the buying back", st["failed"] == "key"
+      and w.saved[-1]["no_buy_until"] > w.t, str(w.saved[-1]))
+w = World()
+w.run(state={"last_fulfil": w.t - 10}, run_s=240, min_looks=1)
+check("a normal run that looked owes nothing extra", w.looks == [0.0, 150.0], str(w.looks))
+w = World()
+w.run(state={"last_poll": w.t - 10, "last_fulfil": w.t - 10}, run_s=0)
+check("without min_looks (duty's default) nothing changes", w.looks == [], str(w.looks))
+w = World(mail_answers=[False, False])
+st = w.run(state={"last_poll": w.t - 10}, run_s=60, min_looks=1)
+check("a run that ended on the mail half does not look", w.looks == [] and st["failed"] == "mail", f"{w.looks} {st}")
+
+calls.clear(); MEM.clear()
+ok.run = lambda: calls.append("run") or 0
+ok.TROUBLE = {"key": False}
+od.ready_to_mail = lambda: True
+_real_duty, _run_s = od.duty, od.RUN_S
+od.duty = lambda bell, state, **kw: _real_duty(bell, state, save=lambda d: None, **kw)   # no state file on this machine
+od.RUN_S = 0.0
+try:
+    rc = od.main()
+finally:
+    od.duty, od.RUN_S = _real_duty, _run_s
+check("main: the checks took the whole run, the queue is still read once and the run ends well",
+      rc == 0 and calls == ["run"], f"{rc} {calls}")
+
+print("\n21. a hold from a clock set back is never longer than NO_BUY_S")
+check("hold_until: nothing saved -> 0", od.hold_until({}, 1000.0) == 0.0)
+check("hold_until: a hold inside the window stands", od.hold_until({"no_buy_until": 1500.0}, 1000.0) == 1500.0)
+check("hold_until: a far-future hold is cut to now + NO_BUY_S",
+      od.hold_until({"no_buy_until": 1e12}, 1000.0) == 1000.0 + od.NO_BUY_S)
+w = World()
+w.run(state={"last_poll": w.t - 10, "last_fulfil": w.t - 10, "no_buy_until": w.t + 10**7}, run_s=20)
+check("duty saves the cut hold", w.t0 < w.saved[-1]["no_buy_until"] <= w.t0 + od.NO_BUY_S, str(w.saved[-1]))
+MEM.clear(); MEM["no_buy_until"] = _time.time() + 10**7; calls.clear()
+check("main: still held now (nothing claimed)", od.main() == 1 and calls == [], str(calls))
+check("...but saved cut, so the hold ends within NO_BUY_S", MEM["no_buy_until"] <= _time.time() + od.NO_BUY_S + 1,
+      str(MEM.get("no_buy_until")))
+
+print("\n22. checks that ate the whole run: no late look, handed back")
+MEM.clear(); calls.clear()
+_rs, _late = od.RUN_S, od.LATE_LOOK_S
+od.RUN_S, od.LATE_LOOK_S = -100.0, 0.0
+try:
+    rc = od.main()
+finally:
+    od.RUN_S, od.LATE_LOOK_S = _rs, _late
+check("main ends failed without a look", rc == 1 and MEM.get("failed") is True, f"{rc} {MEM}")
 
 print()
 if fails:

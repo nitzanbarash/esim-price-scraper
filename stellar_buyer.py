@@ -53,12 +53,21 @@ from __future__ import annotations
 import logging
 import os
 import re
+import ssl
 import sys
 import time
 from datetime import datetime
 from typing import Optional
 
 import requests
+
+try:
+    # NewConnectionError and NameResolutionError are ConnectTimeoutError's
+    # subclasses: all three are raised before a byte of the request is sent.
+    from urllib3.exceptions import ConnectTimeoutError as _U3ConnectError
+    from urllib3.exceptions import SSLError as _U3SSLError
+except ImportError:                                         # pragma: no cover
+    _U3ConnectError = _U3SSLError = ()
 
 import fulfillment_bot as fb
 import stellar_prices as sp
@@ -79,10 +88,13 @@ WORKER = (os.getenv("STELLAR_WORKER") or "gha:stellar").strip()[:64]
 # Names this run may take a claim OVER from, comma-separated (empty = none).
 # Set only by a backup that has been told the other buyer is dead: an order
 # claimed by a buyer that died mid-purchase would otherwise wait out the
-# claim's whole hour. Taking over is claiming under the HOLDER's name, which
-# the site answers as "yours already"; the receipts rows and Stellar's
-# idempotency key then make this run continue that purchase, not start a
-# second one (the module text, NOT TWICE).
+# claim's whole hour. Taking over MOVES the claim to our own name
+# (POST {claim: WORKER, takeover_from: holder}, 2026-11-16), and the site does
+# it only while the holder still holds it. It used to re-claim under the
+# HOLDER's name, which the site answered "yours" to both buyers at once. A
+# revived holder then finds the claim gone at its pre-purchase re-check
+# (still_ours) and buys nothing; the receipts rows and Stellar's idempotency
+# key make this run continue an earlier purchase, not start a second one.
 TAKEOVER = tuple(x.strip() for x in (os.getenv("STELLAR_TAKEOVER") or "").split(",") if x.strip())
 ROUTE_PREFIX = "Stellar "            # receipts Route: 'Stellar JC059'
 
@@ -159,20 +171,73 @@ AUTH_CODES = {401, 403, 407}
 
 # What a dropped connection says about whether the request was SENT. requests
 # raises the same ConnectionError for "could not connect" and "connected, then
-# the server hung up"; only the second can have spent money.
-NEVER_SENT = ("NewConnectionError", "Failed to establish a new connection",
+# the server hung up"; only the second can have spent money. The types decide
+# first (never_sent); these texts are the fallback, POSIX and Windows (the
+# home PCs: "getaddrinfo failed [Errno 11001]", WinError 10061 = refused).
+# WinError 10060 is NOT here: Windows uses it for a read that timed out on an
+# open connection too, so on its own it stays "may have reached".
+NEVER_SENT = ("NewConnectionError", "NameResolutionError", "Failed to establish a new connection",
               "Name or service not known", "nodename nor servname",
-              "Temporary failure in name resolution", "Connection refused")
+              "Temporary failure in name resolution", "Connection refused",
+              "getaddrinfo failed", "[Errno 11001]", "[Errno 11002]", "[WinError 10061]")
+# An SSL error is "never sent" only when its text says the HANDSHAKE failed
+# (a PC clock that is wrong fails the certificate check); an SSL error while
+# reading the answer comes after the request.
+HANDSHAKE_FAILED = ("handshake", "certificate verify failed", "wrong version number")
+_NEVER_SENT_TYPES = tuple(t for t in (requests.exceptions.ConnectTimeout, _U3ConnectError) if t)
+_SSL_TYPES = tuple(t for t in (requests.exceptions.SSLError, ssl.SSLError, _U3SSLError) if t)
+
+
+def _causes(ex: BaseException) -> list:
+    """ex and what it explicitly wraps (args, .reason, __cause__): requests ->
+    urllib3's MaxRetryError -> its reason. Not __context__: that can be an
+    older failure that has nothing to do with this one."""
+    out, todo = [], [ex]
+    while todo and len(out) < 20:
+        e = todo.pop(0)
+        if not isinstance(e, BaseException) or any(e is s for s in out):
+            continue
+        out.append(e)
+        todo.append(getattr(e, "reason", None))
+        todo.append(e.__cause__)
+        todo.extend(a for a in getattr(e, "args", ()) if isinstance(a, BaseException))
+    return out
+
+
+def never_sent(ex: BaseException) -> bool:
+    """True only when the request certainly never left this machine. Anything
+    ambiguous is False -- "may have reached Stellar"."""
+    chain = _causes(ex)
+    if any(isinstance(e, _NEVER_SENT_TYPES) for e in chain):
+        return True
+    text = " ".join(repr(e) for e in chain)
+    if any(m in text for m in NEVER_SENT):
+        return True
+    if any(isinstance(e, _SSL_TYPES) for e in chain):
+        if any(isinstance(e, ssl.SSLCertVerificationError) for e in chain):
+            return True
+        low = text.lower()
+        return any(m in low for m in HANDSHAKE_FAILED)
+    return False
 
 
 def reached_stellar(ex: Exception) -> bool:
-    return not any(m in repr(ex) for m in NEVER_SENT)
+    return not never_sent(ex)
 
 
 class Blocked(Exception):
     """The world is wrong, not the order. Nothing is bought this run and every
     order keeps its place in the queue."""
-FX_FALLBACK = 1.16       # only when the sheet's own '(€y) $x' cell cannot say
+
+
+class KeyRefused(Exception):
+    """Stellar answered 401/403 to a READ (/wallet, /plans, /orders/{id},
+    /esims/{id}): our key, not the order. Never an HTTPError on purpose, so the
+    handlers that read "no answer yet" into an HTTPError do not swallow it.
+    The text names the path and the code only."""
+
+
+FX_FALLBACK = 1.16      # only when the sheet's own '(€y) $x' cell cannot say
 
 # Receipts 'סטטוס - Status' values this bot writes. The sheet is the ledger,
 # so these words are state, not decoration: run() reads them back.
@@ -263,24 +328,35 @@ def pending_orders() -> list[dict]:
     return list(r.json().get("orders") or [])
 
 
-def claim(order_id: str) -> bool:
+def _json(r) -> dict:
+    try:
+        ans = r.json()
+    except Exception:                                       # noqa: BLE001
+        ans = {}
+    return ans if isinstance(ans, dict) else {}
+
+
+def claim(order_id: str, takeover: bool = True) -> bool:
     """True = ours (or already ours). False = another buyer holds it.
-    Raises when the site cannot be asked -- and then nothing is bought."""
+    Raises when the site cannot be asked -- and then nothing is bought.
+    takeover=False is the plain re-check (still_ours): never moves a claim."""
     r = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": WORKER},
                       headers=_site_headers(), timeout=20)
     if r.status_code == 409:
-        try:
-            ans = r.json()
-        except Exception:                                   # noqa: BLE001
-            ans = {}
+        ans = _json(r)
         by = str(ans.get("by") or "")
         # A closed order (settled, or it already has its eSIM) is nobody's,
         # whoever holds the claim: only a plain "another buyer holds it" may
         # be taken over.
-        if by and by in TAKEOVER and not ans.get("reason"):
-            r2 = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": by},
+        if takeover and by and by in TAKEOVER and not ans.get("reason"):
+            # Moved to OUR name, and only if `by` still holds it. A site that
+            # predates takeover_from answers 409 here: nothing is taken.
+            r2 = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": WORKER,
+                                                    "takeover_from": by},
                                headers=_site_headers(), timeout=20)
-            if r2.status_code == 200 and bool(r2.json().get("claimed")):
+            ans2 = _json(r2)
+            if (r2.status_code == 200 and ans2.get("claimed") is True
+                    and str(ans2.get("by") or WORKER) == WORKER):
                 log.warning(f"{order_id}: taken over from {by}, which is not answering")
                 return True
         log.warning(f"{order_id}: held by {by or '?'} -- not ours")
@@ -289,13 +365,22 @@ def claim(order_id: str) -> bool:
     return bool(r.json().get("claimed"))
 
 
+def still_ours(order_id: str) -> bool:
+    """The claim re-asserted right before the money moves: a backup may have
+    taken it over while this run read the catalogue. Raises when the site
+    cannot be asked -- and then nothing is bought."""
+    return claim(order_id, takeover=False)
+
+
 def release(order_id: str) -> bool:
     """Let go of our claim, so the other buyer may take the order now and not
-    in an hour. Only ever called when the supplier REFUSED OUR KEY on the
-    order (401/403: it read the request and created nothing), never after a
-    "busy" answer - there the order may exist on the supplier's side, and
-    only the SAME buyer's replay of the same idempotency key is certain to
-    find it. Never raises."""
+    in an hour. Called when the supplier REFUSED OUR KEY on the order
+    (401/403: it read the request and created nothing), and when an order
+    ended in an error before anything was sent to Stellar for it (Run.let_go)
+    -- never after a "busy" answer or any purchase whose outcome is unknown:
+    there the order may exist on the supplier's side, and only the SAME
+    buyer's replay of the same idempotency key is certain to find it. Never
+    raises."""
     try:
         r = requests.post(fb.ORDERS_URL, json={"order_id": order_id, "claim": WORKER, "release": True},
                           headers=_site_headers(), timeout=20)
@@ -315,8 +400,10 @@ def key_place() -> str:
 # What the last run() did (orders_duty reads it): "key" = the supplier
 # refused our key on an order; "placed" = how many orders were really placed
 # with the supplier (run()'s own count also holds the ones that could not be -
-# a short wallet, a busy supplier - which still wait in the queue).
-TROUBLE = {"key": False, "placed": 0}
+# a short wallet, a busy supplier - which still wait in the queue); "errors" =
+# orders that ended in an exception (orders_duty: a look that placed nothing
+# and had errors is a FAILED look, so the backup is not silenced).
+TROUBLE = {"key": False, "placed": 0, "errors": 0}
 
 
 def report_fulfilled(order_id: str, esim: dict, supplier_ref: str = "") -> dict:
@@ -363,10 +450,24 @@ class Stellar:
         self.s.headers.update({"Authorization": f"Bearer {key}",
                                "Accept": "application/json"})
 
-    def wallet_cents(self) -> int:
-        r = self.s.get(f"{BASE}/wallet", timeout=30)
+    def _read(self, path: str, label: str, **kw):
+        """One GET. 401/403 -> KeyRefused (our key, not the thing asked about);
+        anything else >= 400 -> HTTPError, as before. `label` is the path
+        without ids, for the log."""
+        r = self.s.get(f"{BASE}{path}", timeout=30, **kw)
+        if r.status_code in AUTH_CODES:
+            raise KeyRefused(f"GET {label} answered {r.status_code}")
         r.raise_for_status()
+        return r
+
+    def wallet_cents(self) -> int:
+        r = self._read("/wallet", "/wallet")
         return int((r.json().get("data") or {}).get("available_balance_cents") or 0)
+
+    def can_read_plans(self) -> None:
+        """The smallest catalogue read there is (one listing): proves plans:read
+        before anything is claimed. Raises KeyRefused or HTTPError."""
+        self._read("/plans", "/plans", params={"per_page": 1})
 
     def plans(self) -> list:
         return sp.fetch_plans(self.s.headers["Authorization"].split(" ", 1)[1])
@@ -405,20 +506,17 @@ class Stellar:
         return r.status_code, (body if isinstance(body, dict) else {})
 
     def order(self, order_id: str) -> dict:
-        r = self.s.get(f"{BASE}/orders/{order_id}", timeout=30)
-        r.raise_for_status()
+        r = self._read(f"/orders/{order_id}", "/orders/{id}")
         return r.json().get("data") or {}
 
     def esim(self, sim_id: str) -> dict:
-        r = self.s.get(f"{BASE}/esims/{sim_id}", timeout=30)
-        r.raise_for_status()
+        r = self._read(f"/esims/{sim_id}", "/esims/{id}")
         return r.json().get("data") or {}
 
     def plan(self, plan_id: str) -> dict:
         """One listing, for the region and networks of an order placed by an
         earlier run -- one call, where the whole catalogue is thirty-five."""
-        r = self.s.get(f"{BASE}/plans/{plan_id}", timeout=30)
-        r.raise_for_status()
+        r = self._read(f"/plans/{plan_id}", "/plans/{id}")
         return r.json().get("data") or {}
 
 
@@ -492,6 +590,20 @@ def order_rows(ws, order_id: str, hdr: Optional[list] = None,
         out.append({"n": n, "status": r[idx[H_STATUS]].strip(),
                     "stellar_id": m.group(1) if m else ""})
     return out
+
+
+# What a cell may not open with when its text came from the customer: the
+# receipts rows are written USER_ENTERED, so a device named '=IMPORTDATA(..)'
+# would become a live formula in the owner's sheet.
+FORMULA_LEADS = ("=", "+", "-", "@", "\t", "\r", "\n", "＝", "＋", "－", "＠")
+
+
+def as_text(v) -> str:
+    """A value from the order (device, address, rail, link) as plain text: a
+    leading ' when it opens like a formula. Sheets stores the ' as a marker,
+    not as part of the value, so every reader still gets the original."""
+    s = "" if v is None else str(v)
+    return "'" + s if s.lstrip(" ").startswith(FORMULA_LEADS) else s
 
 
 def append_row(ws, values: dict, hdr: Optional[list] = None) -> int:
@@ -687,15 +799,47 @@ def _quiet_hour(now: Optional[datetime] = None) -> bool:
     return (now or datetime.now(fb.TZ)).minute >= 10
 
 
+ALERT_EVERY_S = 3600
+
+
+def _throttle_ok():
+    """bot_common.throttle_ok(key, every_s) when this copy has it, else None.
+
+    On the home PCs the duty looks every 150 s, and the minute rule lets a
+    persistent fault through on every look inside :00-:09 (4-8 mails an
+    hour); the throttle's file remembers the last mail per subject instead.
+    Not on GitHub Actions: every run there is a fresh machine, the file would
+    be forgotten and every run would mail -- the minute rule stays there."""
+    if (os.getenv("GITHUB_ACTIONS") or "").strip().lower() == "true":
+        return None
+    f = getattr(fb, "throttle_ok", None)
+    if f is None:
+        try:
+            import bot_common
+            f = getattr(bot_common, "throttle_ok", None)
+        except Exception:                                   # noqa: BLE001
+            f = None
+    return f if callable(f) else None
+
+
 def alert_hourly(subject: str, body: str, now: Optional[datetime] = None):
-    if _quiet_hour(now):
-        log.warning(f"(alert held until the top of the hour) {subject}")
+    ok = _throttle_ok()
+    if ok is not None:
+        try:
+            send = bool(ok(f"stellar:{subject}", ALERT_EVERY_S))
+        except Exception:                                   # noqa: BLE001
+            send = not _quiet_hour(now)
+    else:
+        send = not _quiet_hour(now)
+    if not send:
+        log.warning(f"(alert held: sent within the hour, or not yet the top of it) {subject}")
         return
-    fb.alert(f"[stellar] {subject}", body)
+    fb.alert(f"[stellar] {subject}", body, every_s=0)      # throttled above, once
 
 
 def alert_now(subject: str, body: str):
-    fb.alert(f"[stellar] {subject}", body)
+    # One-off by design (one per row or attempt): never folded into an hour.
+    fb.alert(f"[stellar] {subject}", body, every_s=0)
 
 
 # ── choosing what to buy ─────────────────────────────────────────────────────
@@ -776,7 +920,8 @@ def plan_facts(raw_plan: dict, row: sp.StellarRow) -> tuple[str, str]:
 def credentials(st: Stellar, data: dict) -> Optional[dict]:
     """The installation block of the first eSIM that has one -- on the order
     itself when the key carries esims:read, else fetched per sim_id. None
-    while Stellar is still provisioning (or the key cannot see it)."""
+    while Stellar is still provisioning. A key that may not read the eSIM
+    (401/403) raises KeyRefused: this key can never deliver it."""
     for e in data.get("esims") or []:
         inst = e.get("installation") or {}
         if not inst.get("activation_code") and e.get("sim_id"):
@@ -830,6 +975,12 @@ class Run:
         self.bought = 0
         self._let_go = False                   # the last buy() ended for a reason of OURS (handle)
         self.parked = 0                         # packages the site kept as extras (deliver())
+        # Per order, reset by handle(): the order id whose claim this run holds,
+        # whether a purchase POST may have gone out for it in this attempt, and
+        # whether the claim was found taken over at the pre-purchase re-check.
+        self._held = ""
+        self._posted = False
+        self._lost = False
 
     def hdr(self) -> list:
         """The receipts header, read once. The owner reorders these columns
@@ -872,6 +1023,11 @@ class Run:
                 # Half a catalogue is the world being wrong, not the order:
                 # whatever sat on the unread pages would be refused as gone.
                 raise Blocked(str(ex)) from ex
+            except requests.HTTPError as ex:
+                code = getattr(ex.response, "status_code", 0)
+                if code in AUTH_CODES:
+                    raise KeyRefused(f"GET /plans answered {code}") from ex
+                raise
             cat = sp.Catalogue.from_api(plans)
             # A read that makes most coded rows vanish at once is a broken read
             # -- an empty page, a renamed id format, a key answering 200 with
@@ -928,13 +1084,30 @@ class Run:
                          f"-- reading the catalogue")
         return choose(self.catalogue(), row, o)
 
+    def let_go(self, oid: str) -> bool:
+        """After an order ended in an error: hand the claim back when nothing
+        was sent to Stellar for it in this attempt (NEVER CLAIM WHAT YOU CANNOT
+        BUY). Once a purchase POST may have gone out, the claim is kept: only
+        this buyer's replay of the same key is sure to find that order."""
+        oid = str(oid or "").strip()
+        if oid and self._held == oid and not self._posted:
+            return release(oid)
+        return False
+
     # ── one order ──
     def handle(self, o: dict):
         oid = str(o.get("order_id") or "").strip()
+        self._held, self._posted, self._lost = "", False, False
         if not oid:
+            return
+        # Before the claim: a claim this run will not act on holds the order
+        # from the other buyer for the claim's hour.
+        if self.bought >= MAX_ORDERS_PER_RUN:
+            log.warning(f"{oid}: per-run cap of {MAX_ORDERS_PER_RUN} reached -- next run")
             return
         if not claim(oid):
             return
+        self._held = oid
         # One read of the sheet, answering both questions asked of it: has this
         # order been bought already, and where does a new row go.
         self._values = self.ws.get_all_values()
@@ -952,6 +1125,10 @@ class Run:
             r = live[-1]
             if r["status"].startswith(ST_REVIEW):
                 log.info(f"{oid}: in manual review (row {r['n']}) -- hands off")
+                # The review row, not the claim, keeps every buyer away; a
+                # claim re-taken every look would never lapse and would block
+                # the owner's reassign for good (2026-11-16 review).
+                release(oid)
                 return
             if not r["stellar_id"]:
                 log.warning(f"{oid}: row {r['n']} says {r['status']!r} but names no Stellar order")
@@ -962,17 +1139,22 @@ class Run:
                              f"cost money. Paste the order's portal link into it, or set it to "
                              f"'{ST_FAILED}' if nothing was bought and the next run will retry.",
                              self.now)
+                release(oid)        # the row keeps buyers away, as above
                 return
             self.settle(o, r["n"], r["stellar_id"], wait=False)
             return
-        if self.bought >= MAX_ORDERS_PER_RUN:
-            log.warning(f"{oid}: per-run cap of {MAX_ORDERS_PER_RUN} reached -- next run")
-            return
         self._let_go = False
         n, sid = self.buy(o, attempt=len(attempts))
+        if self._lost:
+            return                  # taken over meanwhile: not ours to count or release
         if self._let_go and not sid:
             # Our key was refused: the order is not held hostage for the
             # claim's hour - the other buyer's key may be fine.
+            release(oid)
+            return
+        if not sid and not self._posted:
+            # Nothing was sent to Stellar (a short wallet, a refused order):
+            # hold nothing either - NEVER CLAIM WHAT YOU CANNOT BUY.
             release(oid)
             return
         self.bought += 1
@@ -1012,7 +1194,21 @@ class Run:
         # killed in that gap buys the package again.
         self.rail(o)
         idem = f"waverole-{oid}-a{attempt}"
-        code, body = self.st.create_order(v.plan_id, idem)
+        # The claim is re-asserted (never taken over) right before the money
+        # moves: a backup may have taken it over while this run read the
+        # catalogue. Not ours any more = nothing bought, nothing written,
+        # nothing reported -- the new holder carries the order.
+        if not still_ours(oid):
+            log.warning(f"{oid}: the claim is no longer ours -- not buying")
+            self._lost = True
+            return 0, ""
+        self._posted = True             # from here the order may exist at Stellar
+        try:
+            code, body = self.st.create_order(v.plan_id, idem)
+        except Exception as ex:
+            if never_sent(ex):
+                self._posted = False    # it never left this machine
+            raise
         # Once ONE answer has failed to say whether the order was created, the
         # whole exchange is unknown and STAYS unknown: no later answer can
         # prove the first POST created nothing. A clean success resolves it --
@@ -1028,22 +1224,30 @@ class Run:
             # -- never a purchase.)
             log.warning(f"{oid}: HTTP {code} says nothing about the money -- replaying {idem}")
             time.sleep(REPLAY_WAIT_S)
-            code, body = self.st.create_order(v.plan_id, idem)
+            try:
+                code, body = self.st.create_order(v.plan_id, idem)
+            except Exception as ex:                          # noqa: BLE001
+                # The first POST is still unknown: a replay that could not be
+                # asked settles nothing, so it is the review row below.
+                log.warning(f"{oid}: the replay of {idem} was not answered ({type(ex).__name__})")
+                code, body = 0, {"error": {"code": type(ex).__name__, "message": "the replay was not answered"}}
         data = _data(body)
         err = (body.get("error") or {}) if isinstance(body.get("error"), dict) else {}
         region, networks = plan_facts(self._raw.get(v.plan_id) or {}, row)
-        base = {H_MAIL: o.get("customer_email") or "", H_DATE: self.now.strftime("%d/%m/%Y %H:%M:%S"),
+        # The order's own strings go through as_text (formula injection); the
+        # cells this bot builds itself -- links, money, sizes -- do not.
+        base = {H_MAIL: as_text(o.get("customer_email") or ""), H_DATE: self.now.strftime("%d/%m/%Y %H:%M:%S"),
                 H_SKU: row.sku, H_GB: f"{v.gb:g}GB", H_USAGE: f"0 / {v.gb:g}", H_ORDER: oid,
-                H_LINK_WR: o.get("order_url") or "", H_ROUTE: f"{ROUTE_PREFIX}{row.code}",
+                H_LINK_WR: as_text(o.get("order_url") or ""), H_ROUTE: f"{ROUTE_PREFIX}{row.code}",
                 H_REGION: region, H_PLAN: f"{v.gb:g}GB - {v.days} days — {networks}".rstrip(" —"),
                 H_SOURCE: SUPPLIER_NAME,
                 # The rail -- or 'free' for a gift, or the replaced order's rail
                 # for a replacement (rail_for).
-                H_PURCHASE: self.rail(o),
+                H_PURCHASE: as_text(self.rail(o)),
                 H_BUY: f"{v.wholesale_eur * fx_of(row):.2f}$",
                 H_SELL: (f"{float(o['paid_usd']):.2f}$" if o.get("paid_usd") not in (None, "") else ""),
                 H_SALE: discount_text(o.get("list_usd"), o.get("paid_usd")),
-                H_DEVICE: o.get("device") or ""}
+                H_DEVICE: as_text(o.get("device") or "")}
 
         if code in (200, 201, 202) and data.get("id"):
             sid = str(data["id"])
@@ -1052,7 +1256,10 @@ class Run:
             self._created = data
             log.info(f"{oid}: Stellar order {sid} placed ({v.gb:g}GB/{v.days}d), row {n}")
             return n, sid
-        if code == 402:
+        # 402 and "busy" (below) are about THIS request only. After an unknown
+        # first answer (`unsure`) they fall through to the review row: the
+        # first POST may hold an order that a later run must not report failed.
+        if code == 402 and not unsure:
             alert_hourly(f"wallet refused {oid}", f"Stellar answered 402 (insufficient balance) "
                          f"for EUR {cents/100:.2f}. Top up; the order stays queued.", self.now)
             return 0, ""
@@ -1087,7 +1294,7 @@ class Run:
             self._let_go = True
             return 0, ""
 
-        if code in BUSY_CODES:
+        if code in BUSY_CODES and not unsure:
             # Stellar says it did not process the request. Nothing is written
             # and the site is told nothing, so the order keeps its place in the
             # queue and the next run asks again under the same key -- which is
@@ -1116,7 +1323,8 @@ class Run:
             return 0, ""
 
         # Stellar has still not said whether the money moved -- either twice
-        # over, or once and then with a refusal that only covers the REPLAY.
+        # over, or once and then with an answer that only covers the REPLAY
+        # (a refusal, busy, 402, or a replay that could not be asked at all).
         # The site is NOT told 'failed': it would read that as "nothing was
         # hand this PAID order back to be bought again, and the wallet may
         # already be down a package. So the order simply keeps its place in the
@@ -1454,23 +1662,26 @@ def preflight(st: Optional[Stellar] = None, loud: bool = False,
 
     try:
         cents = st.wallet_cents()
+        # One listing too: a key without plans:read would claim an order and
+        # then fail on the catalogue (review 2026-11-16).
+        st.can_read_plans()
+    except KeyRefused as ex:
+        alert_hourly("Stellar refuses our key",
+                     f"{ex}. Nothing can be bought from Stellar until this is fixed: check "
+                     f"STELLAR_API_KEY in {key_place()} against the one in the portal (it needs "
+                     f"plans:read, orders:create, orders:read and esims:read).", now)
+        log.error(f"Stellar refuses our key ({ex})")
+        return False
     except requests.HTTPError as ex:
         code = getattr(ex.response, "status_code", 0)
-        if code in AUTH_CODES:
-            alert_hourly("Stellar refuses our key",
-                         f"GET /wallet answered {code}. Nothing can be bought from Stellar "
-                         f"until this is fixed: check STELLAR_API_KEY in {key_place()} "
-                         f"against the one in the portal.", now)
-            log.error(f"Stellar refuses our key ({code})")
-        else:
-            log.warning(f"wallet read answered {code} -- not the key; asking again next run")
-            if loud:
-                alert_now("preflight: Stellar answered an error", f"GET /wallet -> HTTP {code}.")
+        log.warning(f"Stellar read answered {code} -- not the key; asking again next run")
+        if loud:
+            alert_now("preflight: Stellar answered an error", f"HTTP {code}.")
         return False
     except Exception as ex:
         # Stellar being briefly unreachable says nothing about the key, and a
         # queue this run had nothing to buy from is not an outage worth mail.
-        log.warning(f"wallet unreachable ({type(ex).__name__}) -- asking again next run")
+        log.warning(f"Stellar unreachable ({type(ex).__name__}) -- asking again next run")
         if loud:
             alert_now("preflight: Stellar unreachable", f"{type(ex).__name__}: {ex}")
         return False
@@ -1490,7 +1701,8 @@ def preflight(st: Optional[Stellar] = None, loud: bool = False,
 
 
 def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -> int:
-    TROUBLE["key"], TROUBLE["placed"] = False, 0
+    started = time.monotonic()          # the budget counts the queue read and the sheet open too
+    TROUBLE.update(key=False, placed=0, errors=0)
     orders = pending_orders()
     if not orders:
         log.info("no Stellar orders pending")
@@ -1507,7 +1719,6 @@ def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -
     st = st or Stellar(fb.env("STELLAR_API_KEY"))
     ws = ws if ws is not None else fb.sheet_client().open_by_key(fb.RECEIPTS_SHEET_ID).sheet1
     r = Run(st, ws, now)
-    started = time.monotonic()
     # Orders this run has already taken a decision about. The site hands back
     # an order that is still pending -- one waiting on a review row, one whose
     # claim another worker holds -- and asking about it twice in one run buys
@@ -1530,16 +1741,36 @@ def run(st: Optional[Stellar] = None, ws=None, now: Optional[datetime] = None) -
                     # refused and released the same way. Stop here.
                     stop = True
                     break
+            except KeyRefused as ex:
+                # A read refused our key (catalogue, order, eSIM, wallet): the
+                # next order would go the same way. Same words as the purchase's
+                # own 401/403 branch in buy().
+                TROUBLE["key"] = True
+                log.error(f"{oid}: Stellar refused the KEY ({ex}) -- not the order's fault")
+                alert_hourly("Stellar refused the key",
+                             f"Stellar: {ex}. That is our key or an edge in front of it, not "
+                             f"{oid} -- nothing was reported against the order. Check STELLAR_API_KEY "
+                             f"in {key_place()} (it needs plans:read, orders:create, orders:read and "
+                             f"esims:read) and the account at wholesale.stellarsecurity.com.", r.now)
+                r.let_go(oid)
+                stop = True
+                break
             except Blocked as ex:
+                TROUBLE["errors"] += 1
                 log.error(f"nothing is bought this run: {ex}")
                 alert_hourly("the Stellar catalogue read is not trustworthy",
                              f"{ex}\n\nNothing was bought; every queued Stellar order keeps its "
                              f"place and the next run tries again.", r.now)
+                r.let_go(oid)
                 stop = True
                 break
             except Exception as ex:
+                # Counted, so the orders duty does not report a look that bought
+                # nothing as a success; the claim goes back when nothing was sent.
+                TROUBLE["errors"] += 1
                 log.exception(f"{oid}: {type(ex).__name__}")
                 alert_hourly(f"{oid}: {type(ex).__name__}", f"{ex}\n\nThe order stays queued; this repeats next run.", r.now)
+                r.let_go(oid)
         if stop or r.bought >= MAX_ORDERS_PER_RUN or time.monotonic() - started > RUN_BUDGET_S:
             break
         # A settle is ninety seconds of standing still, and the customer who

@@ -61,6 +61,9 @@ REFRESH_S = 3600          # every package is sent at least this often
 SITE_CHUNK = 100
 S1_CHUNK = 50             # fetch_usage splits further into the supplier's own batch size
 DEFAULT_S2_RATE = 100
+# STELLAR_RATE_LIMIT set but unreadable ('60.0', '60/min'): the old, safe 60
+# (2026-11-16), never this job's default - a share somebody meant is below it.
+UNREADABLE_S2_RATE = 60
 # s2 reads stop after this many seconds of the run (2026-11-09, before many
 # more packages): the network ends the job at 580 s (lease), and a run that is
 # cut there sends nothing at all. Packages not reached are read FIRST next run
@@ -145,10 +148,11 @@ def readings(todo: list[dict], s2_key: str, cache: dict | None = None,
         log.info(f"s2: {len(s2)} package(s) skipped - no STELLAR_USAGE_KEY on this computer")
     elif s2:
         import stellar_usage
+        raw = os.getenv("STELLAR_RATE_LIMIT", "").strip()
         try:
-            rate = int(os.getenv("STELLAR_RATE_LIMIT", str(DEFAULT_S2_RATE)))
+            rate = int(raw) if raw else DEFAULT_S2_RATE
         except ValueError:
-            rate = DEFAULT_S2_RATE
+            rate = UNREADABLE_S2_RATE
         stellar_usage.RATE_LIMIT = max(1, min(rate, stellar_usage.RATE_CEILING))
         s2 = s2_order(s2, cache or {})
         try:
@@ -156,6 +160,9 @@ def readings(todo: list[dict], s2_key: str, cache: dict | None = None,
         except ValueError:
             budget = S2_BUDGET_S
         # The budget counts from the start of the run (t0 is time.time()).
+        # stellar_usage holds the deadline inside each package too - no call,
+        # no rate-window wait and no 429 wait runs past it (2026-11-16) - so
+        # the lease's last 160 s are left to the site push.
         spent = time.time() - t0 if t0 else 0.0
         deadline = time.monotonic() + max(30.0, budget - spent)
         sims = stellar_usage.load_sim_ids()
@@ -174,11 +181,20 @@ def readings(todo: list[dict], s2_key: str, cache: dict | None = None,
 
 
 def due(read: dict, cache: dict, now: float) -> list[dict]:
-    """The readings worth sending: moved since the last send, or not sent for an hour."""
+    """The readings worth sending: moved since the last send, or not sent for an hour.
+
+    Sent as the suppliers' own 3 decimals, exactly what usage_bot sends, and
+    the site rounds both to its 2 places the same way (half up, in JS). Until
+    2026-11-16 this rounded to 2 here, in Python (half to even, on the binary
+    value): on ~4% of figures the two writers disagreed by 0.01, so every
+    hourly sweep and every live run after it MOVED the stored figure, and the
+    order page's "last updated" kept resetting on a package nobody used. The
+    cache compares the same 3 decimals it sends.
+    """
     items = []
     for oid, u in sorted(read.items()):
-        used = round(float(u.get("used_gb") or 0), 2)
-        total = round(float(u.get("total_gb") or 0), 2)
+        used = round(float(u.get("used_gb") or 0), 3)
+        total = round(float(u.get("total_gb") or 0), 3)
         prev = cache.get(oid)
         if (isinstance(prev, list) and len(prev) == 3 and prev[0] == used and prev[1] == total
                 and now - float(prev[2] or 0) < REFRESH_S):

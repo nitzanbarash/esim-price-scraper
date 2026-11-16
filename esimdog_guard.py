@@ -144,7 +144,8 @@ def notify(info: dict, where: str, now: float | None = None, path: str = PAUSE_F
           f"({d.get('reason', '')}).\n\nThis computer makes no s1 calls for "
           f"{info['pause_s'] // 60:.0f} minutes (refusal {info['strikes']} in a row). "
           "Prices and usage from s1 wait on this computer; the others go on.\n\n"
-          "If this repeats, the load from this internet line is too high.")
+          "If this repeats, the load from this internet line is too high.",
+          every_s=0)      # one mail per new pause; the daily cap below limits it
     d.update({"mail_day": day, "mails": (sent or 0) + 1})
     _save(d, path)
     return True

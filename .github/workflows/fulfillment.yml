@@ -66,6 +66,10 @@ jobs:
       # answered 404, the run cancelled behind another): if a Stellar order
       # is still pending, wake stellar-buy.yml. Only a COUNT is printed —
       # the orders JSON carries customer addresses and this repo is public.
+      # probe=1 (2026-11-16): this is a LOOK at the queue, not a buyer's
+      # poll. Without it the site took every tick for the s2 buyer polling -
+      # stamped its heartbeat (so a dead buyer looked alive to every monitor)
+      # and ran the iCount sweep. The supplier filter applies all the same.
       - name: Wake the Stellar buyer if an order waits
         continue-on-error: true
         env:
@@ -74,7 +78,7 @@ jobs:
           DISPATCH_URL: https://api.github.com/repos/${{ github.repository }}/actions/workflows/stellar-buy.yml/dispatches
         run: |
           n=$(curl -sf -m 20 -H "Authorization: Bearer $ORDERS_TOKEN" \
-                "https://www.waverole.com/api/orders?status=pending&supplier=stellar" \
+                "https://www.waverole.com/api/orders?status=pending&supplier=stellar&probe=1" \
               | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("orders") or []))' 2>/dev/null || echo 0)
           echo "pending Stellar orders: $n"
           if [ "${n:-0}" -gt 0 ]; then
@@ -87,7 +91,10 @@ jobs:
 
   fulfill:
     needs: gate
-    if: needs.gate.outputs.skip != 'true'
+    # !cancelled(), not the implicit success(): a bare condition skipped the
+    # mail bot whenever the gate job FAILED (a checkout or runner fault) -
+    # exactly when nobody can tell whether the network is doing it.
+    if: ${{ !cancelled() && needs.gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     # The job clock starts when the job is CREATED, before a runner is
     # assigned. On 2026-10-05 a GitHub incident held runners for 10-15 min and

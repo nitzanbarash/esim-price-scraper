@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Usage bot (bot #5) — runs every 4 hours in GitHub Actions.
+Usage bot (bot #5) — runs on the update network's computers every 30-60
+minutes (job 'usage'); GitHub Actions every 4 hours is the backup, and runs
+only while the network's own 'usage' job has not succeeded for 2 hours.
 
 Keeps every live package's consumption up to date in two places:
 the receipts sheet (for you) and waverole.com (for the customer, who sees a
@@ -41,17 +43,25 @@ Two suppliers, one sweep (since 2026-09-10):
   actually got: no key, an error, or an unfamiliar shape all leave the row
   exactly as it was, because "we could not ask" is not "the package is over".
 
-Required environment (GitHub Secrets):
+Environment (GitHub Secrets; the update network's vault):
   GOOGLE_CREDENTIALS_JSON  service account with Editor on the receipts sheet
   ORDERS_TOKEN             bearer token of waverole.com/api/orders
-  GMAIL_APP_PASSWORD       only used to email you if the run itself breaks
-  STELLAR_API_KEY          Stellar Wholesale; absent = Stellar rows untouched
+  GMAIL_APP_PASSWORD       optional: the alert mails. Without it an alert is
+                           one log line (see alert below)
+  STELLAR_USAGE_KEY        Stellar Wholesale, read-only (the network's); or
+  STELLAR_API_KEY          the buying key (GitHub's); or STELLAR_READ_KEY.
+                           The first one set is used (stellar_usage.usage_key);
+                           none = Stellar rows untouched
+  USAGE_STELLAR_BUDGET_S   optional, default 600: how long the Stellar reads
+                           may take (see STELLAR_BUDGET_S)
 """
 
+import json
 import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import gspread
@@ -60,9 +70,10 @@ import requests
 import esimdog_guard
 import stellar_usage
 from bot_common import (
-    ORDERS_URL, RECEIPTS_SHEET_ID, TZ, alert, env, fetch_esim_details,
+    ORDERS_URL, RECEIPTS_SHEET_ID, TZ, env, fetch_esim_details,
     fetch_usage, is_replaced_status, sheet_client, _redact, _row_time,
 )
+from bot_common import alert as _mail_alert
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("usage")
@@ -87,6 +98,23 @@ STATUS_COLOURS = (
     ((USED_UP, EXPIRED),  (0.79, 0.87, 0.96)),   # blue   — spent or over
     ((FAULT,),            (1.00, 0.93, 0.66)),   # yellow — needs a person
 )
+
+# How long the Stellar reads of one run may take, counted from the start of
+# that phase (2026-11-16). On the update network this job's lease is 1200 s
+# and the sheet is written ONCE, at the end: a Stellar that answered slowly
+# (each call up to 30 s, a 429 up to 300 s more) used to run the job into its
+# lease, and the fence killed it before that write - so the s1 rows went
+# unwritten too. Packages not reached are "not asked", exactly like an error:
+# left as they are, read next run.
+STELLAR_BUDGET_S = 600
+
+# The alert mails, on a computer that runs this every 30-60 minutes (the
+# update network) instead of every 4 hours: one mail per subject per this many
+# seconds from that computer, so a fault that lasts mails as often as the
+# GitHub copy always did and not on every run (memory: stuck-claim-watchdog,
+# the 47-mail flood). Remembered in the job's working folder.
+ALERT_EVERY_S = 4 * 3600
+ALERT_MEMORY = "usage_alerts_sent.json"
 
 GRACE_DAYS = 1          # the spare day described above
 UNKNOWN_MAX_DAYS = 90   # cap for rows with no plan length (we sell max 30 days)
@@ -312,13 +340,59 @@ def decide_status(usage: dict | None, bought_at, plan_days: int | None, now=None
             else ACTIVE)
 
 
+def alert(subject: str, body: str, memory: str = ALERT_MEMORY) -> None:
+    """Mail the owner (bot_common.alert) - when this computer can, and not
+    more often than the 4-hourly GitHub copy ever did.
+
+    No GMAIL_APP_PASSWORD (the network's usage job may run without one - it
+    is optional in its vault): one warning line instead of bot_common's
+    'alert email failed' traceback. Nothing else changes; the run goes on.
+
+    Inside the update network (NET_FENCE_FILE is set for its jobs) the same
+    subject is mailed at most once per ALERT_EVERY_S from this computer. On
+    GitHub and by hand nothing is remembered and nothing is held back.
+    """
+    if not os.getenv("GMAIL_APP_PASSWORD", "").strip():
+        log.warning(f"alert not mailed - no GMAIL_APP_PASSWORD on this computer: {subject}")
+        return
+    if os.getenv("NET_FENCE_FILE"):
+        try:
+            with open(memory, encoding="utf-8") as f:
+                sent = json.load(f)
+            sent = sent if isinstance(sent, dict) else {}
+        except (OSError, ValueError):
+            sent = {}
+        now = time.time()
+        last = sent.get(subject)
+        if isinstance(last, (int, float)) and 0 <= now - last < ALERT_EVERY_S:
+            log.info(f"alert '{subject}' was mailed from this computer "
+                     f"{(now - last) / 60:.0f} min ago - not again yet")
+            return
+        sent = {k: v for k, v in sent.items()
+                if isinstance(v, (int, float)) and now - v < ALERT_EVERY_S}
+        sent[subject] = now
+        try:
+            with open(memory + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(sent, f)
+            os.replace(memory + ".tmp", memory)
+        except OSError as e:
+            log.warning(f"alert memory not saved ({type(e).__name__}) - "
+                        "the next run may mail this again")
+    _mail_alert(subject, body)
+
+
 def unmetered_mail_due(unmetered: int, have_key: bool, now=None) -> bool:
     """Mail about unmetered Stellar rows? Once a day, and only when it means
-    something. No key = the PC copy, blind to Stellar by design (memory:
+    something. No key = a computer blind to Stellar by design (memory:
     stellar-key-placement), so every row is unmetered and that is not news.
-    The window 08-12 Israel holds exactly one scheduled run (09:00, cron at
+    have_key is whether THIS run read with a key (stellar_usage.usage_key -
+    the network's STELLAR_USAGE_KEY counts as much as GitHub's STELLAR_API_KEY;
+    until 2026-11-16 only the latter did, so the network never mailed).
+    The window 08-12 Israel holds exactly one GitHub run (09:00, cron at
     06 UTC, even if GitHub starts it late), so a fault that lasts gets one
-    mail a day instead of six, and a one-run blip at 13:00 gets none."""
+    mail a day instead of six, and a one-run blip at 13:00 gets none. The
+    network runs this every 30-60 minutes; there alert()'s 4-hour memory
+    keeps the window to one mail per computer."""
     if not unmetered or not have_key:
         return False
     now = now or datetime.now(TZ)
@@ -666,7 +740,7 @@ def main() -> int:
                 "status, nothing retired — because asking the wrong supplier "
                 "about a package gets 'never heard of it', and this bot reads "
                 "that as 'finished'. Fix whichever column is wrong and they "
-                "rejoin the sweep on the next run (every 4 hours).")
+                "rejoin the sweep on the next run.")
     if not todo:
         marks = refund_marks(rows, idx, fetch_refunds())
         if marks:
@@ -728,7 +802,18 @@ def main() -> int:
     # network's computers, gone with each GitHub run (no harm, just two calls).
     st_links = [t["link"] for t in todo if t["source"] == SRC_STELLAR and t["link"]]
     sims = stellar_usage.load_sim_ids()
-    st_usage = stellar_usage.fetch_usage(st_links, sim_ids=sims)
+    # The key this run reads with - and so the one the unmetered mail below
+    # asks about (the network holds STELLAR_USAGE_KEY, GitHub STELLAR_API_KEY).
+    st_key_name, st_key = stellar_usage.usage_key()
+    try:
+        st_budget = float(os.getenv("USAGE_STELLAR_BUDGET_S", "") or STELLAR_BUDGET_S)
+    except ValueError:
+        st_budget = STELLAR_BUDGET_S
+    if st_links:
+        log.info(f"Stellar: {len(st_links)} package(s), key {st_key_name or 'none'}, "
+                 f"{st_budget:.0f}s budget")
+    st_usage = stellar_usage.fetch_usage(st_links, key=st_key or None, sim_ids=sims,
+                                         deadline=time.monotonic() + max(30.0, st_budget))
     for u, r in st_usage.items():
         if isinstance(r, dict) and r.get("sim_id"):
             sims[u] = str(r["sim_id"])
@@ -763,13 +848,13 @@ def main() -> int:
             #
             #   · no portal link on the row (a Stellar package has no ICCID to
             #     fall back on, so the link is the only way in)
-            #   · no STELLAR_API_KEY — the PC copy of this repo has none, by
-            #     design (memory: stellar-key-placement)
+            #   · no Stellar key on this computer (stellar_usage.usage_key)
             #   · a network error, a timeout, a 5xx, junk instead of JSON
+            #   · the run's Stellar time budget ran out before this package
             #   · an order Stellar names no eSIM for
             #   · an answer in a shape stellar_usage has never mapped
             #
-            # stellar_usage reports the first five as None and the last as
+            # stellar_usage reports all but the last as None and the last as
             # Unknown, but the DANGER is identical and only Unknown used to be
             # caught. None fell through into decide_status(None, ...), which
             # reads silence as "the supplier never heard of this eSIM" — a
@@ -791,7 +876,8 @@ def main() -> int:
                     log.info(f"row {t['row']} ({t['order_id']}): Stellar "
                              + ("answered in an unrecognised shape"
                                 if isinstance(u, stellar_usage.Unknown)
-                                else "was not reached (no key, or the call failed)")
+                                else "was not reached (no key, the call failed, "
+                                     "or the time budget ran out)")
                              + " — left untouched")
                 continue
         else:
@@ -831,7 +917,9 @@ def main() -> int:
             # stand. Send what the sheet already knows rather than nothing:
             # the customer's meter showed BLANK for every finished package
             # because this push only ever ran when the supplier answered.
-            site_items.append({"order_id": t["order_id"], **sheet_u})
+            # from_sheet: the site never lets this older figure take a
+            # meter backwards that a live reading already moved on (2026-11-16).
+            site_items.append({"order_id": t["order_id"], **sheet_u, "from_sheet": True})
         if COL_ACTIVATED in idx:
             was = t.get("activated", "")
             now_txt = activation_text(u, was, sheet_u)
@@ -876,8 +964,8 @@ def main() -> int:
         # of the Stellar fleet went unmeasured this run, and a run where it
         # equals the whole fleet is a missing key, not a fleet of dead eSIMs.
         log.info(f"{unmetered} Stellar row(s) unmetered: no key / error / "
-                 "unknown shape — every one of them left exactly as it was")
-    if unmetered_mail_due(unmetered, bool(os.getenv("STELLAR_API_KEY", "").strip())):
+                 "time budget / unknown shape — every one of them left exactly as it was")
+    if unmetered_mail_due(unmetered, bool(st_key)):
         # 2026-09-29: eleven Stellar meters sat frozen for two days behind a
         # rate limit and the only trace was the log line above. A frozen meter
         # is invisible to the customer AND to us, so it gets a mail -- but ONE
@@ -889,9 +977,10 @@ def main() -> int:
               "so their GB figure on the sheet and on the order page is frozen:"
               "\n\n" + "\n".join(f"  · {r}" for r in shown)
               + (f"\n  ... and {extra} more" if extra else "")
-              + "\n\nThe reason per row is in the GitHub Actions log (usage "
-                "workflow). Rows are left exactly as they were, nothing is "
-                "retired. If this repeats tomorrow, the fault is not a blip.")
+              + "\n\nThe reason per row is in this run's log (the usage job on "
+                "the update network, or the usage workflow in GitHub Actions). "
+                "Rows are left exactly as they were, nothing is retired. If "
+                "this repeats tomorrow, the fault is not a blip.")
     # ── refunds the site recorded (PayPal webhook / dashboard) → the sheet ──
     marks = refund_marks(rows, idx, fetch_refunds())
     for n, c, text in marks:
@@ -909,8 +998,9 @@ def main() -> int:
     if skipped:
         alert("Usage bot skipped some packages",
               f"{skipped} of {len(todo)} package(s) could not be read this run "
-              "(details in the GitHub Actions log). Everyone else was updated "
-              "normally — those rows keep their previous figure.")
+              "(details in this run's log - the network's usage job, or GitHub "
+              "Actions). Everyone else was updated normally — those rows keep "
+              "their previous figure.")
 
     if site_items:
         log.info(f"site: {push_to_site(site_items)} order page(s) now show current usage")

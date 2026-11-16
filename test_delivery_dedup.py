@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The buyer must get their eSIM exactly once.
 
-Replays the 2026-09-02 incident: order WR-SCKMCC was mailed at 14:01 and again
+Replays the 2026-09-02 incident: order WR-DEDUP01 was mailed at 14:01 and again
 at 14:13. The send worked both times — what failed in between was the POST that
 tells the site "this one is done", so the ledger still called the order owed and
 the next sweep sent a second copy of the same eSIM.
@@ -21,7 +21,29 @@ from unittest import mock
 # instead of POSTing to the live site from a developer's shell.
 os.environ.pop("ORDERS_TOKEN", None)
 
+# Never a real mail server (2026-11-16: an Inbox() in a test once logged in
+# to the owner's real Gmail with the fake password). A test that needs SMTP
+# patches in its own fake; anything else that tries fails here, offline.
+import imaplib  # noqa: E402
+import smtplib  # noqa: E402
+
+
+class _NoMailServer:
+    def __init__(self, *a, **k):
+        raise OSError("test: no real SMTP/IMAP connection")
+
+
+smtplib.SMTP = smtplib.SMTP_SSL = _NoMailServer
+imaplib.IMAP4_SSL = _NoMailServer
+
 import fulfillment_bot as fb
+
+import tempfile  # noqa: E402
+
+import bot_common  # noqa: E402
+
+# The alert throttle keeps a file in the temp folder; the tests keep their own.
+bot_common.THROTTLE_FILE = os.path.join(tempfile.mkdtemp(prefix="wr-test-"), "throttle.json")
 
 
 class FakeInbox:
@@ -95,35 +117,35 @@ class Harness(unittest.TestCase):
             fb.deliver_pending_emails(ws)
 
 
-OWED = [{"order_id": "WR-SCKMCC", "customer_email": "chensharony321@gmail.com",
+OWED = [{"order_id": "WR-DEDUP01", "customer_email": "traveller321@example.com",
          "order_url": "", "lang": "he", "esim": {"plan": "10GB - 25 days"}}]
 
 
 class TestNoDuplicate(Harness):
     def test_the_incident_does_not_repeat(self):
         """Mailed once, confirmation lost: the sweep must close, not resend."""
-        inbox = FakeInbox(sent=[("WR-SCKMCC", "chensharony321@gmail.com")])
+        inbox = FakeInbox(sent=[("WR-DEDUP01", "traveller321@example.com")])
         self.sweep(OWED, inbox)
         self.assertEqual(self.sends, [], "buyer was mailed a second eSIM")
-        self.assertEqual(self.confirms, [("WR-SCKMCC", True)])
+        self.assertEqual(self.confirms, [("WR-DEDUP01", True)])
 
     def test_case_differs_between_site_and_sent(self):
-        """The site says Chensharony321@, Sent holds chensharony321@."""
-        inbox = FakeInbox(sent=[("WR-SCKMCC", "chensharony321@gmail.com")])
-        owed = [dict(OWED[0], customer_email="Chensharony321@gmail.com")]
+        """The site says Traveller321@, Sent holds traveller321@."""
+        inbox = FakeInbox(sent=[("WR-DEDUP01", "traveller321@example.com")])
+        owed = [dict(OWED[0], customer_email="Traveller321@example.com")]
         self.sweep(owed, inbox)
         self.assertEqual(self.sends, [])
 
     def test_still_not_resent_when_the_ledger_will_not_close(self):
         """A stale ledger row is cheaper than a second eSIM."""
         self.confirm_works = False
-        inbox = FakeInbox(sent=[("WR-SCKMCC", "chensharony321@gmail.com")])
+        inbox = FakeInbox(sent=[("WR-DEDUP01", "traveller321@example.com")])
         self.sweep(OWED, inbox)
         self.assertEqual(self.sends, [])
 
     def test_a_second_real_order_is_not_confused_with_the_first(self):
         """WR-VJ8K9P is a different order to the same buyer — it must go out."""
-        inbox = FakeInbox(sent=[("WR-SCKMCC", "chensharony321@gmail.com")])
+        inbox = FakeInbox(sent=[("WR-DEDUP01", "traveller321@example.com")])
         owed = [dict(OWED[0], order_id="WR-VJ8K9P")]
         self.sweep(owed, inbox)
         self.assertEqual([o for _, o in self.sends], ["WR-VJ8K9P"])
@@ -134,7 +156,7 @@ class TestStillDelivers(Harness):
         inbox = FakeInbox(sent=[])
         self.sweep(OWED, inbox)
         self.assertEqual(self.sends,
-                         [("chensharony321@gmail.com", "WR-SCKMCC")])
+                         [("traveller321@example.com", "WR-DEDUP01")])
 
     def test_unreadable_sent_folder_delivers_rather_than_withholds(self):
         """A duplicate beats a no-show: the eSIM is the buyer's only copy."""
@@ -148,12 +170,12 @@ class TestStillDelivers(Harness):
 
     def test_address_comes_from_the_sheet_when_the_site_has_none(self):
         rows = [["מייל - Mail", "מס׳ הזמנה"],
-                ["chensharony321@gmail.com", "WR-SCKMCC"]]
+                ["traveller321@example.com", "WR-DEDUP01"]]
         owed = [dict(OWED[0], customer_email="")]
         inbox = FakeInbox(sent=[])
         self.sweep(owed, inbox, sheet_rows=rows)
         self.assertEqual(self.sends,
-                         [("chensharony321@gmail.com", "WR-SCKMCC")])
+                         [("traveller321@example.com", "WR-DEDUP01")])
 
     def test_mailbox_is_closed_afterwards(self):
         inbox = FakeInbox(sent=[])
@@ -175,12 +197,12 @@ class TestAlertIsNotMistakenForTheCustomerCopy(unittest.TestCase):
         return inbox
 
     def test_only_an_alert_means_not_mailed(self):
-        inbox = self._inbox([fb.ALERT_PREFIX + "Order WR-SCKMCC is STUCK"])
-        self.assertFalse(inbox.already_mailed_to("WR-SCKMCC", "owner@x.com"))
+        inbox = self._inbox([fb.ALERT_PREFIX + "Order WR-DEDUP01 is STUCK"])
+        self.assertFalse(inbox.already_mailed_to("WR-DEDUP01", "owner@x.com"))
 
     def test_a_real_customer_copy_counts(self):
-        inbox = self._inbox(["ה-eSIM שלך מוכן לשימוש! ✈ הזמנה WR-SCKMCC"])
-        self.assertTrue(inbox.already_mailed_to("WR-SCKMCC", "owner@x.com"))
+        inbox = self._inbox(["ה-eSIM שלך מוכן לשימוש! ✈ הזמנה WR-DEDUP01"])
+        self.assertTrue(inbox.already_mailed_to("WR-DEDUP01", "owner@x.com"))
 
     def test_an_order_id_that_could_break_the_search_is_not_searched(self):
         inbox = self._inbox(["anything"])
@@ -357,7 +379,7 @@ class TestWhoseLatePackageIsIt(unittest.TestCase):
             if isinstance(park, Exception):
                 raise park
             return park if park is not None else {"ok": True, "parked": True, "customer_mail": False}
-        with mock.patch.object(fb, "alert", lambda s, b: alerts.append((s, b))), \
+        with mock.patch.object(fb, "alert", lambda s, b, **k: alerts.append((s, b))), \
              mock.patch.object(fb, "order_facts", lambda oid: dict(facts)), \
              mock.patch.object(fb, "fetch_esim_details", lambda urls: dict(details)), \
              mock.patch.object(fb, "report_fulfilled", report), \
@@ -529,7 +551,7 @@ class TestTheSiteCanWithholdTheMail(Harness):
         inbox.flag = flagged.append
         got = {"activation_code": "LPA:1$smdp$CODE", "iccid": "8972000000000000001",
                "used_url": URL + SID_B}
-        with mock.patch.object(fb, "alert", lambda s, b: alerts.append((s, b))), \
+        with mock.patch.object(fb, "alert", lambda s, b, **k: alerts.append((s, b))), \
              mock.patch.object(fb, "find_replaced_row", lambda ws, d: None), \
              mock.patch.object(fb, "fetch_esim_details", lambda urls: dict(got)), \
              mock.patch.object(fb, "report_fulfilled", lambda oid, d, det: answer), \
@@ -719,7 +741,7 @@ class TestTheLateDeliveryMailOfAServedOrder(Harness):
         inbox, flagged, alerts = FakeInbox(sent=sent), [], []
         inbox.flag = flagged.append
         got = {"activation_code": "LPA:1$smdp$CODE", "iccid": "8972000000000000001", "used_url": URL + SID_B}
-        with mock.patch.object(fb, "alert", lambda s, b: alerts.append((s, b))), \
+        with mock.patch.object(fb, "alert", lambda s, b, **k: alerts.append((s, b))), \
              mock.patch.object(fb, "find_replaced_row", lambda ws, d: None), \
              mock.patch.object(fb, "fetch_esim_details", lambda urls: dict(got)), \
              mock.patch.object(fb, "report_fulfilled", lambda oid, d, det: dict(answer)), \
@@ -825,7 +847,7 @@ class TestTheSaleComesBackFromTheSite(unittest.TestCase):
                  "paid_usd": 6.99, "list_usd": 7.99, "source": "paypal"}
         inbox, alerts, flagged = mock.Mock(), [], []
         inbox.flag = flagged.append
-        with mock.patch.object(fb, "alert", lambda s, b: alerts.append((s, b))), \
+        with mock.patch.object(fb, "alert", lambda s, b, **k: alerts.append((s, b))), \
              mock.patch.object(fb, "order_facts", lambda oid: dict(facts)), \
              mock.patch.object(fb, "fetch_esim_details", lambda urls: dict(GOT_A)), \
              mock.patch.object(fb, "report_fulfilled", lambda oid, d, det: {"ok": True, "status": "fulfilled",
@@ -843,6 +865,355 @@ class TestTheSaleComesBackFromTheSite(unittest.TestCase):
         self.assertEqual(fb.sale_cells_from_facts({"paid_usd": 0, "free": True, "source": "manual"}),
                          {fb.H_SELL: "0.00$", fb.H_PURCHASE: fb.FREE_RAIL})
         self.assertEqual(fb.sale_cells_from_facts({}), {})
+
+
+# ── 2026-11-16: two machines send side by side (the PCs and GitHub) ─────────
+
+import smtplib as _smtplib  # noqa: E402
+
+import requests as _requests  # noqa: E402
+
+
+def zero_last_run():
+    fb.LAST_RUN.update(due=0, sent=0, failed=0, hard_failed=0)
+
+
+class R:
+    """A requests.Response enough for the site calls."""
+
+    def __init__(self, code=200, body=None):
+        self.status_code, self.body = code, body if body is not None else {"ok": True}
+
+    def json(self):
+        return self.body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise _requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+
+def posting(answers, seen):
+    """requests.post returning (or raising) `answers` in turn."""
+    it = iter(answers)
+
+    def post(url, json=None, timeout=None, headers=None):
+        seen.append(json)
+        a = next(it)
+        if isinstance(a, Exception):
+            raise a
+        return a
+    return post
+
+
+class TestClaimMailAsksTwiceThenSkips(unittest.TestCase):
+    def claim(self, answers):
+        seen = []
+        with mock.patch.object(fb, "env", lambda name: "t"), \
+             mock.patch.object(fb.requests, "post", posting(answers, seen)), \
+             mock.patch.object(fb.time, "sleep", lambda s: None):
+            return fb.claim_mail("WR-ONE001", "cloud:test"), len(seen)
+
+    def test_one_blip_is_ridden_out(self):
+        got, n = self.claim([_requests.Timeout("t"), R(200, {"ok": True, "claim": True, "lease": "x#1"})])
+        self.assertEqual((got, n), ({"claim": True, "lease": "x#1"}, 2))
+
+    def test_two_blips_are_unreachable(self):
+        got, n = self.claim([_requests.ConnectionError("c"), R(503)])
+        self.assertEqual((got["reason"], n), ("unreachable", 2))
+
+    def test_only_a_400_is_an_old_site(self):
+        self.assertEqual(self.claim([R(400)]), ({"claim": None, "reason": "old_site"}, 1))
+        # 404: the site's store failed to read the order (readLive) - passes.
+        self.assertEqual(self.claim([R(404), R(404)])[0]["reason"], "unreachable")
+        self.assertEqual(self.claim([R(403), R(429)])[0]["reason"], "unreachable")
+
+    def test_an_answer_that_makes_no_sense_is_not_a_licence(self):
+        self.assertEqual(self.claim([R(200, {"ok": True}), R(200, {"claim": True})])[0]["reason"],
+                         "unreachable")
+
+
+class TestSendOnceUnderTwoMachines(Harness):
+    def setUp(self):
+        super().setUp()
+        zero_last_run()
+
+    def _send(self, raises=None, inbox=None, facts=None):
+        def send():
+            if raises:
+                raise raises
+            self.sends.append(("c@x.com", "WR-ONE001"))
+        return fb.send_once(inbox if inbox is not None else FakeInbox(), "WR-ONE001", "c@x.com", send,
+                            by="cloud:test", facts=facts if facts is not None else {})
+
+    def test_a_silent_lease_means_no_mail_this_tick(self):
+        self.claim_answer = {"claim": None, "reason": "unreachable"}
+        with mock.patch.object(fb, "alert", side_effect=AssertionError("a fresh order is not alerted")):
+            self.assertEqual(self._send(), "skipped")
+        self.assertEqual((self.sends, self.confirms), ([], []), "owed still: nothing written, nothing reported")
+        self.assertEqual(fb.LAST_RUN, {"due": 1, "sent": 0, "failed": 1, "hard_failed": 1})
+
+    def test_a_long_wait_behind_a_silent_lease_is_told(self):
+        self.claim_answer = {"claim": None, "reason": "unreachable"}
+        alerts = []
+        with mock.patch.object(fb, "alert", lambda s, b, **k: alerts.append(s)):
+            self._send(facts={"ts": "2026-01-01T00:00:00Z"})
+        self.assertEqual(len(alerts), 1)
+
+    def test_maybe_sent_keeps_the_lease(self):
+        self.claim_answer = {"claim": True, "lease": "cloud:test#ab12"}
+        forgot = []
+        box = FakeInbox()
+        box.forget = lambda o, t: forgot.append(o)
+        self.assertEqual(self._send(fb.MailMaybeSent("SMTPServerDisconnected after the handover"), box),
+                         "uncertain")
+        self.assertEqual(self.confirms, [("WR-ONE001", False)], "the error is reported...")
+        self.assertEqual(self.leases, [], "...but the lease is NOT handed back")
+        self.assertEqual(forgot, ["WR-ONE001"], "Sent is read again next time")
+        self.assertEqual(fb.LAST_RUN, {"due": 1, "sent": 0, "failed": 1, "hard_failed": 1})
+
+    def test_maybe_sent_without_a_lease_reports_nothing(self):
+        # A failure report starts the site's own Resend copy after 20 min.
+        self.assertEqual(self._send(fb.MailMaybeSent("x")), "uncertain")
+        self.assertEqual(self.confirms, [])
+
+    def test_a_refused_recipient_is_not_hard_and_not_logged(self):
+        self.claim_answer = {"claim": True, "lease": "cloud:test#ab12"}
+        e = _smtplib.SMTPRecipientsRefused({"c@x.com": (550, b"5.1.1 <c@x.com> no such user")})
+        with self.assertLogs("fulfillment", "WARNING") as logs:
+            self.assertEqual(self._send(e), "failed")
+        self.assertNotIn("c@x.com", "\n".join(logs.output))
+        self.assertEqual(self.leases, [("WR-ONE001", False, "cloud:test#ab12")], "before DATA: as before")
+        self.assertEqual(fb.LAST_RUN, {"due": 1, "sent": 0, "failed": 1, "hard_failed": 0})
+
+    def test_a_dropped_login_is_hard(self):
+        self._send(_smtplib.SMTPAuthenticationError(535, b"bad"))
+        self.assertEqual(fb.LAST_RUN["hard_failed"], 1)
+
+    def test_sent_and_already_are_counted_apart(self):
+        self.assertEqual(self._send(), "sent")
+        self.claim_answer = {"claim": False, "reason": "sent"}
+        self.assertEqual(self._send(), "already")
+        self.assertEqual(fb.LAST_RUN, {"due": 1, "sent": 1, "failed": 0, "hard_failed": 0})
+
+
+class TestTheFenceComesBeforeTheIrreversible(Harness):
+    def test_the_check_runs_before_the_mail(self):
+        events = []
+        fence = types.SimpleNamespace(check=lambda: events.append("fence"))
+        with mock.patch.object(fb, "net_fence", fence):
+            fb.send_once(FakeInbox(), "WR-ONE001", "c@x.com", lambda: events.append("mail"),
+                         by="cloud:test", facts={})
+        self.assertEqual(events, ["fence", "mail"])
+
+    def test_a_run_whose_time_is_up_writes_nothing(self):
+        def past():
+            raise SystemExit(124)                   # net_fence.check exits the process
+        with mock.patch.object(fb, "net_fence", types.SimpleNamespace(check=past)), \
+             self.assertRaises(SystemExit):
+            fb.send_once(FakeInbox(), "WR-ONE001", "c@x.com",
+                         lambda: self.sends.append(1), by="cloud:test", facts={})
+        self.assertEqual(self.sends, [])
+
+    def test_the_check_runs_before_the_receipts_row(self):
+        events = []
+        ws = Sheet([rrow("WR-FENCE1", link=URL + SID_B)])
+        box = FakeInbox()
+        box.flag = lambda uid: None
+        with mock.patch.object(fb, "net_fence", types.SimpleNamespace(check=lambda: events.append("fence"))), \
+             mock.patch.object(fb, "find_replaced_row", lambda ws, d: None), \
+             mock.patch.object(fb, "fetch_esim_details", lambda urls: {"activation_code": "LPA:1$a$b"}), \
+             mock.patch.object(fb, "complete_row", lambda *a: events.append("row")), \
+             mock.patch.object(fb, "report_fulfilled",
+                               lambda oid, d, det: events.append("report") or {"ok": True, "mail_owed": False}):
+            fb.process(box, ws, delivery(SID_B))
+        self.assertEqual(events, ["fence", "row", "report"])
+
+
+class TestACompletedRowTheSiteNeverHeardOf(Harness):
+    """The run filled the receipts row and ended (the network's fence, a
+    crash) before report_fulfilled reached the site. The delivery mail is
+    still unflagged, and the next run used to flag it as 'completed by the
+    purchase bot' - the customer's page stayed empty for good."""
+
+    def _run(self, facts, when=WHEN):
+        ws = Sheet([rrow("WR-DONE01", link=URL + SID_B, act="LPA:1$a$b", iccid="'8972")])
+        box, flagged, reports = FakeInbox(), [], []
+        box.flag = flagged.append
+        with mock.patch.object(fb, "find_replaced_row", lambda ws, d: None), \
+             mock.patch.object(fb, "fetch_esim_details", lambda urls: {"activation_code": "LPA:1$a$b"}), \
+             mock.patch.object(fb, "order_facts", lambda oid: dict(facts)), \
+             mock.patch.object(fb, "report_fulfilled",
+                               lambda oid, d, det: reports.append(oid) or {"ok": True, "status": "fulfilled"}):
+            fb.process(box, ws, delivery(SID_B, when=when))
+        return reports, flagged, ws
+
+    def test_the_site_lacks_the_esim_so_it_is_reported_again_and_mailed(self):
+        reports, flagged, ws = self._run({"order_id": "WR-DONE01", "status": "pending", "esim_ready": False})
+        self.assertEqual(reports, ["WR-DONE01"])
+        self.assertEqual(self.sends, [("c@x.com", "WR-DONE01")])
+        self.assertEqual(flagged, ["7"])
+        self.assertEqual(ws.cells, [], "the row is not written twice")
+
+    def test_the_site_holds_it_so_nothing_is_said(self):
+        reports, flagged, _ = self._run({"order_id": "WR-DONE01", "status": "fulfilled", "esim_ready": True})
+        self.assertEqual((reports, self.sends, flagged), ([], [], ["7"]))
+
+    def test_an_unreadable_site_is_asked_again_while_the_mail_is_fresh(self):
+        fresh = datetime.now(timezone.utc) - timedelta(minutes=10)
+        reports, flagged, _ = self._run({}, when=fresh)
+        self.assertEqual((reports, flagged), ([], []))
+        reports, flagged, _ = self._run({})            # WHEN is weeks old: as before
+        self.assertEqual((reports, flagged), ([], ["7"]))
+
+
+class TestReportFulfilledIsRetried(unittest.TestCase):
+    def report(self, answers):
+        seen = []
+        with mock.patch.object(fb, "env", lambda name: "t"), \
+             mock.patch.object(fb.requests, "post", posting(answers, seen)), \
+             mock.patch.object(fb.time, "sleep", lambda s: None):
+            try:
+                return fb.report_fulfilled("WR-ONE001", delivery(SID_B), {"activation_code": "x"}), len(seen)
+            except Exception as e:                  # noqa: BLE001
+                return e, len(seen)
+
+    def test_blips_are_ridden_out(self):
+        got, n = self.report([_requests.Timeout("t"), R(502), R(200, {"ok": True})])
+        self.assertEqual((got, n), ({"ok": True}, 3))
+
+    def test_a_real_answer_is_not_retried(self):
+        got, n = self.report([R(409), R(200)])
+        self.assertIsInstance(got, _requests.HTTPError)
+        self.assertEqual(n, 1)
+
+    def test_three_failures_raise(self):
+        got, n = self.report([R(503), R(503), R(503)])
+        self.assertIsInstance(got, _requests.HTTPError)
+        self.assertEqual(n, 3)
+
+
+class TestTheSweepWithoutTheSheet(Harness):
+    def test_the_first_address_wins_and_the_key_ignores_case(self):
+        rows = [["מייל - Mail", "מס׳ הזמנה"],
+                ["first@x.com", "wr-dedup01"],
+                ["", "WR-DEDUP01"]]                      # a re-buy's row, no address
+        self.sweep([dict(OWED[0], customer_email="")], FakeInbox(), sheet_rows=rows)
+        self.assertEqual(self.sends, [("first@x.com", "WR-DEDUP01")])
+
+    def test_no_sheet_at_all_still_mails_the_site_s_address(self):
+        with mock.patch.object(fb, "awaiting_email_orders", lambda: OWED), \
+             mock.patch.object(fb, "_open_inbox", lambda attempts=1: FakeInbox()):
+            fb.deliver_pending_emails(None)
+        self.assertEqual(self.sends, [("traveller321@example.com", "WR-DEDUP01")])
+
+
+class TestMainKeepsTheSheetApart(unittest.TestCase):
+    """A sheet that will not open (quota 429, Google down, a bad key) used to
+    be filed as 'mailbox unreadable' and cancel the delivery sweep."""
+
+    def run_main(self, sheet_error):
+        swept, alerts, processed = [], [], []
+        box = types.SimpleNamespace(unprocessed=lambda: [delivery()], close=lambda: None)
+        fb.LAST_RUN.update(due=9, sent=9, failed=9, hard_failed=9)
+        with mock.patch.object(fb, "_open_inbox", lambda attempts=3: box), \
+             mock.patch.object(fb, "sheet_client", mock.Mock(side_effect=sheet_error)), \
+             mock.patch.object(fb, "process", lambda *a: processed.append(1)), \
+             mock.patch.object(fb, "deliver_pending_emails", swept.append), \
+             mock.patch.object(fb, "check_stale_pending", lambda: None), \
+             mock.patch.object(fb, "alert", lambda s, b, **k: alerts.append(s)):
+            try:
+                fb.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, swept, alerts, processed
+
+    def test_a_passing_sheet_error_costs_only_the_matching(self):
+        e = Exception("APIError: [429]: Quota exceeded")
+        e.response = types.SimpleNamespace(status_code=429)
+        code, swept, alerts, processed = self.run_main(e)
+        self.assertEqual((code, swept, alerts, processed), (0, [None], [], []))
+        self.assertEqual(fb.LAST_RUN, {"due": 0, "sent": 0, "failed": 0, "hard_failed": 0}, "reset each run")
+
+    def test_a_missing_key_is_loud_and_named_right(self):
+        code, swept, alerts, _ = self.run_main(RuntimeError("Missing env/secret: GOOGLE_CREDENTIALS_JSON"))
+        self.assertEqual((code, swept), (1, [None]))
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("receipts sheet", alerts[0])
+        self.assertNotIn("mailbox", alerts[0])
+
+
+class TestNothingFromOutsideRunsAsAFormula(unittest.TestCase):
+    def test_cells(self):
+        for raw in ("=IMPORTXML(\"x\")", "+1", "-A1", "@x"):
+            self.assertEqual(fb._cell_text(raw), "'" + raw)
+        for raw in ("LPA:1$a$b", "", "0 / 10", "'8972"):
+            self.assertEqual(fb._cell_text(raw), raw)
+
+    def test_a_forged_delivery_mail_s_network_line(self):
+        ws = Sheet([rrow("WR-FORGED", link=URL + SID_B)])
+        hdr = HDR + ["חבילה - Plan"]
+        ws.rows[0] = list(hdr)
+        written = []
+        ws.update_cells = lambda cells, value_input_option=None: written.extend(cells)
+        d = dict(delivery(SID_B), gb=None, network='=HYPERLINK("http://evil")')
+        fb.complete_row(ws, 2, d, {"activation_code": "LPA:1$a$b"})
+        plan = [c.value for c in written if c.col == len(hdr)]
+        self.assertEqual(plan, ['\'=HYPERLINK("http://evil")'])
+
+
+class TestTheSentGuardLooksInSent(unittest.TestCase):
+    class Box:
+        def __init__(self, lines=()):
+            self.lines, self.selected, self.searches = list(lines), [], []
+
+        def list(self):
+            return "OK", [ln.encode() for ln in self.lines]
+
+        def select(self, name, readonly=False):
+            self.selected.append((name, readonly))
+            return "OK", [b"1"]
+
+        def uid(self, cmd, *a):
+            self.searches.append(a[-1])
+            return "OK", [b""]
+
+    def test_folders_by_their_attribute(self):
+        box = self.Box(['(\\HasNoChildren) "/" "INBOX"',
+                        '(\\HasNoChildren \\Sent) "/" "[Gmail]/Sent Mail"',
+                        '(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"'])
+        self.assertEqual(fb._special_folders(box), {"all": "[Gmail]/All Mail", "sent": "[Gmail]/Sent Mail"})
+        box.lines = box.lines[:2]
+        self.assertEqual(fb._special_folders(box), {"sent": "[Gmail]/Sent Mail"})
+        self.assertEqual(fb._all_mail_folder(box), "INBOX")
+
+    def _inbox(self, folder, guard):
+        box = fb.Inbox.__new__(fb.Inbox)
+        box._mailed, box.box, box.folder, box.guard_folder = {}, self.Box(), folder, guard
+        box._headers = lambda uids: {}
+        return box
+
+    def test_all_mail_hidden_the_guard_reads_sent_and_comes_back(self):
+        inbox = self._inbox("INBOX", "[Gmail]/Sent Mail")
+        self.assertFalse(inbox.already_mailed_to("WR-ONE001", "c@x.com"))
+        self.assertEqual(inbox.box.selected, [('"[Gmail]/Sent Mail"', True), ("INBOX", False)])
+        self.assertEqual(len(inbox.box.searches), 1)
+
+    def test_no_sent_folder_is_cannot_tell_and_said_once_a_day(self):
+        alerts = []
+        with mock.patch.object(fb, "alert", lambda s, b, **k: alerts.append(s)):
+            for oid in ("WR-ONE001", "WR-TWO002"):
+                self.assertFalse(self._inbox("INBOX", "").already_mailed_to(oid, "c@x.com"))
+        self.assertEqual(len(alerts), 1)
+
+    def test_an_address_the_atom_refuses_is_quoted_not_skipped(self):
+        inbox = self._inbox("[Gmail]/All Mail", "[Gmail]/All Mail")
+        inbox.already_mailed_to("WR-ONE001", "o'neil\"x@x.com")
+        self.assertIn('TO "o\'neil\\"x@x.com"', inbox.box.searches[0])
+        self.assertEqual(inbox.box.selected, [], "the same folder: no switch")
+        inbox = self._inbox("[Gmail]/All Mail", "[Gmail]/All Mail")
+        self.assertFalse(inbox.already_mailed_to("WR-ONE001", "josé@x.com"))
+        self.assertEqual(inbox.box.searches, [], "non-ASCII cannot be quoted: cannot tell")
 
 
 if __name__ == "__main__":

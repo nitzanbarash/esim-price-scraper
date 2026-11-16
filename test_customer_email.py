@@ -19,12 +19,33 @@ Run: python test_customer_email.py
 import base64
 import json
 import os
+import smtplib
+import tempfile
 import unittest
 from unittest import mock
 
 os.environ.setdefault("GMAIL_APP_PASSWORD", "test-password")
 
+# Never a real mail server (2026-11-16: an Inbox() in a test once logged in
+# to the owner's real Gmail with the fake password). A test that needs SMTP
+# patches in its own fake; anything else that tries fails here, offline.
+import imaplib  # noqa: E402
+import smtplib  # noqa: E402
+
+
+class _NoMailServer:
+    def __init__(self, *a, **k):
+        raise OSError("test: no real SMTP/IMAP connection")
+
+
+smtplib.SMTP = smtplib.SMTP_SSL = _NoMailServer
+imaplib.IMAP4_SSL = _NoMailServer
+
+import bot_common  # noqa: E402
 import fulfillment_bot as fb  # noqa: E402
+
+# The alert throttle keeps a file in the temp folder; the tests keep their own.
+bot_common.THROTTLE_FILE = os.path.join(tempfile.mkdtemp(prefix="wr-test-"), "throttle.json")
 
 FREE_HE = "\u05d7\u05d9\u05e0\u05dd"                         # "Free"
 PAID_HE = "\u05e1\u05d4\u05f4\u05db \u05e9\u05d5\u05dc\u05dd"  # "Total paid"
@@ -165,10 +186,119 @@ class StaleAlert(unittest.TestCase):
         with mock.patch.dict(os.environ, {"ORDERS_TOKEN": "t"}), \
              mock.patch.object(fb.requests, "get", lambda *a, **k: resp), \
              mock.patch.object(fb, "_mark_alerted", lambda marks: None), \
-             mock.patch.object(fb, "alert", lambda s, b: sent.append(b)):
+             mock.patch.object(fb, "alert", lambda s, b, **k: sent.append(b)):
             fb.check_stale_pending()
         self.assertIn("FREE (gift)", sent[0])
         self.assertNotIn("$0", sent[0])
+
+    def test_a_rung_the_site_could_not_store_is_mailed_once_per_computer(self):
+        # 2026-11-16: the PCs run this every 45 s at their quickest. The site
+        # did not store the rung (its mark failed) - each run sees it "fresh".
+        from datetime import datetime, timedelta, timezone
+        ts = (datetime.now(timezone.utc) - timedelta(minutes=17)).isoformat()
+        orders = [{"order_id": "WR-STUCK1", "ts": ts, "paid_usd": 5, "sku": "2.0.10",
+                   "supplier": "esim.dog", "stale_alert_rung": 0}]
+        sent, marked = [], []
+        resp = mock.Mock()
+        resp.json.return_value = {"orders": orders}
+        with mock.patch.dict(os.environ, {"ORDERS_TOKEN": "t"}), \
+             mock.patch.object(fb.requests, "get", lambda *a, **k: resp), \
+             mock.patch.object(fb, "_mark_alerted", marked.append), \
+             mock.patch.object(fb, "alert", lambda s, b, **k: sent.append((s, k))):
+            for _ in range(5):
+                fb.check_stale_pending()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][1].get("every_s"), 0, "the ladder is its own throttle")
+        self.assertEqual(len(marked), 5, "the site is still told every run")
+
+
+# ── 2026-11-16: which side of the handover a mail failure fell ──────────────
+
+class FakeLine:
+    """smtplib.SMTP enough for _smtp_send: send_message calls self.data, the
+    way smtplib's sendmail does, so the handover watch is exercised."""
+    fail_at = ""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.fail_at == "quit":
+            raise smtplib.SMTPServerDisconnected("gone at QUIT")
+        return False
+
+    def starttls(self):
+        if self.fail_at == "tls":
+            raise ConnectionResetError("reset")
+
+    def login(self, *a):
+        if self.fail_at == "login":
+            raise smtplib.SMTPAuthenticationError(535, b"5.7.8 bad credentials")
+
+    def send_message(self, msg):
+        if self.fail_at == "rcpt":
+            raise smtplib.SMTPRecipientsRefused({"buyer@example.com": (550, b"5.1.1 no such user")})
+        self.data(msg)
+
+    def data(self, msg):
+        if self.fail_at == "data":
+            raise smtplib.SMTPServerDisconnected("Connection unexpectedly closed: timed out")
+        if self.fail_at == "refused":
+            raise smtplib.SMTPDataError(554, b"5.7.0 message rejected")
+        return 250, b"OK"
+
+
+def line(fail_at):
+    return type("Line", (FakeLine,), {"fail_at": fail_at})
+
+
+class Handover(unittest.TestCase):
+    def send(self, fail_at):
+        with mock.patch.object(fb.smtplib, "SMTP", line(fail_at)):
+            fb.send_customer_email("buyer@example.com", "WR-NEW001", link(t=6.99),
+                                   {"gb": 10.0, "days": 30, "location": "Europe", "network": ""})
+
+    def test_before_data_the_error_is_what_it_was(self):
+        with self.assertRaises(smtplib.SMTPAuthenticationError):
+            self.send("login")
+        with self.assertRaises(ConnectionResetError):
+            self.send("tls")
+        with self.assertRaises(smtplib.SMTPRecipientsRefused):
+            self.send("rcpt")
+
+    def test_a_line_lost_during_data_may_have_delivered(self):
+        with self.assertRaises(fb.MailMaybeSent):
+            self.send("data")
+
+    def test_the_server_s_own_no_is_a_clear_failure(self):
+        with self.assertRaises(smtplib.SMTPDataError):
+            self.send("refused")
+
+    def test_a_failure_after_the_250_is_a_sent_mail(self):
+        self.send("quit")                         # no exception: it went
+
+    def test_the_public_log_never_sees_the_address(self):
+        e = smtplib.SMTPRecipientsRefused({"buyer@example.com": (550, b"5.1.1 buyer@example.com no")})
+        self.assertNotIn("buyer", fb._mail_error_text(e))
+        self.assertIn("550", fb._mail_error_text(e))
+        self.assertEqual(fb._mail_error_text(smtplib.SMTPAuthenticationError(535, b"x")),
+                         "SMTPAuthenticationError (535)")
+
+    def test_hard_is_the_mail_path_not_one_recipient(self):
+        hard = fb._hard_mail_failure
+        self.assertTrue(hard(smtplib.SMTPAuthenticationError(535, b"x")))
+        self.assertTrue(hard(TimeoutError("timed out")))
+        self.assertTrue(hard(smtplib.SMTPServerDisconnected("x")))
+        self.assertTrue(hard(fb.MailMaybeSent("x")))
+        self.assertTrue(hard(RuntimeError("Missing env/secret: GMAIL_APP_PASSWORD")))
+        self.assertTrue(hard(smtplib.SMTPDataError(421, b"4.7.0 try again later")))
+        self.assertTrue(hard(smtplib.SMTPDataError(550, b"5.4.5 Daily user sending limit exceeded")))
+        self.assertFalse(hard(smtplib.SMTPRecipientsRefused({"a@b.c": (550, b"5.1.1 no such user")})))
+        self.assertFalse(hard(smtplib.SMTPDataError(552, b"5.3.4 message too big")))
+        self.assertFalse(hard(ValueError("missing customer email address")))
 
 
 if __name__ == "__main__":

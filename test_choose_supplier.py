@@ -221,9 +221,10 @@ d = only(decide([dog(2, "1.66.10", "$10.00", gb=10, my_price="11.95", final="12.
 check("19.5% vs 20.1%: the clean rival 0.5% cheaper wins", d.action, "switch")
 check("...and the reason names both facts", d.reason,
       "incumbent לא רווחי, rival 0.5% cheaper and pays")
-d = only(decide([dog(2, "1.84.30", "$10.05", gb=30, my_price="15.00", final="15.99"),
-                 stellar(3, "1.84.30", "$9.98", gb=30)]))
-check("over the ceiling vs under it, 0.7% apart: switch", d.action, "switch")
+# 30GB buy ceiling is $11 since 2026-11-10 (BUY_CEILINGS) - was $10 when this was written.
+d = only(decide([dog(2, "1.84.30", "$11.05", gb=30, my_price="15.00", final="15.99"),
+                 stellar(3, "1.84.30", "$10.98", gb=30)]))
+check("over the ceiling vs under it, 0.6% apart: switch", d.action, "switch")
 check("...for the ceiling word", d.reason.startswith("incumbent לא רווחי — מעל תקרה"), True)
 d = only(decide([dog(2, "1.66.10", "$10.00", gb=10, my_price="11.00", final="12.99"),
                  stellar(3, "1.66.10", "$9.95", gb=10)]))

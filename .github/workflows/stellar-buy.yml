@@ -24,7 +24,8 @@ name: Stellar buyer
 #                has claimed answers 409 and is left alone; one nobody claimed
 #                (a lost bell, a computer mid-restart) is bought here.
 #   not alive -> runs at once, exactly as before the network existed, and may
-#                take over an order a computer claimed and died holding.
+#                take over an order a computer claimed and died holding -
+#                only on proof that it died (net_gate.sh takeover).
 # So with the computers off, an order is bought as fast as it always was.
 on:
   repository_dispatch:
@@ -46,7 +47,10 @@ concurrency:
 jobs:
   buy:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Above the sum of what is inside it: setup (~1 min), the gate's 2 and the
+    # buyer's 13. 10 until 2026-11-16, which held a 2-minute gate and an
+    # 8-minute buyer whose own worst case is ~690 s plus the head start.
+    timeout-minutes: 16
     steps:
       - uses: actions/checkout@v4
 
@@ -60,10 +64,6 @@ jobs:
       - name: Install dependencies
         run: pip install -q gspread requests playwright google-auth google-api-python-client
 
-      # The backstop only. The bot stops itself at STELLAR_RUN_BUDGET_S (300s)
-      # and hands whatever is left to the next run; being killed HERE is a
-      # stop with nothing written and nothing said, so this must be looser
-      # than the budget, not tighter.
       # One short call to the site. It can only say "stand back a moment";
       # whatever goes wrong with it, the buyer below runs.
       - name: Is the network buying?
@@ -75,8 +75,19 @@ jobs:
           NEED_JOB: orders
         run: bash net_gate.sh
 
+      # The backstop only. The bot starts no new order after
+      # STELLAR_RUN_BUDGET_S (300 s) and hands whatever is left to the next
+      # run, but an order begun at 299 s may take ~390 s more (the plan read,
+      # the order and its replay, the provisioning wait, the sheet and the
+      # mail - ORDERS_WORST_S in waverole-net): ~690 s, plus the 20 s head
+      # start. Being killed HERE is a stop with nothing written and nothing
+      # said, so this must be looser than that, not tighter: 13 minutes is
+      # that worst case and a minute to spare (8 until 2026-11-16).
+      # !cancelled(): the gate step above may fail or time out (it is
+      # continue-on-error); the buyer runs whatever happened to it.
       - name: Stellar buyer
-        timeout-minutes: 8
+        if: ${{ !cancelled() }}
+        timeout-minutes: 13
         env:
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
@@ -89,8 +100,9 @@ jobs:
             echo "The network is buying: ${HEAD_START_S}s head start, then whatever is unclaimed is bought here."
             sleep "$HEAD_START_S"
           elif [ "$NET_DEAD" = "true" ]; then
-            # Positive proof only (net_gate.sh): the network's orders job has
-            # had no success for 25 minutes, so an order it claimed is stuck.
+            # Positive proof only (net_gate.sh): the network is reporting, its
+            # orders job has had no success for 25 minutes AND no computer
+            # reports a run of it in progress, so an order it claimed is stuck.
             echo "The network's buyer is dead: its claims are taken over."
             export STELLAR_TAKEOVER="net:stellar"
           else

@@ -12,12 +12,15 @@ Nothing here may import fulfillment_bot, stellar_buyer, stock_shelf,
 create_order or the finance bot.
 """
 
+import hashlib
 import logging
 import json
+import math
 import os
 import re
 import smtplib
 import tempfile
+import time
 from datetime import datetime
 from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
@@ -64,9 +67,108 @@ def _redact(s: str) -> str:
     return re.sub(r"(session_id|payment_intent)=[A-Za-z0-9_\-]+", r"\1=REDACTED", s)
 
 
+# ── throttle (2026-11-16) ──────────────────────────────────────────────────
+# Alerts leave from the same Gmail account as the customers' eSIM mails, and
+# Gmail stops that account for the day at ~500 sends. A condition that holds
+# for hours (a renamed sheet header, a stock tab that cannot be written) used
+# to mail on EVERY run - and the orders duty on the PCs runs the mail bot every
+# 45 s to 5 min. A small file in the temp folder remembers what went when.
+# It holds across runs on one computer; a GitHub run starts with an empty temp
+# folder, so there it only folds the repeats inside that one run.
+THROTTLE_FILE = os.path.join(tempfile.gettempdir(), "wr_alert_throttle.json")
+THROTTLE_KEEP_S = 7 * 86400        # older entries are dropped on every write
+THROTTLE_MAX_KEYS = 2000
+
+
+def _throttle_key(key: str) -> str:
+    # Hashed: the file then holds no subject text (no order number, no word
+    # of a supplier) on a home computer.
+    return hashlib.sha256(str(key).encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def _throttle_load(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="ascii") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    return {k: float(v) for k, v in d.items()
+            if isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v)}
+
+
+def _throttle_save(path: str, d: dict):
+    # A temporary file of its own, then os.replace: two runs writing at once
+    # never leave half a file, and the last one wins (one extra alert at worst).
+    fd, tmp = tempfile.mkstemp(prefix=".wr_throttle.", suffix=".tmp",
+                               dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            json.dump(d, f, allow_nan=False)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def throttle_ok(key: str, every_s: float, now=None) -> bool:
+    """True when `key` has not been let through in the last `every_s` seconds,
+    and records this one. Never raises: any error answers True - an alert held
+    by a broken throttle costs more than one sent twice."""
+    try:
+        t = time.time() if now is None else float(now)
+        every = float(every_s)
+        if not every > 0:
+            return True
+        d = _throttle_load(THROTTLE_FILE)
+        k = _throttle_key(key)
+        last = d.get(k)
+        # A clock set back makes `last` lie in the future: that is no reason to hold.
+        if last is not None and 0 <= t - last < every:
+            return False
+        d[k] = t
+        d = {kk: v for kk, v in d.items() if abs(t - v) < max(THROTTLE_KEEP_S, every)}
+        if len(d) > THROTTLE_MAX_KEYS:
+            d = dict(sorted(d.items(), key=lambda kv: kv[1])[-THROTTLE_MAX_KEYS:])
+        _throttle_save(THROTTLE_FILE, d)
+        return True
+    except Exception:                                   # noqa: BLE001 -- never in the way
+        return True
+
+
+def throttle_forget(key: str):
+    """Undo throttle_ok's record of `key` (a send that then failed), so the
+    next run tries again. Best effort."""
+    try:
+        d = _throttle_load(THROTTLE_FILE)
+        if d.pop(_throttle_key(key), None) is not None:
+            _throttle_save(THROTTLE_FILE, d)
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
 # ── alerts ─────────────────────────────────────────────────────────────────
 
-def alert(subject: str, body: str):
+ALERT_EVERY_S = 3600
+
+
+def alert(subject: str, body: str, every_s: float = ALERT_EVERY_S, key: str = ""):
+    """Mail the owner. The same subject goes at most once per `every_s`
+    (hourly by default; a subject naming an order is its own). every_s=0 is
+    for a one-off that is never repeated by itself - one followed by a flag or
+    a site mark - where holding it would lose it for good. `key` throttles on
+    something other than the subject (one package of an order, say)."""
+    tkey = "alert:" + (key or subject)
+    if every_s and not throttle_ok(tkey, every_s):
+        # Not the subject: it can name a supplier, and Actions logs are public.
+        log.info(f"alert held: the same one went out in the last {every_s / 60:.0f} min "
+                 f"(key {_throttle_key(tkey)[:8]})")
+        return
     try:
         msg = MIMEText(body, "plain", "utf-8")
         msg["From"] = GMAIL_USER
@@ -78,6 +180,8 @@ def alert(subject: str, body: str):
             s.send_message(msg)
     except Exception:
         log.exception("alert email failed")
+        if every_s:
+            throttle_forget(tkey)                   # not sent: the next run may try
 
 
 # ── supplier lookup ──────────────────────────────────────────────────────────
@@ -303,11 +407,20 @@ def is_replaced_status(status) -> bool:
     return str(status or "").strip().startswith(REPLACED_STATUS)
 
 
+# (connect, read) seconds for every Sheets call. gspread 6 sends timeout=None,
+# so one Google request that never answers held the whole run (and on a PC the
+# orders duty's turn) until the network's fence killed it.
+SHEETS_TIMEOUT = (10, 60)
+
+
 def sheet_client():
     # From memory, never through a file: until 2026-11-14 every call left a
     # readable copy of the Google key in the temp folder (and the orders duty
     # opens the sheet every few minutes, on a home computer).
-    return gspread.service_account_from_dict(json.loads(env("GOOGLE_CREDENTIALS_JSON")))
+    gc = gspread.service_account_from_dict(json.loads(env("GOOGLE_CREDENTIALS_JSON")))
+    if hasattr(gc, "set_timeout"):                  # gspread >= 5.x
+        gc.set_timeout(SHEETS_TIMEOUT)
+    return gc
 
 
 def _row_time(s: str):

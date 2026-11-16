@@ -29,8 +29,11 @@ concurrency:
 
 jobs:
   # GitHub is the update network's BACKUP (owner, 2026-11-12): the PCs run
-  # this job themselves, so it goes ahead here only while the network is not
-  # reporting (net_gate.sh). 'force' from the Actions tab runs it anyway.
+  # this job themselves, so it goes ahead here only while the network's own
+  # 'coupons' job has not succeeded for 2 hours (net_gate.sh NEED_JOB; until
+  # 2026-11-16 "the network is reporting" alone was enough, so a network
+  # whose computers never ran this job left it undone). 'force' from the
+  # Actions tab runs it anyway.
   gate:
     runs-on: ubuntu-latest
     timeout-minutes: 4
@@ -41,16 +44,22 @@ jobs:
         with:
           sparse-checkout: net_gate.sh
           sparse-checkout-cone-mode: false
-      - name: Is the update network up?
+      # 7200: the network runs it hourly, so two hours is a missed run
+      # and a late one, not one slow tick.
+      - name: Is the network doing this job?
         id: net
         env:
           ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          NEED_JOB: coupons
+          MAX_JOB_AGE_S: "7200"
           FORCE_RUN: ${{ github.event.inputs.force || 'false' }}
         run: bash net_gate.sh
 
   coupons:
     needs: gate
-    if: needs.gate.outputs.skip != 'true'
+    # !cancelled(), not the implicit success(): a gate that failed cannot
+    # tell, and a backup that cannot tell runs.
+    if: ${{ !cancelled() && needs.gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

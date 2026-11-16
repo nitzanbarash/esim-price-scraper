@@ -15,6 +15,11 @@ on:
   # usage.yml: the PCs run stellar_prices every hour, and this run used to
   # land after them and stamp all the s2 rows "git" - the owner read that as
   # "the servers do not update the sheet". 'force' runs it anyway.
+  # It stands back only while the network's OWN stellar_prices and chooser
+  # jobs have succeeded within 2 hours (net_gate.sh NEED_JOB): "the network
+  # is reporting" alone is not enough, since stellar_prices runs only on a
+  # computer whose vault holds a Stellar key - with none, or in shadow, or
+  # failing every run, the network reports "ok" and nobody prices s2.
   workflow_dispatch:
     inputs:
       force:
@@ -34,28 +39,51 @@ concurrency:
 jobs:
   gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 6
     outputs:
-      skip: ${{ steps.net.outputs.skip }}
+      # Both of this run's jobs must be done by the network for it to stand
+      # back: the chooser below is the only GitHub chooser outside the daily
+      # scrape (which the network's scraping skips), so a network chooser that
+      # stopped would otherwise have no backup at all.
+      skip: ${{ steps.net.outputs.skip == 'true' && steps.chooser.outputs.skip == 'true' }}
     steps:
       - uses: actions/checkout@v4
         with:
           sparse-checkout: net_gate.sh
           sparse-checkout-cone-mode: false
-      - name: Is the update network up?
+      # 7200: the network runs it hourly (+0-10 min), so two hours is one
+      # missed run and a late one - not a single slow tick.
+      - name: Is the network refreshing the s2 prices?
         id: net
+        timeout-minutes: 2
         env:
           ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          NEED_JOB: stellar_prices
+          MAX_JOB_AGE_S: "7200"
+          FORCE_RUN: ${{ github.event.inputs.force || 'false' }}
+        run: bash net_gate.sh
+      - name: Is the network choosing the supplier?
+        id: chooser
+        timeout-minutes: 2
+        env:
+          ORDERS_TOKEN: ${{ secrets.ORDERS_TOKEN }}
+          NEED_JOB: chooser
+          MAX_JOB_AGE_S: "7200"
           FORCE_RUN: ${{ github.event.inputs.force || 'false' }}
         run: bash net_gate.sh
 
   prices:
     needs: gate
-    if: needs.gate.outputs.skip != 'true'
+    # !cancelled(): a bare condition is wrapped in success(), so a gate that
+    # FAILED (checkout down, a runner fault) skipped the backup - the one
+    # moment it cannot tell is the moment it must run.
+    if: ${{ !cancelled() && needs.gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
-    # Backstop only — the two steps below cap themselves at 5 + 5, and the
-    # checkout/python/pip setup is another couple of minutes.
-    timeout-minutes: 15
+    # Backstop only — the steps below cap themselves at 6 (pip) + 10 (Stellar,
+    # 5 -> 10 on 2026-10-06) + 5 (chooser) = 21, and checkout/python is
+    # another minute. 15 -> 25 on 2026-11-16: at 15 a slow pip and a slow
+    # Stellar read let the JOB cut the chooser instead of its own cap.
+    timeout-minutes: 25
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

@@ -279,11 +279,15 @@ class _FakeSvc:
         return _Exec({})
 
 
+_EXEC_KW = []
+
+
 class _Exec:
     def __init__(self, v):
         self.v = v
 
     def execute(self, **kw):
+        _EXEC_KW.append(kw)
         return self.v
 
 
@@ -308,6 +312,10 @@ check("a fully stamped column reports nothing to fix",
       stamp_price_direction(_FakeSvc([("$1 (€1)", "LEFT_TO_RIGHT")]), {"price": 6}), 0)
 check("a column the sheet does not have is skipped, not crashed on",
       stamp_price_direction(_FakeSvc([("$1 (€1)", None)]), {"price": 6}), 1)
+# 2026-11-16: its two reads had no retry, so one 503 failed a run whose
+# prices were already written.
+check("every call the stamp makes retries (reads too, not only the write)",
+      all(kw.get("num_retries", 0) >= 1 for kw in _EXEC_KW) and len(_EXEC_KW) > 0, True)
 
 # ── the wholesale API (from_api) ───────────────────────────────────────────
 from stellar_prices import Decision, _gb_from_mb, sanity
@@ -713,7 +721,11 @@ check("the read-only key is preferred over the buying key", stellar_prices.read_
 os.environ.pop("STELLAR_READ_KEY"); os.environ.pop("STELLAR_API_KEY")
 
 print("-- STELLAR_RATE_LIMIT sets the per-minute share, never past the ceiling --")
-for _v, _want in (("", 150), ("20", 20), ("90", 90), ("900", 280), ("0", 1), ("x", 150)):
+# Set but unreadable is a share somebody MEANT, and every share the network
+# hands out is under the default: the old, safe 60, never the default 150
+# (2026-11-16). Unset or blank is the default.
+for _v, _want in (("", 150), ("  ", 150), ("20", 20), (" 90 ", 90), ("900", 280), ("0", 1),
+                  ("x", 60), ("60.0", 60), ("100.0", 60), ("60/min", 60)):
     os.environ["STELLAR_RATE_LIMIT"] = _v
     check(f"STELLAR_RATE_LIMIT={_v!r} -> {_want}", stellar_prices.calls_per_minute(), _want)
 os.environ.pop("STELLAR_RATE_LIMIT", None)
@@ -741,6 +753,48 @@ _got = stellar_prices.fetch_plans("k", session=_Sess(), sleep=_sleep, clock=lamb
 os.environ.pop("STELLAR_RATE_LIMIT", None)
 check("a paced read still reads every page", len(_got), 30)
 check("...and at 20 a minute it waited for the window", len(_waits) >= 1, True)
+
+
+print("-- the text-direction stamp never fails a run whose prices are written --")
+_real = {n: getattr(stellar_prices, n) for n in (
+    "sheets_service", "read_sheet", "read_rows", "fetch_fx", "fetch_plans",
+    "write_updates", "stamp_price_direction")}
+_wrote = []
+
+
+def _stamp_boom(svc, col):
+    raise RuntimeError("HTTP 503 from Sheets")
+
+
+stellar_prices.sheets_service = lambda *a, **k: object()
+stellar_prices.read_sheet = lambda svc: [["header"]]
+stellar_prices.read_rows = lambda values: ([], {"price": 6, "prev": 7})
+stellar_prices.fetch_fx = lambda cells: (1.16, "test")
+stellar_prices.fetch_plans = lambda k: []
+stellar_prices.write_updates = lambda svc, col, updates: _wrote.append(len(updates)) or 0
+stellar_prices.stamp_price_direction = _stamp_boom
+os.environ["STELLAR_READ_KEY"] = "k"
+_out = io.StringIO()
+try:
+    with contextlib.redirect_stdout(_out):
+        _code = main(["--apply"])
+finally:
+    os.environ.pop("STELLAR_READ_KEY", None)
+    for _n, _f in _real.items():
+        setattr(stellar_prices, _n, _f)
+check("the prices were written first", len(_wrote), 1)
+check("a stamp error after the write is not a failed run", _code, 0)
+check("...it is said, by its type only", "RuntimeError" in _out.getvalue(), True)
+check("...and the run still reports its write", "wrote" in _out.getvalue(), True)
+
+print("-- inside the update network, the fence is installed like the other jobs --")
+_src = open(os.path.join(os.path.dirname(os.path.abspath(stellar_prices.__file__)),
+                         "stellar_prices.py"), encoding="utf-8").read()
+_main_block = _src.split('if __name__ == "__main__":', 1)[1]
+check("__main__ installs net_fence before main()",
+      _main_block.index("net_fence.install()") < _main_block.index("main()"), True)
+check("...and an absent net_fence (GitHub, by hand) changes nothing",
+      "except ImportError" in _main_block, True)
 
 
 print()

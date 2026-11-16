@@ -57,7 +57,7 @@ check("an unreadable file means free", g.paused(T, path="broken.json"), 0.0)
 print("\nmail: one per new pause, three a day, only with the mail secret")
 sent = []
 fake_bc = type(sys)("bot_common")
-fake_bc.alert = lambda su, bo: sent.append((su, bo))
+fake_bc.alert = lambda su, bo, **kw: sent.append((su, bo))
 with mock.patch.dict(sys.modules, {"bot_common": fake_bc}):
     p = os.path.join(tempfile.mkdtemp(), "p.json")
     with mock.patch.dict(os.environ, {"GMAIL_APP_PASSWORD": ""}):

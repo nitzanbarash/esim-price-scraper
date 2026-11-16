@@ -58,12 +58,38 @@ from bot_common import (  # noqa: F401
     alert, ALERT_PREFIX, ALERTS_EMAIL, env, fetch_esim_details, _fetch_one_esim,
     fetch_usage, GB, GMAIL_USER, is_replaced_status, ORDERS_URL, RECEIPTS_SHEET_ID,
     _redact, REPLACED_CHECK_STATUS, REPLACED_STATUS, _row_time, SESSION_ID_RE,
-    sheet_client, _sup, SUPPLIER_ESIM_URL, SUPPLIER_USAGE_URL, TZ, USAGE_BATCH,
+    sheet_client, _sup, SUPPLIER_ESIM_URL, SUPPLIER_USAGE_URL, throttle_ok, TZ, USAGE_BATCH,
     USAGE_PROVIDER_CODES, _usage_request,
 )
 
+# The update network's fence (copied next to the scripts on the PCs only).
+# Its install() guards every HTTP request; SMTP is not HTTP, so the customer
+# mail and the receipts row are fenced by hand (_fence) right before each.
+try:
+    import net_fence
+except ImportError:              # GitHub Actions, or by hand
+    net_fence = None
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("fulfillment")
+
+# What the last main() did with customer mails, for orders_duty (2026-11-16):
+#   due          mails this run had to write (send_once got past the site's
+#                stamp, the lease and the Sent folder - or could not ask);
+#   sent         written (recorded at the site or not);
+#   failed       not written, or maybe not (left owed for the next run);
+#   hard_failed  of those, the ones no single recipient caused: connect,
+#                login, timeout, a dropped connection, the site's lock silent.
+# Changed in place, never rebound, so a module that imported it keeps reading it.
+LAST_RUN = {"due": 0, "sent": 0, "failed": 0, "hard_failed": 0}
+
+
+def _fence():
+    """Stop here if the network's time for this run is up - BEFORE an act that
+    cannot be undone (a customer mail, a receipts row), never between it and
+    its record. Nothing outside the network."""
+    if net_fence is not None:
+        net_fence.check()
 
 # ── constants ────────────────────────────────────────────────────────────────
 DELIVERY_FROM = "orders@updates.esim.dog"
@@ -84,9 +110,21 @@ HEADER_BATCH = 200         # message headers per IMAP round-trip (see _headers)
 # leaves the ledger entry open, and an open entry is mailed AGAIN next sweep —
 # so this POST failing once is what sends a buyer a second copy of their eSIM.
 LEDGER_CONFIRM_ATTEMPTS = 3
+REPORT_ATTEMPTS = 3        # report_fulfilled, likewise (it is idempotent at the site)
 # Order ids and addresses go into an IMAP SEARCH command verbatim. Anything
 # that could close the quoting is not searched for at all.
 SAFE_IMAP_ATOM = re.compile(r"^[A-Za-z0-9._%+@-]+$")
+GUARD_BLIND_ALERT_S = 86400   # "no Sent folder visible over IMAP": once a day at most
+
+
+def _imap_quoted(s: str) -> str | None:
+    """`s` as an IMAP quoted string (RFC 3501: printable ASCII, with \\ and "
+    escaped), or None when it cannot be quoted safely (non-ASCII, control
+    characters). For addresses the atom rule refuses (o'neil@...)."""
+    s = str(s or "")
+    if not s or any(not (0x20 <= ord(c) <= 0x7E) for c in s):
+        return None
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 # Both live formats seen in real delivery emails: ?session_id=cs_live_... and
 # ?payment_intent=pi_... (older orders).
@@ -230,24 +268,42 @@ def parse_delivery(uid: str, msg) -> dict | None:
     return out
 
 
-def _all_mail_folder(box) -> str:
-    """Gmail's "All Mail" folder — sees every message regardless of which
-    label/filter it landed under (a filter that skips the inbox would hide
-    the email from an INBOX-only search). Found via the \\All special-use
-    attribute so it works in any UI language; INBOX is the last resort."""
+def _special_folders(box) -> dict:
+    """{'all': name, 'sent': name} from the folders' special-use attributes
+    (\\All, \\Sent), so it works in any UI language. Either may be missing:
+    Gmail lets the owner hide a folder from IMAP ("Show in IMAP")."""
+    out = {}
     try:
         typ, folders = box.list()
         if typ == "OK":
-            for raw in folders:
+            for raw in folders or []:
                 line = raw.decode(errors="replace") if isinstance(raw, bytes) else str(raw)
-                if "\\All" in line:
-                    # ...(\HasNoChildren \All) "/" "[Gmail]/All Mail"
-                    name = line.split(' "/" ')[-1].strip().strip('"')
-                    if name:
-                        return name
+                # ...(\HasNoChildren \All) "/" "[Gmail]/All Mail"
+                m = re.match(r"\s*\(([^)]*)\)", line)
+                flags = set((m.group(1) if m else "").split())
+                name = line.split(' "/" ')[-1].strip().strip('"')
+                if not name:
+                    continue
+                if "\\All" in flags:
+                    out.setdefault("all", name)
+                elif "\\Sent" in flags:
+                    out.setdefault("sent", name)
     except Exception as e:
-        log.warning(f"folder list failed ({e}) — using INBOX")
-    return "INBOX"
+        log.warning(f"folder list failed ({type(e).__name__})")
+    return out
+
+
+def _all_mail_folder(box) -> str:
+    """Gmail's "All Mail" folder — sees every message regardless of which
+    label/filter it landed under (a filter that skips the inbox would hide
+    the email from an INBOX-only search). INBOX is the last resort for the
+    delivery mails; the Sent guard does NOT fall back to it (Inbox.guard_folder)."""
+    return _special_folders(box).get("all") or "INBOX"
+
+
+def _mailbox_arg(folder: str) -> str:
+    # imaplib needs the mailbox name quoted when it contains spaces.
+    return f'"{folder}"' if " " in folder else folder
 
 
 class Inbox:
@@ -256,10 +312,22 @@ class Inbox:
         # all covered by it — not just the connect.
         self.box = imaplib.IMAP4_SSL("imap.gmail.com", timeout=IMAP_TIMEOUT)
         self.box.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
-        folder = _all_mail_folder(self.box)
-        log.info(f"searching folder: {folder}")
-        # imaplib needs the mailbox name quoted when it contains spaces.
-        self.box.select(f'"{folder}"' if " " in folder else folder)
+        found = _special_folders(self.box)
+        self.folder = found.get("all") or "INBOX"
+        # Where already_mailed_to looks for our earlier sends. Never INBOX: our
+        # own mail is not in it, so a guard reading it always says "not yet"
+        # and nobody notices (before 2026-11-16 that was the fallback).
+        self.guard_folder = found.get("all") or found.get("sent") or ""
+        log.info(f"searching folder: {self.folder}")
+        if not found.get("all"):
+            log.warning("All Mail is not visible over IMAP - delivery mails are read from INBOX"
+                        + (", earlier sends from Sent" if self.guard_folder else ""))
+        if not self.guard_folder:
+            # Said here; the owner is told where the guard is used
+            # (already_mailed_to) - never from a constructor.
+            log.warning("neither All Mail nor Sent is visible over IMAP - the Sent-folder guard "
+                        "cannot tell; the site's mail lock is the only guard")
+        self.box.select(_mailbox_arg(self.folder))
         self._mailed: dict[tuple[str, str], bool] = {}   # see already_mailed_to
 
     def _headers(self, uids: list[str]) -> dict:
@@ -346,31 +414,63 @@ class Inbox:
         if key in self._mailed:
             return self._mailed[key]
         found = False
-        if SAFE_IMAP_ATOM.match(order_id) and SAFE_IMAP_ATOM.match(to):
+        # "Cannot tell" - no Sent folder visible, an address that cannot be
+        # quoted, a failed search - is answered "not yet", as it always was.
+        # Since 2026-11-16 a mail is never written without the site's lease
+        # (send_once skips when the site cannot be asked), so a blind guard
+        # costs a duplicate only when a ledger confirmation was ALSO lost;
+        # withholding would cost the buyer their only copy of the eSIM.
+        guard = getattr(self, "guard_folder", None)
+        here = getattr(self, "folder", None)
+        to_q = to if SAFE_IMAP_ATOM.match(to) else _imap_quoted(to)
+        if guard == "":
+            log.warning(f"order {order_id}: no Sent folder to look in - treating as not yet mailed")
+            # Once a day (throttle_ok), and only when a mail actually needed the guard.
+            if throttle_ok("guard-blind", GUARD_BLIND_ALERT_S):
+                alert("The Sent-folder guard is blind",
+                      f"Neither 'All Mail' nor 'Sent Mail' of {GMAIL_USER} is visible over IMAP, so "
+                      "the bot cannot see which eSIM mails it already sent. The site's mail lock "
+                      "still stops a second mail, but a lost ledger confirmation is no longer "
+                      "caught.\n\nFix: Gmail > Settings > Labels > 'Show in IMAP' for All Mail "
+                      "(and Sent Mail).", every_s=0)
+        elif not SAFE_IMAP_ATOM.match(order_id) or not to_q:
+            log.warning(f"order {order_id}: this address cannot be searched safely - "
+                        f"treating as not yet mailed")
+        else:
+            to_arg = to_q if to_q.startswith('"') else f'"{to_q}"'
+            switched = bool(guard and here and guard != here)
             try:
-                typ, data = self.box.uid(
-                    "search", None,
-                    f'(FROM "{GMAIL_USER}" TO "{to}" HEADER SUBJECT "{order_id}")')
-                uids = ([b.decode() for b in (data[0] or b"").split()]
-                        if typ == "OK" else [])
-                # An ALERT about this order is also from us and also names it in
-                # the subject. It is addressed to the owner, so TO normally
-                # separates the two — but when the owner is the buyer (internal
-                # orders) it does not, and mistaking an alert for the customer's
-                # copy would withhold the eSIM. The prefix always separates them.
-                for head in self._headers(uids).values():
-                    if not _decode(head.get("Subject")).startswith(ALERT_PREFIX):
-                        found = True
-                        break
+                if switched:
+                    self.box.select(_mailbox_arg(guard), readonly=True)
+                try:
+                    typ, data = self.box.uid(
+                        "search", None,
+                        f'(FROM "{GMAIL_USER}" TO {to_arg} HEADER SUBJECT "{order_id}")')
+                    uids = ([b.decode() for b in (data[0] or b"").split()]
+                            if typ == "OK" else [])
+                    # An ALERT about this order is also from us and also names it in
+                    # the subject. It is addressed to the owner, so TO normally
+                    # separates the two — but when the owner is the buyer (internal
+                    # orders) it does not, and mistaking an alert for the customer's
+                    # copy would withhold the eSIM. The prefix always separates them.
+                    for head in self._headers(uids).values():
+                        if not _decode(head.get("Subject")).startswith(ALERT_PREFIX):
+                            found = True
+                            break
+                finally:
+                    if switched:            # flag() works on the delivery folder's UIDs
+                        self.box.select(_mailbox_arg(here))
             except Exception as e:
-                # "Unknown", answered as "not yet". Withholding on a failed
-                # lookup would break the one promise this bot makes — every
-                # buyer gets their eSIM — to avoid a duplicate that only
-                # happens when the ledger confirmation ALSO failed.
-                log.warning(f"order {order_id}: cannot read Sent ({_redact(str(e))}) "
+                # "Unknown", answered as "not yet" (see above).
+                log.warning(f"order {order_id}: cannot read Sent ({type(e).__name__}) "
                             f"— treating as not yet mailed")
         self._mailed[key] = found
         return found
+
+    def forget(self, order_id: str, to: str):
+        """Drop the cached answer for (order, address): after a send that may
+        or may not have gone, the next look must read the folder again."""
+        self._mailed.pop((order_id, to.lower()), None)
 
     def note_sent(self, order_id: str, to: str):
         """Remember a send made in THIS run. already_mailed_to caches its
@@ -420,6 +520,16 @@ H_LINK_SUP, H_QR = "Link - esim.dog", "QR"
 PAID_RAILS = {"paypal", "payme"}
 PAID_BG = {"red": 217 / 255, "green": 234 / 255, "blue": 211 / 255}   # #d9ead3
 WHITE_BG = {"red": 1.0, "green": 1.0, "blue": 1.0}
+
+
+def _cell_text(v) -> str:
+    """A cell for a USER_ENTERED write, never read as a formula. The texts
+    written here come from outside (the supplier's page, a delivery mail that
+    anyone can forward in, the site's record), and Sheets runs a cell that
+    starts with = + - @ as a formula. A leading apostrophe makes it plain text
+    (Sheets keeps the apostrophe out of the value)."""
+    s = str(v)
+    return "'" + s if s[:1] in ("=", "+", "-", "@") else s
 
 
 def _is_zero_money(text) -> bool:
@@ -611,9 +721,11 @@ def find_pending_row(ws, delivery: dict) -> dict | None:
     return cands[0]
 
 
-def already_completed(ws, success_url) -> bool:
-    """True if some row already holds this delivery's supplier page AND its
-    activation code — i.e. the purchase bot finished the order itself.
+def completed_row(ws, success_url) -> dict | None:
+    """The row that already holds this delivery's supplier page AND its
+    activation code — the purchase bot finished the order itself, or an
+    earlier run of this bot filled it in — as {row, order_id, customer_email,
+    order_url}; None when there is none.
 
     Compared by session id as well as by the whole link: the PC bot's
     placeholder link carries a '#payment-uncertain' fragment (2026-10-20), and
@@ -623,27 +735,36 @@ def already_completed(ws, success_url) -> bool:
     wanted = {success_url} if isinstance(success_url, str) else set(success_url or [])
     wanted.discard("")
     if not wanted:
-        return False
+        return None
     wanted_ids = set()
     for u in wanted:
         wanted_ids |= _session_ids(u)
     rows = ws.get_all_values()
     hdr = [h.strip() for h in rows[0]]
     if "Activation Code" not in hdr:
-        return False
+        return None
     i_act = hdr.index("Activation Code")
+    idx = lambda name: hdr.index(name) if name in hdr else None
+    i_order, i_mail, i_wave = idx(H_ORDER), idx(H_MAIL), idx("Link - waverole")
     # The supplier link lives in 'Link - esim.dog'; rows written before that
     # change kept it in 'QR', so check both.
     link_cols = [hdr.index(h) for h in ("Link - esim.dog", "QR") if h in hdr]
-    for r in rows[1:]:
-        act = r[i_act].strip() if len(r) > i_act else ""
-        if not act:
+    for n, r in enumerate(rows[1:], start=2):
+        get = lambda i: r[i].strip() if i is not None and len(r) > i else ""
+        if not get(i_act):
             continue
         for i in link_cols:
-            cell = r[i].strip() if len(r) > i else ""
+            cell = get(i)
             if cell in wanted or (wanted_ids and _session_ids(cell) & wanted_ids):
-                return True
-    return False
+                return {"row": n, "order_id": get(i_order), "customer_email": get(i_mail),
+                        "order_url": get(i_wave)}
+    return None
+
+
+def already_completed(ws, success_url) -> bool:
+    """True if some row already holds this delivery's supplier page and its
+    activation code (completed_row)."""
+    return completed_row(ws, success_url) is not None
 
 
 def find_replaced_row(ws, delivery: dict) -> dict | None:
@@ -750,7 +871,7 @@ def supersede_row(ws, row_number: int, hdr: list | None = None, before: list | N
     for name, val in target.items():
         if name not in hdr:
             continue
-        cells.append(gspread.Cell(row_number, hdr.index(name) + 1, val))
+        cells.append(gspread.Cell(row_number, hdr.index(name) + 1, _cell_text(val)))
         changes.append((name, was(name), val))
     if cells:
         ws.update_cells(cells, value_input_option="USER_ENTERED")
@@ -836,7 +957,7 @@ def complete_row(ws, row_number: int, delivery: dict, details: dict):
             if gb and delivery.get("days") else delivery.get("network", "")
         ),
     }
-    cells = [gspread.Cell(row_number, hdr.index(k) + 1, str(v))
+    cells = [gspread.Cell(row_number, hdr.index(k) + 1, _cell_text(v))
              for k, v in updates.items() if k in hdr and v]
     if cells:
         ws.update_cells(cells, value_input_option="USER_ENTERED")
@@ -873,8 +994,11 @@ STALE_ALERT_LADDER_MIN = (15, 60, 240, 720, 1440)
 # Belt and braces on top of the stored rung below: even with no memory at all,
 # a rung goes quiet this many minutes after it came due. The stored state is
 # what makes each rung mail exactly ONCE; this is what bounds the damage if the
-# site cannot store it (an old deploy, a KV outage) - tens of emails in the
-# worst case instead of one every five minutes forever.
+# site cannot store it (an old deploy, a KV outage). That bound assumed one
+# run every 5 minutes (6 mails a rung). Since 2026-11-16 the PCs' orders duty
+# also runs this, every 45 s at its quickest - ~40 mails a rung - so each
+# computer also remembers which rungs it mailed (throttle_ok, per order and
+# rung, for the backstop's length): one mail a rung per computer at worst.
 STALE_ALERT_BACKSTOP_MIN = 30
 
 # Which rungs have already been mailed is kept ON THE ORDER, at the site
@@ -946,10 +1070,16 @@ def check_stale_pending():
         rung = _rung_for(age_min)
         fresh = rung > (int(o.get("stale_alert_rung") or 0))
         if fresh and age_min < rung + STALE_ALERT_BACKSTOP_MIN:
-            due.append((age_min, o))
             marks.append({"order_id": o.get("order_id"), "rung": rung})
+            if throttle_ok(f"stale:{o.get('order_id')}:{rung}", STALE_ALERT_BACKSTOP_MIN * 60):
+                due.append((age_min, o))
+            else:
+                silent += 1                 # this computer mailed this rung already
         else:
             silent += 1
+
+    if marks and not due:
+        _mark_alerted(marks)                # mailed before; the site still has to hear it
 
     if not due:
         if silent:
@@ -1009,6 +1139,7 @@ def check_stale_pending():
         f"{STALE_ALERT_LADDER_MIN[-1] // 60} hours after payment, fixed or "
         f"not - do not read silence as resolved. The Orders screen always "
         f"shows the truth.",
+        every_s=0,      # the ladder above is this alert's throttle; a subject throttle would drop a new order's rung
     )
     _mark_alerted(marks)
 
@@ -1061,6 +1192,7 @@ def report_email_sent(order_id: str, ok: bool, error: str = "", address: str = "
 # automatic sender now goes through the one function below, with the same
 # four checks in the same order.
 MAIL_LEASE_TTL_S = 900
+CLAIM_RETRY_PAUSE_S = 3.0          # one retry of the lease after this pause
 
 
 def claim_mail(order_id: str, by: str, ttl_s: int = MAIL_LEASE_TTL_S) -> dict:
@@ -1070,14 +1202,28 @@ def claim_mail(order_id: str, by: str, ttl_s: int = MAIL_LEASE_TTL_S) -> dict:
       {"claim": False, "reason": "sent"}          the mail already went
       {"claim": False, "reason": "claimed"}       another sender is writing it NOW
       {"claim": False, "reason": "not_owed"}      parked, closed or no eSIM yet
-      {"claim": None, "reason": "..."}            no lease to be had: a site from
-                                                  before 2026-10-21 (400), or the
-                                                  site could not be asked
+      {"claim": None, "reason": "old_site"}       a site from before 2026-10-21:
+                                                  it answers 400 to the action
+      {"claim": None, "reason": "unreachable"}    the site could not be asked, or
+                                                  its answer made no sense - after
+                                                  one retry
 
-    The last one is NOT a refusal. A lease that cannot be taken leaves the
-    sent stamp and the Sent folder as the guards, exactly as before the lease
-    existed — withholding the mail because a bookkeeping call failed would
-    trade a duplicate that needs two failures for a no-show that needs one."""
+    old_site is NOT a refusal: the sent stamp and the Sent folder stay the
+    guards, exactly as before the lease existed. unreachable IS one since
+    2026-11-16 (send_once skips the order this tick; it stays owed): with the
+    PCs and GitHub sending side by side, one timeout on this call was all a
+    second eSIM mail needed. A 404 is not "old": the site answers it when its
+    store failed to read the order (readLive), which passes."""
+    for attempt in (1, 2):
+        got = _claim_mail_once(order_id, by, ttl_s)
+        if got.get("reason") != "unreachable" or attempt == 2:
+            return got
+        time.sleep(CLAIM_RETRY_PAUSE_S)
+    return got
+
+
+def _claim_mail_once(order_id: str, by: str, ttl_s: int) -> dict:
+    unreachable = {"claim": None, "reason": "unreachable"}
     try:
         r = requests.post(ORDERS_URL, json={"action": "mail_claim", "order_id": order_id,
                                             "by": by, "ttl_s": int(ttl_s)},
@@ -1087,17 +1233,104 @@ def claim_mail(order_id: str, by: str, ttl_s: int = MAIL_LEASE_TTL_S) -> dict:
         r.raise_for_status()
         out = r.json()
     except Exception as e:
-        log.warning(f"order {order_id}: mail lease not available ({_redact(str(e))}) "
-                    f"- the sent stamp and the Sent folder still guard the mail")
-        return {"claim": None, "reason": "unreachable"}
+        log.warning(f"order {order_id}: mail lease not available ({type(e).__name__})")
+        return unreachable
     if not isinstance(out, dict) or "claim" not in out:
-        return {"claim": None, "reason": "old_site"}
+        log.warning(f"order {order_id}: the site's answer to the mail lease made no sense")
+        return unreachable
     if out.get("claim") is True and out.get("lease"):
         return {"claim": True, "lease": str(out["lease"])}
     if out.get("claim") is False:
         return {"claim": False, "reason": str(out.get("reason") or "claimed"),
                 "by": str(out.get("by") or "")}
-    return {"claim": None, "reason": "old_site"}
+    log.warning(f"order {order_id}: the site granted the mail lease without one")
+    return unreachable
+
+
+class MailMaybeSent(Exception):
+    """The SMTP conversation broke AFTER the message was handed over (during
+    or after DATA, before Gmail's final 250): it may be in the customer's
+    mailbox. Raised by _smtp_send; send_once keeps the lease for it."""
+
+
+def _smtp_send(msg):
+    """Hand `msg` to Gmail, and say which side of the handover a failure fell.
+
+    Before DATA - connect, TLS, login, a refused sender or recipient - nothing
+    went: the exception is raised as it is. From DATA on, a dropped line or a
+    timeout waiting for the final answer may mean Gmail took the mail:
+    MailMaybeSent. The server's own "no" to the message (SMTPDataError) is
+    clear and raised as it is. A failure after the 250 (the QUIT) is a sent
+    mail and is not raised at all."""
+    handed, accepted = [], False
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=30, local_hostname="waverole.com") as s:
+            data = getattr(s, "data", None)
+            if callable(data):
+                def watched(*a, **k):
+                    handed.append(1)
+                    return data(*a, **k)
+                s.data = watched            # send_message -> sendmail -> self.data
+            s.starttls()
+            s.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
+            s.send_message(msg)
+            accepted = True
+    except smtplib.SMTPDataError:
+        raise
+    except Exception as e:
+        if accepted:
+            log.warning(f"the mail was accepted; closing the connection failed ({type(e).__name__})")
+            return
+        if handed:
+            raise MailMaybeSent(f"{type(e).__name__} after the message was handed over") from e
+        raise
+
+
+def _mail_error_text(e: Exception) -> str:
+    """An SMTP failure for the PUBLIC log: its type and SMTP code(s) only.
+    str() of SMTPRecipientsRefused carries the customer's address."""
+    name = type(e).__name__
+    if isinstance(e, smtplib.SMTPRecipientsRefused):
+        codes = sorted({str(v[0]) for v in (getattr(e, "recipients", None) or {}).values()
+                        if isinstance(v, tuple) and v})
+        return f"{name} ({', '.join(codes) or '?'})"
+    code = getattr(e, "smtp_code", None)
+    return f"{name} ({code})" if code else name
+
+
+def _hard_mail_failure(e: Exception) -> bool:
+    """True when the failure is the mail path's, not one recipient's or one
+    message's: connect, TLS, login, a timeout, a dropped connection, a
+    missing secret, Gmail's 4xx throttling. Unknown counts as hard - a
+    failing computer that reports success keeps the backup standing back."""
+    def says_quota(said) -> bool:          # Gmail's daily sending limit stops every mail
+        said = (said.decode("utf-8", "replace") if isinstance(said, bytes) else str(said or "")).lower()
+        return "5.4.5" in said or "limit" in said or "quota" in said
+
+    if isinstance(e, MailMaybeSent):
+        return True
+    if isinstance(e, smtplib.SMTPRecipientsRefused):
+        answers = [v for v in (getattr(e, "recipients", None) or {}).values() if isinstance(v, tuple)]
+        return any(len(v) > 1 and says_quota(v[1]) for v in answers)
+    if isinstance(e, ValueError):
+        return False                       # no address, or no order link
+    if isinstance(e, smtplib.SMTPDataError):
+        if says_quota(getattr(e, "smtp_error", b"")):
+            return True
+        return not (500 <= int(getattr(e, "smtp_code", 0) or 0) < 600)   # 5xx: this message
+    return True
+
+
+def _waited_min(o: dict | None) -> float:
+    try:
+        ts = str((o or {}).get("ts") or "")
+        return (datetime.now(timezone.utc)
+                - datetime.fromisoformat(ts.replace("Z", "+00:00"))).total_seconds() / 60
+    except (TypeError, ValueError):
+        return 0.0
+
+
+LEASE_SKIP_ALERT_MIN = 30   # an order this old, held by a silent lease, is worth a word
 
 
 def send_once(inbox, order_id: str, to: str, send_fn, by: str, facts: dict | None = None) -> str:
@@ -1110,13 +1343,20 @@ def send_once(inbox, order_id: str, to: str, send_fn, by: str, facts: dict | Non
       'already'      it went before — the site's stamp or the Sent folder;
       'claimed'      another sender holds the lease and is writing it now;
       'withheld'     the site says no mail is owed (parked, closed, no eSIM);
+      'skipped'      the site's lease could not be asked (twice): nothing
+                     written this tick, the order stays owed (2026-11-16);
+      'uncertain'    the line broke after the message was handed over: it
+                     may have gone. The lease is KEPT (it ends by itself in
+                     MAIL_LEASE_TTL_S), so no sender writes it again before
+                     the Sent folder can show whether it went;
       'failed'       the send itself failed; the ledger keeps it for retry.
 
     The checks, cheapest and surest first:
       1. the site's customer_email_sent_ts on `facts` (read here when the
          caller has not already);
-      2. the mail lease — refused, nothing is written; unavailable (an old
-         site), carry on with the two guards below;
+      2. the mail lease — refused, nothing is written; a site from before
+         it (400), carry on with the two guards below; a site that cannot
+         be asked, skip this order now;
       3. the Sent folder — what went out is in Sent whatever the site
          believes (memory: duplicate-esim-email). A Sent folder that cannot
          be read is "not yet": the lease is the guard then, and a no-show is
@@ -1127,6 +1367,8 @@ def send_once(inbox, order_id: str, to: str, send_fn, by: str, facts: dict | Non
     (the Stellar buyer opens the mailbox only when a mail is due)."""
     oid = str(order_id or "")
     if not to:
+        LAST_RUN["due"] += 1
+        LAST_RUN["failed"] += 1
         report_email_sent(oid, False, "no customer address on file")
         log.warning(f"order {oid}: still no customer address - email deferred")
         return "failed"
@@ -1146,6 +1388,21 @@ def send_once(inbox, order_id: str, to: str, send_fn, by: str, facts: dict | Non
             return "withheld"
         log.info(f"order {oid}: {got.get('by') or 'another sender'} is writing this mail now - not sent here")
         return "claimed"
+    if got.get("reason") == "unreachable":
+        # Not written without the lock: another computer may be writing it
+        # right now. Owed still; the next tick asks again.
+        LAST_RUN["due"] += 1
+        LAST_RUN["failed"] += 1
+        LAST_RUN["hard_failed"] += 1
+        log.warning(f"order {oid}: the site's mail lock did not answer - not sent now, "
+                    f"the next run tries again")
+        if _waited_min(facts) >= LEASE_SKIP_ALERT_MIN:
+            alert("Customer eSIM mails held: the site's mail lock does not answer",
+                  f"Order {oid} has waited {_waited_min(facts):.0f} min for its eSIM mail, and the "
+                  f"site's mail_claim did not answer (twice). No mail is written without that lock, "
+                  f"so two computers can never both send it. Every run asks again; if this repeats, "
+                  f"check /api/orders (Vercel logs, Upstash).")
+        return "skipped"
     lease = got.get("lease") or ""
     box = inbox() if callable(inbox) else inbox
     if box is not None and box.already_mailed_to(oid, to):
@@ -1157,12 +1414,34 @@ def send_once(inbox, order_id: str, to: str, send_fn, by: str, facts: dict | Non
         else:
             log.warning(f"order {oid}: already in Sent but the ledger would not close - still not resending")
         return "already"
+    LAST_RUN["due"] += 1
     try:
+        _fence()
         send_fn()
+    except MailMaybeSent as e:
+        LAST_RUN["failed"] += 1
+        LAST_RUN["hard_failed"] += 1
+        if box is not None and hasattr(box, "forget"):
+            box.forget(oid, to)         # the next look reads Sent again
+        # The lease is NOT handed back: it holds every sender off for its
+        # fifteen minutes, by then Sent shows whether the mail went. Without
+        # a lease (an old site) nothing is reported either - a failure report
+        # is what starts the site's own Resend copy after twenty minutes.
+        if lease:
+            report_email_sent(oid, False, f"maybe sent, held {MAIL_LEASE_TTL_S // 60} min: {e}")
+        log.warning(f"order {oid}: the connection broke after the eSIM email was handed over "
+                    f"({e}) - it may have gone; held, the Sent folder decides next time")
+        return "uncertain"
     except Exception as e:
+        LAST_RUN["failed"] += 1
+        if _hard_mail_failure(e):
+            LAST_RUN["hard_failed"] += 1
+        # The site's record is the owner's: the detail goes there. The log is
+        # public: the type and the SMTP code only, never the address.
         report_email_sent(oid, False, str(e), **({"lease": lease} if lease else {}))
-        log.warning(f"order {oid}: eSIM email failed, the ledger keeps it for retry: {_redact(str(e))}")
+        log.warning(f"order {oid}: eSIM email failed, the ledger keeps it for retry: {_mail_error_text(e)}")
         return "failed"
+    LAST_RUN["sent"] += 1
     if box is not None and hasattr(box, "note_sent"):
         box.note_sent(oid, to)
     if report_email_sent(oid, True, address=to, **({"lease": lease} if lease else {})):
@@ -1204,19 +1483,25 @@ def deliver_pending_emails(ws):
         return
     log.info(f"{len(owed)} order(s) still owed their eSIM email")
 
+    # The sheet's Mail column, by order number: the FIRST non-empty address of
+    # each order (a re-buy's row often has none, and the last row used to win
+    # even when blank). Keys upper-cased: the site's ids are, a hand-typed row
+    # may not be. No sheet this run (ws None) costs only this fallback.
     by_order = {}
-    try:
-        rows = ws.get_all_values()
-        hdr = [h.strip() for h in rows[0]]
-        i_ord = hdr.index("מס׳ הזמנה") if "מס׳ הזמנה" in hdr else None
-        i_mail = hdr.index("מייל - Mail") if "מייל - Mail" in hdr else None
-        if i_ord is not None and i_mail is not None:
-            for r in rows[1:]:
-                oid = r[i_ord].strip() if len(r) > i_ord else ""
-                if oid:
-                    by_order[oid] = r[i_mail].strip() if len(r) > i_mail else ""
-    except Exception as e:
-        log.warning(f"could not read addresses from the sheet: {e}")
+    if ws is not None:
+        try:
+            rows = ws.get_all_values()
+            hdr = [h.strip() for h in rows[0]]
+            i_ord = hdr.index("מס׳ הזמנה") if "מס׳ הזמנה" in hdr else None
+            i_mail = hdr.index("מייל - Mail") if "מייל - Mail" in hdr else None
+            if i_ord is not None and i_mail is not None:
+                for r in rows[1:]:
+                    oid = r[i_ord].strip().upper() if len(r) > i_ord else ""
+                    mail = r[i_mail].strip() if len(r) > i_mail else ""
+                    if oid and mail and not by_order.get(oid):
+                        by_order[oid] = mail
+        except Exception as e:
+            log.warning(f"could not read addresses from the sheet: {type(e).__name__}")
 
     # Worth a mailbox connection only now that there is something to resend.
     # main() has already closed its own by the time the sweep runs, and the
@@ -1231,7 +1516,7 @@ def deliver_pending_emails(ws):
     try:
         for o in owed:
             oid = str(o.get("order_id", ""))
-            to = str(o.get("customer_email", "")).strip() or by_order.get(oid, "")
+            to = str(o.get("customer_email", "")).strip() or by_order.get(oid.strip().upper(), "")
             # Nothing to send to: send_once keeps the entry open and lets the
             # site escalate to the owner — filling the sheet's Mail column
             # repairs it. The awaiting row IS the site's fresh word that the
@@ -1272,9 +1557,27 @@ def report_fulfilled(order_id: str, delivery: dict, details: dict):
     # marks that session as the customer's, and watches any other.
     if m := SESSION_ID_RE.search(str(delivery.get("success_url") or "")):
         payload["supplier_session"] = m.group(1)
-    r = requests.post(ORDERS_URL, json=payload, timeout=20,
-                      headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
-    r.raise_for_status()
+    # Tried REPORT_ATTEMPTS times (2026-11-16): the receipts row is already
+    # written when this runs, and one lost POST used to leave the customer's
+    # page empty until a person re-posted. The report is idempotent at the
+    # site. A 4xx other than 429 is an answer, not a blip: raised at once.
+    for attempt in range(1, REPORT_ATTEMPTS + 1):
+        try:
+            r = requests.post(ORDERS_URL, json=payload, timeout=20,
+                              headers={"Authorization": f"Bearer {env('ORDERS_TOKEN')}"})
+            if r.status_code == 429 or r.status_code >= 500:
+                r.raise_for_status()
+                raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
+            r.raise_for_status()
+            break
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if (code is not None and code < 500 and code != 429) or attempt == REPORT_ATTEMPTS:
+                raise
+            log.warning(f"order {order_id}: site report failed ({type(e).__name__}"
+                        f"{f' {code}' if code else ''}) - try {attempt + 1}/{REPORT_ATTEMPTS} "
+                        f"in {2 * attempt}s")
+            time.sleep(2 * attempt)
     try:
         answer = r.json()
     except Exception:
@@ -1508,10 +1811,7 @@ def send_customer_email(to: str, order_id: str, order_url: str, delivery: dict,
     msg["From"] = f"Waverole <{GMAIL_USER}>"
     msg["To"] = to
     msg["Subject"] = L["subject"]
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30, local_hostname="waverole.com") as s:
-        s.starttls()
-        s.login(GMAIL_USER, env("GMAIL_APP_PASSWORD").replace(" ", ""))
-        s.send_message(msg)
+    _smtp_send(msg)               # MailMaybeSent when the line broke after the handover
     log.info(f"order {order_id}: customer email sent")  # the log is public; never the address
 
 
@@ -1539,7 +1839,7 @@ def process(inbox: Inbox, ws, d: dict):
     except AmbiguousMatch as e:
         alert("Ambiguous match — manual action needed",
               f"{e}\nEmail: {d['gb']}GB {d['location']} {d['success_url']}\n"
-              "No row was touched.")
+              "No row was touched.", every_s=0)        # flagged below: never repeats
         inbox.flag(uid)
         return
     except RuntimeError as e:                    # e.g. renamed sheet headers
@@ -1550,10 +1850,11 @@ def process(inbox: Inbox, ws, d: dict):
         # Already done? The purchase bot now reads the eSIM straight off the
         # success page, so by the time this email lands its row is usually
         # complete — and a complete row is not "pending", so nothing matches.
-        # That is success, not a problem: flag it and stay quiet.
-        if already_completed(ws, d.get("success_urls") or [d["success_url"]]):
-            log.info(f"email uid={uid}: order already completed by the purchase bot")
-            inbox.flag(uid)
+        # That is success, not a problem — once the site is seen to hold the
+        # eSIM (repair_completed).
+        done = completed_row(ws, d.get("success_urls") or [d["success_url"]])
+        if done:
+            repair_completed(inbox, ws, d, done)
             return
         # Otherwise the email can simply have beaten the purchase bot's row.
         # Flagging immediately would burn the email forever; give the row time
@@ -1566,34 +1867,90 @@ def process(inbox: Inbox, ws, d: dict):
         alert("Delivery email without a matching order",
               f"{d['gb']}GB / {d['days']}d / {d['location']}\n{d['success_url']}\n"
               f"No pending receipts row matched within {UNMATCHED_GRACE_HOURS}h — "
-              "if this was a manual purchase, ignore this message.")
+              "if this was a manual purchase, ignore this message.", every_s=0)   # flagged below
         inbox.flag(uid)
         return
 
     order_id = match["order_id"]
+    details = _supplier_details(d)
+    if not (details.get("activation_code") or details.get("iccid")):
+        log.warning(f"order {order_id}: no details on success page yet — will retry")
+        return                                          # NOT flagged → retried
+
+    _fence()
+    complete_row(ws, match["row"], d, details)
+    _report_and_mail(inbox, ws, d, match, details)
+
+
+def _supplier_details(d: dict) -> dict:
+    """The eSIM of this delivery from the supplier's endpoint, with the plan
+    facts the email did not carry filled in on `d`. {} while not ready."""
     details = fetch_esim_details(d.get("success_urls") or [d["success_url"]])
     # Record the reading the supplier actually accepted, so the receipts row
     # and the site both get a link that opens.
     if details.get("used_url"):
         d["success_url"] = details["used_url"]
     if not (details.get("activation_code") or details.get("iccid")):
-        log.warning(f"order {order_id}: no details on success page yet — will retry")
-        return                                          # NOT flagged → retried
-
+        return {}
     # Backfill plan facts the email didn't parse from the success page itself.
     if d.get("gb") is None and details.get("plan_gb"):
         d["gb"], d["days"] = details["plan_gb"], details.get("plan_days")
     if not d.get("location") and details.get("page_region"):
         d["location"] = details["page_region"]
+    return details
 
-    complete_row(ws, match["row"], d, details)
+
+def repair_completed(inbox, ws, d: dict, done: dict):
+    """A delivery mail whose receipts row is already complete (completed_row).
+
+    Usually the purchase bot finished the order and the site holds the eSIM:
+    flag and stay quiet. But the row may be one THIS bot filled on a run that
+    ended before the site heard - the network's fence, a crash, a lost POST -
+    and then the customer's page stays empty and nothing else would ever tell
+    the site (2026-11-16). So the site is asked, and an order it holds no
+    eSIM for is reported again, exactly as process() reports a fresh row: the
+    site decides (fulfil, park as an extra), and the mail goes through
+    send_once."""
+    uid, oid = d["uid"], str(done.get("order_id") or "").strip()
+    if not oid:
+        log.info(f"email uid={uid}: order already completed by the purchase bot")
+        inbox.flag(uid)
+        return
+    facts = order_facts(oid)
+    if facts.get("esim_ready"):
+        log.info(f"email uid={uid}: order already completed by the purchase bot")
+        inbox.flag(uid)
+        return
+    if not facts:
+        age = datetime.now(timezone.utc) - d["received_at"]
+        if age < timedelta(hours=UNMATCHED_GRACE_HOURS):
+            log.info(f"email uid={uid}: row {done['row']} is complete; the site could not be asked "
+                     f"whether {oid} holds its eSIM - will retry")
+            return                                   # NOT flagged → retried
+        log.warning(f"email uid={uid}: the site never answered for {oid} - flagged as completed")
+        inbox.flag(uid)
+        return
+    details = _supplier_details(d)
+    if not (details.get("activation_code") or details.get("iccid")):
+        log.warning(f"order {oid}: no details on success page yet — will retry")
+        return
+    log.warning(f"order {oid}: receipts row {done['row']} is complete but the site holds no eSIM "
+                f"- reporting it again")
+    _report_and_mail(inbox, ws, d, done, details)
+
+
+def _report_and_mail(inbox, ws, d: dict, match: dict, details: dict):
+    """After a receipts row holds this delivery: tell the site, then (if the
+    site says so) mail the customer. Flags the email once the outcome is
+    settled."""
+    uid, order_id = d["uid"], match["order_id"]
     try:
         answer = report_fulfilled(order_id, d, details)
     except Exception as e:
         # No customer email: it sends the buyer to their order page, which has
         # no eSIM on it until the site accepts this POST. Flagged anyway — the
-        # row is no longer "pending" now that it is filled in, so a retry could
-        # not re-match it and would just alert about an orphan email forever.
+        # report was tried REPORT_ATTEMPTS times, and a mail that kept coming
+        # back would alert about it every run.
         alert(f"Order {order_id}: sheet done, site report FAILED — ACTION NEEDED",
               f"{e}\n\nThe customer email was NOT sent (their order page has no "
               f"eSIM yet). Fix the cause, then re-post the fulfillment; row "
@@ -1753,7 +2110,7 @@ def handle_replaced_delivery(inbox, ws, d: dict, late: dict):
               "to the sheet." + extra + "\n\nThe package is real and paid for: put it on the "
               f"spare-stock shelf (python -m bot.spares add {late['row']}), or ask the supplier for "
               f"a refund. If row {late['row']} says Buy 0, the charge was booked as not made - put "
-              "the cost back.")
+              "the cost back.", every_s=0)              # flagged below: one mail per package
         inbox.flag(uid)
 
     def spare(why: str):
@@ -1794,7 +2151,8 @@ def handle_replaced_delivery(inbox, ws, d: dict, late: dict):
               f"compare its ICCID with this package's. If they are the SAME, the customer has "
               f"this package: fill row {late['row']} with it and make it the sale, and mark the "
               f"other row of {oid or 'the order'} as the spare. If they differ, this one is a "
-              "spare: shelf or supplier refund. Nothing was sent, written or posted.")
+              "spare: shelf or supplier refund. Nothing was sent, written or posted.",
+              every_s=0)                                # flagged below: one mail per package
         inbox.flag(uid)
 
     if not oid:
@@ -1856,6 +2214,7 @@ def handle_replaced_delivery(inbox, ws, d: dict, late: dict):
     n = late["row"]
     hdr = [h.strip() for h in ws.row_values(1)]
     notes = []
+    _fence()
     complete_row(ws, n, d, details)
     sale = {}
     live = list(late.get("live_rows") or [])
@@ -1879,7 +2238,7 @@ def handle_replaced_delivery(inbox, ws, d: dict, late: dict):
         sale = {k: v for k, v in sale.items() if k in hdr}
         src_note = "from the site's record of the order"
     if sale:
-        ws.update_cells([gspread.Cell(n, hdr.index(k) + 1, v) for k, v in sale.items()],
+        ws.update_cells([gspread.Cell(n, hdr.index(k) + 1, _cell_text(v)) for k, v in sale.items()],
                         value_input_option="USER_ENTERED")
         notes.append(f"row {n}: eSIM filled in, Status active, "
                      + ", ".join(f"{k} '{v}'" for k, v in sale.items()) + f" ({src_note})")
@@ -1903,7 +2262,8 @@ def handle_replaced_delivery(inbox, ws, d: dict, late: dict):
           "so it is the eSIM the customer has, and the other purchase of the same number is "
           "the one nobody is using.\n\nChanged:\n  * " + "\n  * ".join(notes) +
           "\n\nThe customer was not mailed again (they have had this eSIM since the site "
-          "completed the order). The spare row's package: shelf, or a supplier refund.")
+          "completed the order). The spare row's package: shelf, or a supplier refund.",
+          every_s=0)                                    # flagged below: one mail per package
     inbox.flag(uid)
     log.info(f"order {oid}: late package is the customer's - row {n} is the sale, "
              f"row(s) {live or '-'} the spare")
@@ -1947,18 +2307,50 @@ def _needs_a_human(e: Exception) -> bool:
                                    "authentication failed", "application-specific"))
 
 
+def _sheet_needs_a_human(e: Exception) -> bool:
+    """A receipts sheet that will not open for a reason that never clears by
+    itself: a missing secret, a key Google refuses, a sheet no longer shared
+    with the robot. A 429 or a Google blip is not one - the next run reads it."""
+    if isinstance(e, RuntimeError):        # missing GOOGLE_CREDENTIALS_JSON
+        return True
+    if type(e).__name__ in ("RefreshError", "SpreadsheetNotFound", "JSONDecodeError"):
+        return True
+    return getattr(getattr(e, "response", None), "status_code", None) in (401, 403, 404)
+
+
 def main():
+    LAST_RUN.update(due=0, sent=0, failed=0, hard_failed=0)
     ws = None
     book = None
     mail_error = None
+    sheet_error = None
+
+    def open_sheet():
+        # Its own try (2026-11-16): a sheet that will not open used to be
+        # filed as "mailbox unreadable", and cost the delivery sweep too.
+        nonlocal ws, book, sheet_error
+        if ws is None:
+            try:
+                book = sheet_client().open_by_key(RECEIPTS_SHEET_ID)
+                ws = book.sheet1
+                sheet_error = None
+            except Exception as e:
+                sheet_error = e
+                log.error(f"receipts sheet unavailable this cycle: "
+                          f"{_redact(f'{type(e).__name__}: {e}')}")
+        return ws
+
     try:
         inbox = _open_inbox()
         try:
             deliveries = inbox.unprocessed()
             log.info(f"{len(deliveries)} unprocessed delivery email(s)")
-            if deliveries:
-                book = sheet_client().open_by_key(RECEIPTS_SHEET_ID)
-                ws = book.sheet1
+            if deliveries and open_sheet() is None:
+                # Nothing is flagged until it is processed: the next run sees
+                # these again. The sweep below still runs.
+                log.warning(f"{len(deliveries)} delivery email(s) left for the next run "
+                            f"- the receipts sheet could not be opened")
+                deliveries = []
             for d in deliveries:
                 try:
                     process(inbox, ws, d)
@@ -1980,11 +2372,10 @@ def main():
 
     # ALWAYS, even with an empty inbox: this is the retry loop that guarantees
     # every buyer eventually receives their eSIM. It runs last so an email that
-    # just failed above gets a second chance in this same run.
+    # just failed above gets a second chance in this same run. Without the
+    # sheet (ws None) it still mails every buyer whose address the site holds.
+    open_sheet()
     try:
-        if ws is None:
-            book = sheet_client().open_by_key(RECEIPTS_SHEET_ID)
-            ws = book.sheet1
         deliver_pending_emails(ws)
     except Exception as e:
         log.error(f"delivery ledger sweep failed: {_redact(str(e))}")
@@ -2008,6 +2399,7 @@ def main():
     except Exception as e:
         log.error(f"stale-pending check failed: {_redact(str(e))}")
 
+    needs_a_human = False
     if mail_error is not None and _needs_a_human(mail_error):
         alert("Cannot read the delivery mailbox — ACTION NEEDED",
               f"{_redact(f'{type(mail_error).__name__}: {mail_error}')}\n\n"
@@ -2015,6 +2407,16 @@ def main():
               f"delivery email is being processed until it is fixed. Paid "
               f"orders are NOT lost — they stay queued and are picked up as "
               f"soon as the bot can read {GMAIL_USER} again.")
+        needs_a_human = True
+    if sheet_error is not None and _sheet_needs_a_human(sheet_error):
+        alert("Cannot open the receipts sheet — ACTION NEEDED",
+              f"{_redact(f'{type(sheet_error).__name__}: {sheet_error}')}\n\n"
+              f"This does not clear on its own. Until it is fixed no supplier delivery "
+              f"mail is matched to its order (they wait, unflagged), and a buyer whose "
+              f"address only the sheet holds is not mailed. Buyers whose address the "
+              f"site holds are still mailed.")
+        needs_a_human = True
+    if needs_a_human:
         raise SystemExit(1)
 
 

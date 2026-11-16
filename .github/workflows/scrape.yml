@@ -46,6 +46,15 @@ jobs:
       # every country group every ~30 minutes, so this hour-long run is only
       # wanted while the network is down. Asked on every run, dispatched or
       # scheduled; 'force' from the Actions tab skips the question.
+      # No NEED_JOB here, on purpose (2026-11-16): the network's scrape is one
+      # job PER COUNTRY GROUP (scrape:<cc>) and net_watch reports none of
+      # them, so "the network is reporting" is the best this gate can know.
+      # The two steps after the scrape are each a network job the site DOES
+      # report (stellar_prices, chooser), but gating this run on them would
+      # start an hour of browser driving against s1 - the load the network
+      # paces itself to keep down - to redo a one-minute API read. Their
+      # backup while the network is up is stellar-prices.yml, which asks
+      # for both jobs by name.
       - uses: actions/checkout@v4
         with:
           sparse-checkout: net_gate.sh
@@ -75,7 +84,9 @@ jobs:
 
   scrape:
     needs: gate
-    if: needs.gate.outputs.skip != 'true'
+    # !cancelled(), not the implicit success(): a gate that failed cannot
+    # tell, and a backup that cannot tell runs.
+    if: ${{ !cancelled() && needs.gate.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     # Backstop only. Every step below carries its own limit, so the job limit
     # should never be what stops us — if it is, a step is missing a timeout.
@@ -219,8 +230,10 @@ jobs:
       # its only remaining source is the public RETAIL feed, and it refuses to
       # write estimates off it - it says so in this log and exits 3.
       # 6 -> 10 on 2026-10-06: since ad65d36 reads the WHOLE catalogue (7,000+
-      # listings, 70+ pages at Stellar's 55-a-minute pace) the step takes
+      # listings, 70+ pages, then at Stellar's 60-a-minute limit) the step took
       # 90-290 s; the 10-04 22:54 run was killed one tick after its last write.
+      # Since 2026-11-16 Stellar allows 300 a minute and this run's share is
+      # 150 (stellar_prices.calls_per_minute), so the read no longer waits.
       - name: Refresh Stellar prices
         id: stellar
         if: always()

@@ -268,9 +268,18 @@ seen = []
 res = stellar_usage.fetch_usage(
     [URL], session=_Session(_api(meter_code=404, esim=REAL_ESIM, seen=seen)), key="k",
     sim_ids={URL: "s1"})
-check("a known sim id whose meter fails walks the long path",
-      seen, ["/esims/s1/usage", "/orders/o1", "/esims/s1/usage", "/esims/s1"])
+# ...without sending the call that just failed a second time (2026-11-16:
+# it did - a second 30 s timeout per package on a slow Stellar).
+check("a known sim id whose meter fails walks the long path, asking the meter once",
+      seen, ["/esims/s1/usage", "/orders/o1", "/esims/s1"])
 check("...and is still never a guessed reading", isinstance(res[URL], dict), False)
+# The order naming a DIFFERENT eSIM than the one remembered: that meter is new.
+seen = []
+res = stellar_usage.fetch_usage(
+    [URL], session=_Session(_api(meter_code=404, esim=REAL_ESIM, seen=seen)), key="k",
+    sim_ids={URL: "s0"})
+check("a remembered sim id the order no longer names: the order's own meter is asked",
+      seen, ["/esims/s0/usage", "/orders/o1", "/esims/s1/usage", "/esims/s1"])
 
 # A deadline already past: nothing asked, every url "not asked" (None).
 seen = []
@@ -285,6 +294,149 @@ with mock.patch.dict(os.environ, {"STELLAR_API_KEY": "", "STELLAR_USAGE_KEY": "r
     seen = []
     res = stellar_usage.fetch_usage([URL], session=_Session(_api(meter=REAL_METER, seen=seen)))
     check("STELLAR_USAGE_KEY is used when STELLAR_API_KEY is absent", isinstance(res[URL], dict), True)
+
+
+# -- which key a sweep reads with (usage_bot's alert asks the same) ---------
+print("\n-- the key: read-only first, the name is what is logged --")
+_KEYS = ("STELLAR_USAGE_KEY", "STELLAR_API_KEY", "STELLAR_READ_KEY")
+for env, want in (
+        ({"STELLAR_USAGE_KEY": "ro", "STELLAR_API_KEY": "buy"}, ("STELLAR_USAGE_KEY", "ro")),
+        ({"STELLAR_API_KEY": "buy"}, ("STELLAR_API_KEY", "buy")),
+        ({"STELLAR_API_KEY": " ", "STELLAR_READ_KEY": "cat"}, ("STELLAR_READ_KEY", "cat")),
+        ({}, ("", ""))):
+    with mock.patch.dict(os.environ, {k: "" for k in _KEYS}):
+        os.environ.update(env)
+        check(f"usage_key with {sorted(k for k, v in env.items() if v.strip())}",
+              stellar_usage.usage_key(), want)
+_hdr = {}
+
+
+class _KeySession:
+    def __init__(self):
+        self.headers = _hdr
+
+    def get(self, url, **kw):
+        return _Resp({"data": REAL_METER})
+
+
+with mock.patch.dict(os.environ, {"STELLAR_USAGE_KEY": "ro", "STELLAR_API_KEY": "buy",
+                                  "STELLAR_READ_KEY": ""}):
+    stellar_usage.fetch_usage([URL], session=_KeySession(), sim_ids={URL: "s1"})
+check("with both, the sweep reads with the read-only key",
+      _hdr.get("Authorization"), "Bearer ro")
+
+
+# -- the deadline holds INSIDE a package, not only between them -------------
+# 2026-11-16: usage_bot gave no deadline at all, and stellar_usage looked at
+# one only between packages - while a package can be four calls of a 30 s
+# timeout and a 429 used to sleep up to 300 s. On the network the run is
+# killed at its lease, before its ONE sheet write: the s1 rows were lost too.
+print("\n-- the deadline: no call, no wait and no timeout past it --")
+
+
+class _Clock:
+    """time.monotonic / time.sleep on a fake clock; s.get can advance it."""
+
+    def __init__(self):
+        self.t, self.slept = 1000.0, []
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, d):
+        self.slept.append(d)
+        self.t += d
+
+
+def _with_clock(fn):
+    clk = _Clock()
+    with mock.patch.object(stellar_usage.time, "monotonic", clk.monotonic), \
+         mock.patch.object(stellar_usage.time, "sleep", clk.sleep):
+        return clk, fn(clk)
+
+
+class _R429(_Resp):
+    def __init__(self, after):
+        super().__init__({}, 429)
+        self.headers = {"Retry-After": str(after)}
+
+
+calls = []
+
+
+def _run_429(clk):
+    def get(url, **kw):
+        calls.append((url.rsplit("/api/v1", 1)[-1], kw.get("timeout")))
+        return _R429(120)
+    return stellar_usage.fetch_usage(
+        [URL, URL2], session=_Session(get), key="k", sim_ids={URL: "s1", URL2: "s2"},
+        deadline=clk.t + 60)
+
+
+clk, res = _with_clock(_run_429)
+check("a 429 asking longer than the time left is not slept on", clk.slept, [])
+check("...the package is 'not asked', never a reading", res[URL], None)
+check("...and nothing after it knocks on the 429 again", [c[0] for c in calls], ["/esims/s1/usage"])
+check("...every package comes back, all None", res, {URL: None, URL2: None})
+
+calls = []
+
+
+def _run_429_short(clk):
+    def get(url, **kw):
+        calls.append(url.rsplit("/api/v1", 1)[-1])
+        return _R429(5) if len(calls) == 1 else _Resp({"data": REAL_METER})
+    return stellar_usage.fetch_usage([URL], session=_Session(get), key="k",
+                                     sim_ids={URL: "s1"}, deadline=clk.t + 60)
+
+
+clk, res = _with_clock(_run_429_short)
+check("a 429 that fits in the time left is waited out and asked once more",
+      ([round(x) for x in clk.slept], calls), ([6], ["/esims/s1/usage", "/esims/s1/usage"]))
+check("...and its reading comes back", isinstance(res[URL], dict), True)
+
+timeouts = []
+
+
+def _run_timeouts(clk):
+    def get(url, **kw):
+        timeouts.append(kw.get("timeout"))
+        clk.t += kw.get("timeout") or 0          # every call hangs to its timeout
+        raise OSError("timed out")
+    return stellar_usage.fetch_usage([URL], session=_Session(get), key="k",
+                                     sim_ids={URL: "s1"}, deadline=clk.t + 45)
+
+
+clk, res = _with_clock(_run_timeouts)
+check("a call never waits past the deadline (timeout cut to the time left)",
+      timeouts[:2], [30, 15.0])
+check("...so a hanging Stellar ends the sweep AT the deadline, not minutes after",
+      clk.t <= 1000.0 + 45, True)
+check("...and the package is left untouched", res, {URL: None})
+
+
+def _run_window(clk):
+    stellar_usage._recent.clear()
+    with mock.patch.object(stellar_usage, "RATE_LIMIT", 1):
+        def get(url, **kw):
+            return _Resp({"data": REAL_METER})
+        return stellar_usage.fetch_usage([URL, URL2], session=_Session(get), key="k",
+                                         sim_ids={URL: "s1", URL2: "s2"}, deadline=clk.t + 30)
+
+
+clk, res = _with_clock(_run_window)
+check("the rate window is not waited on past the deadline either",
+      (clk.slept, isinstance(res[URL], dict), res[URL2]), ([], True, None))
+check("the deadline is the sweep's own: none is left behind for the next caller",
+      stellar_usage._deadline, None)
+
+
+# -- STELLAR_RATE_LIMIT: unreadable means the old, safe 60 ------------------
+print("\n-- STELLAR_RATE_LIMIT --")
+for raw, want in (("", 150), ("100", 100), ("900", 280), ("0", 1),
+                  ("60.0", 60), ("100.0", 60), ("60/min", 60), ("x", 60)):
+    with mock.patch.dict(os.environ, {"STELLAR_RATE_LIMIT": raw}):
+        check(f"STELLAR_RATE_LIMIT={raw!r} -> {want}", stellar_usage.rate_from_env(150), want)
 
 # The sim id memory survives a run and drops finished packages.
 _d = tempfile.mkdtemp()

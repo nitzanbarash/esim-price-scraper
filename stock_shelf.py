@@ -371,18 +371,24 @@ def shelf_alert(order: dict, extra: dict, shelf_row: int, rrow: dict | None, cos
         todo = (f"Nothing to do: the next order for {sku} is served from this spare.\n"
                 f"For the money back instead: ask esim.dog to refund ICCID ...{iccid_tail or '?'}, then on the PC:\n"
                 f"  python -m bot.spares remove {iccid_tail or '<ICCID digits>'} refund requested")
+    # Unthrottled: one mail per package, never repeated (the row on the tab is
+    # what stops the next run), and two packages of one order share a subject.
     fb.alert(f"{oid}: a second package was bought - it is on the stock shelf",
              f"{first}\n\nSecond package: {pkg} -> '{STOCK_TAB}' row {shelf_row}, free\n"
-             f"How: {_how(order, extra)}\n{cost_line}\n\n{todo}")
+             f"How: {_how(order, extra)}\n{cost_line}\n\n{todo}", every_s=0)
 
 
 def refusal_alert(order: dict, extra: dict, why: str):
     oid = str(order.get("order_id") or "?")
+    # Once a day per package: it repeats every run while the site cannot be
+    # told (mark_shelved), and two packages of one order share a subject.
     fb.alert(f"{oid}: a parked package was NOT put on the stock shelf",
              f"Order {oid} ({order.get('sku') or '?'}) has a parked package that this bot refused to "
              f"shelve: {why}.\n\nShelving the eSIM the customer is using would sell the next customer "
              f"a package somebody already has. Compare the order's page with its receipts rows by hand "
-             f"(package ICCID ...{_digits(extra.get('iccid'))[-4:] or '?'}). It will not be offered again.")
+             f"(package ICCID ...{_digits(extra.get('iccid'))[-4:] or '?'}). It will not be offered again.",
+             every_s=86400,
+             key=f"shelf-refused:{oid}:{_digits(extra.get('iccid')) or extra.get('sid') or extra.get('supplier_ref') or ''}")
 
 
 # ── the run ──────────────────────────────────────────────────────────────────
@@ -419,6 +425,8 @@ def _shelve(book, orders: list[dict], receipts_ws, now) -> list[dict]:
         ws = stock_ws(book)
     except ShelfError as e:
         log.error(f"stock tab not writable: {e}")
+        # Repeats every run until the header is restored: fb.alert's hourly
+        # throttle (2026-11-16) keeps it to one mail an hour.
         fb.alert("The stock tab cannot be written - second packages are waiting",
                  f"{e}.\n\nRestore the header row of '{STOCK_TAB}' (the PC bot's columns, in any order); "
                  f"until then no package is shelved, and the site keeps listing them.")
