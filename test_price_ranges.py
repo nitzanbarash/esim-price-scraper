@@ -78,6 +78,27 @@ check("ladder fee at $5", pr.table_fee(5.0), 0.6)
 check("ladder fee over $20 is 0, not '-'", pr.table_fee(24.49), 0)
 check("margin is net over cost", round(pr.margin_pct(6.49, 4.0), 1), 47.0)
 
+print("\n-- money by rail (2026-11-22: card 3.5% above 1GB, PayPal 4% + 35c on 1GB) --")
+check("1GB keeps PayPal's fee", pr.net_of(0.99, 1), 0.60)
+check("unknown size keeps PayPal's (dearer) fee", pr.net_of(6.49, None), 5.88)
+check("3GB is on the card: 3.5%, no fixed part", pr.net_of(1.97, 3), 1.90)
+check("10GB at 6.49 on the card", pr.net_of(6.49, 10), 6.26)
+check("50GB at 24.49 on the card", pr.net_of(24.49, 50), 23.63)
+check("card margin at 6.49 on $4", round(pr.margin_pct(6.49, 4.0, 10), 1), 56.5)
+check("Canada 5GB on $4.25: 5.99 now pays 30% (36%) — it took 6.49 on PayPal's fee",
+      pr.reprice(5, 4.25, 4.99, 4.99, 6.49), 5.99)
+check("Hungary 20GB on $5.72 (range rule): 10.49 now earns the $4.25 floor ($4.40)",
+      pr._range_price(20, 5.72, 9.99, 9.99, 12.99), 10.49)
+check("1GB unchanged: the lowest step losing at most 10c on PayPal's fee",
+      pr.reprice(1, 1.00, None, 0.99, 1.49), 1.39)
+
+# The rule tests below were written, with their numbers, on PayPal's 4% + 35c
+# for every size; the rule itself is blind to which fee it is fed. They run on
+# that fee still, so each story keeps its numbers; the card's own answers are
+# pinned above and at the end of the file.
+_CARD = (pr.CARD_FEE_RATE, pr.CARD_FEE_FIXED)
+pr.CARD_FEE_RATE, pr.CARD_FEE_FIXED = pr.REAL_FEE_RATE, pr.REAL_FEE_FIXED
+
 print("\n-- the grid --")
 check("1GB: ten-cent steps ending in 9", pr.steps(0.99, 1.49, 1), [0.99, 1.09, 1.19, 1.29, 1.39, 1.49])
 check("10GB: fifty-cent steps ending .49/.99", pr.steps(5.99, 7.99, 10), [5.99, 6.49, 6.99, 7.49, 7.99])
@@ -372,6 +393,20 @@ b = row(3, "2.30.10", 3.99, source="Stellar", final=6.49, chosen="")  # twin und
 d = decide([a, b])
 check("…even when the unticked twin is the cheap one (no switch inside 1%)",
       (d[0].action, writes(d[0], "final")), ("keep", []))
+
+print("\n-- the chooser on the card fee --")
+pr.CARD_FEE_RATE, pr.CARD_FEE_FIXED = _CARD
+r = row(2, "3.1C.5", 4.25, gb="5gb", final=4.99, rng="4.99 - 6.49")
+r.my_price = pr.net_of(4.99, 5)
+r.profit = profit_text(r.my_price, 4.25)
+d = decide([r])
+check("Canada 5GB on $4.25 goes to 5.99, not 6.49", writes(d[0], "final"), [(2, 5.99)])
+check("…and S is net of the card's 3.5%", writes(d[0], "my_price"), [(2, 5.78)])
+o = row(2, "1.1.1", 1.00, gb="1gb", final=1.09, rng="0.99 - 1.49")
+d = decide([o])
+check("a 1GB on $1.00 keeps PayPal's fee: 1.29 loses 11c, so 1.39 (loses 2c)",
+      writes(d[0], "final"), [(2, 1.39)])
+check("…and its S is net of 4% + 35c", writes(d[0], "my_price"), [(2, 0.98)])
 
 print()
 if _fails:

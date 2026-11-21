@@ -52,8 +52,9 @@ copies to the same answers:
     $0.90 → 1.47, under $1.30 → 1.97, CHEAP_3GB_LADDER; and a 5GB: under $1.20 → 2.47, under $1.80 → 2.97,
     CHEAP_5GB_LADDER.) From $4 up the range rule alone decides again.
 
-The margin is judged on 'מחיר שלי' (S) — U less the processor's real cut of
-4% + $0.35 (memory: fee-ladder-vs-real-fee) — exactly as 'רווח' (P) reads
+The margin is judged on 'מחיר שלי' (S) — U less the processor's real cut:
+3.5% by card above 1GB, 4% + $0.35 by PayPal on 1GB (since 2026-11-22; until
+then 4% + $0.35 on every size; memory: fee-ladder-vs-real-fee) — exactly as 'רווח' (P) reads
 it. Every write of U here rewrites S and T too, the way applyFee_ in
 waverole_sync.gs does on a hand edit, because API writes never fire onEdit.
 
@@ -82,11 +83,21 @@ from typing import Iterable, Optional
 RANGE_HEADER = "טווח מחירים"          # V — the column this module owns
 OVER_RANGE_LABEL = "לא רווחי — מעל טווח"   # Q: no price in the range pays
 
-# The processor's real cut (waverole_sync.gs REAL_FEE_RATE/FIXED) and the
-# ladder fee the customer is shown (FEE_LADDER / FEE_OVER_TOP). Both are
-# copied from the Apps Script so a bot-written row reads like a typed one.
-REAL_FEE_RATE = 0.04
+# The processor's real cut (waverole_sync.gs REAL_FEE_RATE/FIXED and
+# CARD_FEE_RATE/FIXED) and the ladder fee the customer is shown (FEE_LADDER /
+# FEE_OVER_TOP). All copied from the Apps Script so a bot-written row reads
+# like a typed one.
+#
+# Two rails since 2026-11-22 (the owner: a new card system, every package but
+# 1GB at a 3.5% fee). The site sells 1GB through PayPal only and every larger
+# package by card only (iCount; waverole-site commit 4836124). PayPal keeps
+# 4% + 35c; the card company 3.5% at worst (a card from abroad; an Israeli
+# card is 0.8-1.6%), with no fixed part. A row whose size is unknown is priced
+# on the dearer PayPal fee, so a missing GB never overstates a profit.
+REAL_FEE_RATE = 0.04       # PayPal: 1GB
 REAL_FEE_FIXED = 0.35
+CARD_FEE_RATE = 0.035      # card: every size above 1GB
+CARD_FEE_FIXED = 0.0
 FEE_LADDER = ((2, 0.4), (5, 0.6), (10, 0.8), (15, 1.0), (20, 1.2))
 FEE_OVER_TOP = 0
 
@@ -146,14 +157,22 @@ _EPS = 1e-6
 
 # ── money ────────────────────────────────────────────────────────────────
 
-def real_fee(final: float) -> float:
-    """What the processor keeps of a sale at `final`: 4% + 35c, in cents."""
+def on_card(gb: Optional[float]) -> bool:
+    """Is a package of this size sold by card (True) or by PayPal (False)?"""
+    return gb is not None and not is_1gb(gb)
+
+
+def real_fee(final: float, gb: Optional[float] = None) -> float:
+    """What the processor keeps of a sale at `final`, in cents: the card's
+    3.5% above 1GB, PayPal's 4% + 35c on 1GB (and on an unknown size)."""
+    if on_card(gb):
+        return round(final * CARD_FEE_RATE + CARD_FEE_FIXED, 2)
     return round(final * REAL_FEE_RATE + REAL_FEE_FIXED, 2)
 
 
-def net_of(final: float) -> float:
+def net_of(final: float, gb: Optional[float] = None) -> float:
     """'מחיר שלי' for a sale at `final` — what applyFee_ writes into S."""
-    return round(final - real_fee(final), 2)
+    return round(final - real_fee(final, gb), 2)
 
 
 def table_fee(final: float) -> float:
@@ -164,9 +183,9 @@ def table_fee(final: float) -> float:
     return FEE_OVER_TOP
 
 
-def margin_pct(final: float, cost: float) -> float:
+def margin_pct(final: float, cost: float, gb: Optional[float] = None) -> float:
     """The margin P reports: net over cost, as a percentage of cost."""
-    return (net_of(final) - cost) / cost * 100.0
+    return (net_of(final, gb) - cost) / cost * 100.0
 
 
 def is_1gb(gb: Optional[float]) -> bool:
@@ -176,8 +195,8 @@ def is_1gb(gb: Optional[float]) -> bool:
 def pays(final: float, cost: float, gb: Optional[float]) -> bool:
     """Does a sale at `final` satisfy the owner's floor for this size?"""
     if is_1gb(gb):
-        return net_of(final) - cost >= -LOSS_1GB - _EPS
-    return margin_pct(final, cost) >= RAISE_BELOW_PCT - _EPS
+        return net_of(final, gb) - cost >= -LOSS_1GB - _EPS
+    return margin_pct(final, cost, gb) >= RAISE_BELOW_PCT - _EPS
 
 
 def is_cheap_10gb(gb: Optional[float], cost: Optional[float]) -> bool:
@@ -228,7 +247,7 @@ def dollar_floor(gb: Optional[float]) -> float:
 def earns(final: float, cost: float, gb: Optional[float]) -> bool:
     """Does a sale at `final` make the size's dollar floor? (True without one.)"""
     floor = dollar_floor(gb)
-    return floor <= 0 or net_of(final) - cost >= floor - _EPS
+    return floor <= 0 or net_of(final, gb) - cost >= floor - _EPS
 
 
 # ── the grid ─────────────────────────────────────────────────────────────
@@ -341,7 +360,7 @@ def _range_price(gb: Optional[float], cost: float, current: Optional[float],
         return None if up is None else lift(up)
     if not earns(cur, cost, gb):
         return lift(cur)
-    if margin_pct(cur, cost) > LOWER_ABOVE_PCT + _EPS and cur > grid[0]:
+    if margin_pct(cur, cost, gb) > LOWER_ABOVE_PCT + _EPS and cur > grid[0]:
         down = grid[grid.index(cur) - 1]        # cur is on the grid by now
         if earns(down, cost, gb):
             return down

@@ -136,8 +136,14 @@ const ROW_UNCHOSEN_BG = '#f2f2f2';
 // cannot disagree again.
 const FEE_LADDER    = [[2, 0.4], [5, 0.6], [10, 0.8], [15, 1.0], [20, 1.2]];
 const FEE_OVER_TOP  = 0;      // over $20: shown as no fee, absorbed by us
-const REAL_FEE_RATE = 0.04;   // 4% of the sale ...
+const REAL_FEE_RATE = 0.04;   // PayPal (1GB): 4% of the sale ...
 const REAL_FEE_FIXED = 0.35;  // ... plus 35 cents
+// Since 2026-11-22 every package above 1GB sells by card only (iCount), at
+// 3.5% at worst (a card from abroad) and no fixed part; 1GB stays on PayPal.
+// A row whose size is unknown keeps the dearer PayPal fee. The same numbers
+// as price_ranges.py CARD_FEE_RATE / CARD_FEE_FIXED.
+const CARD_FEE_RATE = 0.035;
+const CARD_FEE_FIXED = 0;
 
 function tableFee_(price) {
   for (let i = 0; i < FEE_LADDER.length; i++) {
@@ -146,7 +152,10 @@ function tableFee_(price) {
   return FEE_OVER_TOP;
 }
 
-function realFee_(price) {
+function onCard_(gb) { return gb !== null && gb !== undefined && !(gb <= 1); }
+
+function realFee_(price, gb) {
+  if (onCard_(gb)) return Math.round((price * CARD_FEE_RATE + CARD_FEE_FIXED) * 100) / 100;
   return Math.round((price * REAL_FEE_RATE + REAL_FEE_FIXED) * 100) / 100;
 }
 
@@ -311,13 +320,13 @@ const RANGE_RE = /^\s*\$?\s*([0-9]+(?:[.,][0-9]+)?)\s*[-\u2013\u2014~]+\s*\$?\s*
 
 function isOneGb_(gb) { return gb !== null && gb !== undefined && gb <= 1; }
 
-function netOf_(price) { return Math.round((price - realFee_(price)) * 100) / 100; }
+function netOf_(price, gb) { return Math.round((price - realFee_(price, gb)) * 100) / 100; }
 
-function marginPct_(price, cost) { return (netOf_(price) - cost) / cost * 100; }
+function marginPct_(price, cost, gb) { return (netOf_(price, gb) - cost) / cost * 100; }
 
 function pays_(price, cost, gb) {
-  if (isOneGb_(gb)) return netOf_(price) - cost >= -RANGE_LOSS_1GB - RANGE_EPS;
-  return marginPct_(price, cost) >= RANGE_RAISE_BELOW_PCT - RANGE_EPS;
+  if (isOneGb_(gb)) return netOf_(price, gb) - cost >= -RANGE_LOSS_1GB - RANGE_EPS;
+  return marginPct_(price, cost, gb) >= RANGE_RAISE_BELOW_PCT - RANGE_EPS;
 }
 
 // A 10GB bought under CHEAP_10GB_COST ($4): on the 10GB ladder.
@@ -358,7 +367,7 @@ function dollarFloor_(gb) {
 // Does a sale at `price` make the size's dollar floor? (true without one)
 function earns_(price, cost, gb) {
   const floor = dollarFloor_(gb);
-  return floor <= 0 || netOf_(price) - cost >= floor - RANGE_EPS;
+  return floor <= 0 || netOf_(price, gb) - cost >= floor - RANGE_EPS;
 }
 
 // The grid is worked in whole cents: 0.1 + 0.2 is not 0.3 in floating point.
@@ -421,7 +430,7 @@ function rangePrice_(gb, cost, current, lo, hi) {
     return null;
   }
   if (!earns_(cur, cost, gb)) return lift(cur);
-  if (marginPct_(cur, cost) > RANGE_LOWER_ABOVE_PCT + RANGE_EPS && cur > grid[0]) {
+  if (marginPct_(cur, cost, gb) > RANGE_LOWER_ABOVE_PCT + RANGE_EPS && cur > grid[0]) {
     const down = grid[grid.indexOf(cur) - 1];  // cur is on the grid by now
     if (earns_(down, cost, gb)) return down;
   }
@@ -651,7 +660,10 @@ function applyFee_(sheet, map, e) {
       }
     }
     const writePrice = hitU || moved;
-    const net = price === null ? null : netOf_(price);
+    // The SKU's size decides the rail, and so the fee (card above 1GB).
+    const feeAt = chosen !== undefined ? chosen : src;
+    const skuGb = map.gb === undefined ? null : num_(data[feeAt][map.gb]);
+    const net = price === null ? null : netOf_(price, skuGb);
 
     rows.forEach(function (i) {
       const row = i + 2;

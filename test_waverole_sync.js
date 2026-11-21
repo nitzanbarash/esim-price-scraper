@@ -72,6 +72,11 @@ py.cases.forEach(function (c) {
 });
 check('reprice_ agrees with price_ranges.reprice on ' + py.cases.length + ' cases', disagree, 0);
 py.cells.forEach(function (c) { check('parseRange_ ' + JSON.stringify(c[0]), gs.parseRange_(c[0]), c[1]); });
+// The fee by rail (2026-11-22), the same numbers as price_ranges.net_of.
+check('netOf_ 1GB keeps PayPal 4% + 35c', gs.netOf_(0.99, 1), 0.6);
+check('netOf_ unknown size keeps PayPal', gs.netOf_(6.49, null), 5.88);
+check('netOf_ 10GB is on the card, 3.5%', gs.netOf_(6.49, 10), 6.26);
+check('netOf_ 50GB is on the card, 3.5%', gs.netOf_(24.49, 50), 23.63);
 
 // -- 2. a fake sheet, edited by hand -----------------------------------
 // The live layout (2026-10-07): A sku, C GB, D source, G buy, P profit,
@@ -157,13 +162,15 @@ function twin10() {
 }
 
 // The buy price rises on the ticked row -> the price climbs to the first step paying 30%.
+// (A 10GB sells by card since 2026-11-22: 3.5%, no fixed part. At $4.85 6.49
+// nets 6.26, 29.1% - short; 6.99 nets 6.75, 39.2%.)
 let s = twin10();
-let t = edit(s, 3, 'buy', '(\u20ac4.10) $4.80');
+let t = edit(s, 3, 'buy', '(\u20ac4.10) $4.85');
 check('dearer cost moves the price up', [cell(s, 2, 'price'), cell(s, 3, 'price')], [6.99, 6.99]);
-check('...and the net and fee follow, on both rows',
-      [cell(s, 2, 'net'), cell(s, 3, 'fee')], [6.36, 0.8]);
+check('...and the net (card fee) and fee follow, on both rows',
+      [cell(s, 2, 'net'), cell(s, 3, 'fee')], [6.75, 0.8]);
 check('...and the owner is told why', t.length === 1 && t[0].indexOf('5.99 \u2192 6.99') >= 0, true);
-check('...and P is the new margin', cell(s, 3, 'profit'), '\ud83d\udfe2 +$1.56 (+32.5%)');
+check('...and P is the new margin', cell(s, 3, 'profit'), '\ud83d\udfe2 +$1.90 (+39.2%)');
 
 // The cost falls back -> no drop until the margin passes 200% (hard down).
 edit(s, 3, 'buy', '(\u20ac3.50) $4.10');

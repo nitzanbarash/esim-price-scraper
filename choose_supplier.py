@@ -479,7 +479,7 @@ def reprice_sku(chosen: Row, carried: dict, rng: Optional[tuple]) -> tuple[list,
     new = price_ranges.reprice(gb_of(chosen.gb), cost, cur, *rng)
     if new is None or (cur is not None and abs(new - cur) < 0.005):
         return [], None
-    vals = {"final": new, "my_price": price_ranges.net_of(new),
+    vals = {"final": new, "my_price": price_ranges.net_of(new, gb_of(chosen.gb)),
             "fee": price_ranges.table_fee(new)}
     carried.update(vals)
     return [(chosen.row, key, value) for key, value in vals.items()], (cur, new)
@@ -1090,12 +1090,13 @@ def run_events(decisions: list[Decision], rows: list[Row]) -> list[dict]:
     out = []
     for sku, row, old, new, cost, rng in price_moves(decisions):
         r = by_row.get(row)
+        gb = gb_of(r.gb) if r is not None else None
         out.append({"t": "move", "sku": sku, "row": row,
                     "supplier": source_of(r) if r is not None else "",
                     "old": old, "new": new, "cost": cost, "range": rng,
-                    "margin": (round(price_ranges.margin_pct(new, cost), 1)
+                    "margin": (round(price_ranges.margin_pct(new, cost, gb), 1)
                                if new is not None and cost else None),
-                    "profit": (round(price_ranges.net_of(new) - cost, 2)
+                    "profit": (round(price_ranges.net_of(new, gb) - cost, 2)
                                if new is not None and cost else None)})
     for sku, row, src, cost, mine, old, new in live_q_changes(decisions, rows):
         out.append({"t": "off" if new else "back", "sku": sku, "row": row,
@@ -1135,12 +1136,12 @@ def report_run(decisions: list[Decision], rows: list[Row]) -> bool:
     print(f"   (daily-summary log not sent: {why})")
     if events:
         mail_live_q_changes(live_q_changes(decisions, rows), price_moves(decisions),
-                            fallback=why)
+                            fallback=why, gb_by_row={r.row: gb_of(r.gb) for r in rows})
     return False
 
 
 def mail_live_q_changes(changes: list[tuple], moves: list[tuple] = (),
-                        fallback: str = "") -> bool:
+                        fallback: str = "", gb_by_row: Optional[dict] = None) -> bool:
     """Mail the owner, in Hebrew, which live packages went off sale (or back
     on) and which prices the range rule moved — one mail per run, only when
     something did. Since 2026-10-12 only report_run's fallback calls it."""
@@ -1158,10 +1159,11 @@ def mail_live_q_changes(changes: list[tuple], moves: list[tuple] = (),
 
     def move_line(m):
         sku, row, old, new, cost, rng = m
+        gb = (gb_by_row or {}).get(row)
         arrow = "▲" if (old is None or new > old) else "▼"
         return (f"{sku}  (שורה {row})  {money(old)} → {money(new)} {arrow}"
-                f"  קנייה {money(cost)}  רווח {money(price_ranges.net_of(new) - cost)}"
-                f" ({price_ranges.margin_pct(new, cost):.0f}%)  טווח {rng}")
+                f"  קנייה {money(cost)}  רווח {money(price_ranges.net_of(new, gb) - cost)}"
+                f" ({price_ranges.margin_pct(new, cost, gb):.0f}%)  טווח {rng}")
 
     parts = []
     if moves:
